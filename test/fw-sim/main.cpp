@@ -19,6 +19,11 @@
 //       drives), its strobe pin (the pin the firmware reads) rises at
 //       +rise_us and falls at +fall_us (±jitter, deterministic PRNG)
 //   strobe <L|R> off                               disarm (timeout tests)
+//   polarity <L|R> <high|low>                      injection polarity; `low`
+//       models the real opto output (idles at the pull-up, exposure pulls it
+//       LOW). Sticky across re-arming. Default `high`.
+//   read <L|R>                                     emit `level <L|R> <level>`
+//       — that camera's strobe pin as the firmware would read it right now
 //   quit                                           exit 0
 //
 // Options: --loop-us <n> throttles the service loop (default 50; 0 = free
@@ -26,7 +31,8 @@
 //
 // stdout control plane: `pty <path>`, `pin <num> <level>` (enable + trigger
 // pins), `dac cs=<-.L.R.LR> <hex word>` (MEMS-SPI capture), `pwm ...` (LPF),
-// `strobe <L|R> <level>` (injected edges), `ok/err <line>`, `reboot`.
+// `strobe <L|R> <level>` (injected edges), `level <L|R> <level>` (probe
+// reply), `ok/err <line>`, `reboot`.
 
 #include <algorithm>
 #include <cctype>
@@ -74,6 +80,9 @@ struct StrobeConfig {
   uint32_t riseUs = 500;
   uint32_t fallUs = 2500;
   uint32_t jitterUs = 0;
+  // false: exposure asserts the pin HIGH. true: the pin idles at its pull-up
+  // and exposure pulls it LOW — a real opto-isolated (open-collector) output.
+  bool activeLow = false;
 };
 
 struct Edge {
@@ -111,8 +120,10 @@ void scheduleStrobes(int cam) {
     rise = 0;
   if (fall <= rise)
     fall = rise + 1;
-  edges.push_back({now + uint64_t(rise), strobePin, HIGH});
-  edges.push_back({now + uint64_t(fall), strobePin, LOW});
+  const uint8_t asserted = cfg.activeLow ? LOW : HIGH;
+  const uint8_t released = cfg.activeLow ? HIGH : LOW;
+  edges.push_back({now + uint64_t(rise), strobePin, asserted});
+  edges.push_back({now + uint64_t(fall), strobePin, released});
 }
 
 // Fire every due edge in due-order: set the strobe pin level, then invoke the
@@ -157,13 +168,33 @@ void handleControlLine(const std::string &line) {
                   &jit) >= 3 &&
       (cam == 'L' || cam == 'R')) {
     auto &cfg = strobes[cam == 'L' ? 0 : 1];
-    cfg = {true, rise, fall, jit};
+    // Field-wise, not aggregate: polarity is sticky across re-arming, so
+    // `polarity` and `strobe` can be issued in either order.
+    cfg.armed = true;
+    cfg.riseUs = rise;
+    cfg.fallUs = fall;
+    cfg.jitterUs = jit;
     Sim::emit("ok %s", line.c_str());
     return;
   }
   if (std::sscanf(line.c_str(), "strobe %c %7s", &cam, off) == 2 &&
       (cam == 'L' || cam == 'R') && std::strcmp(off, "off") == 0) {
     strobes[cam == 'L' ? 0 : 1].armed = false;
+    Sim::emit("ok %s", line.c_str());
+    return;
+  }
+  char pol[8] = {0};
+  if (std::sscanf(line.c_str(), "polarity %c %7s", &cam, pol) == 2 &&
+      (cam == 'L' || cam == 'R') &&
+      (std::strcmp(pol, "low") == 0 || std::strcmp(pol, "high") == 0)) {
+    strobes[cam == 'L' ? 0 : 1].activeLow = std::strcmp(pol, "low") == 0;
+    Sim::emit("ok %s", line.c_str());
+    return;
+  }
+  if (std::sscanf(line.c_str(), "read %c", &cam) == 1 &&
+      (cam == 'L' || cam == 'R')) {
+    const unsigned pin = Board::camera[(cam == 'L' ? 0 : 1) + 1].strobe.number;
+    Sim::emit("level %c %u", cam, unsigned(Sim::pinLevel(pin)));
     Sim::emit("ok %s", line.c_str());
     return;
   }

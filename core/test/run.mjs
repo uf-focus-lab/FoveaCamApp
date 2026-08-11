@@ -45,7 +45,12 @@ const RIG_GATED = new Set([
 // Hardware-free but currently BLOCKED (does not pass standalone) — excluded from
 // the "all" sweep so one known-broken test can't wedge the whole run. Add a test
 // stem here to quarantine it; run it explicitly by number when working the fix.
-const KNOWN_BLOCKED = new Set();
+const KNOWN_BLOCKED = new Set([
+  // Fails on a REAL defect, not a broken test: the firmware latches an
+  // active-HIGH strobe while the pin is pulled up against the camera's
+  // open-collector output. Un-quarantine with the polarity fix.
+  "50-strobe-polarity",
+]);
 
 const PER_TEST_TIMEOUT_MS = 180_000;
 

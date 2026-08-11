@@ -75,8 +75,15 @@ std::recursive_mutex irqMutex;
 } // namespace
 
 void pinMode(unsigned pin, unsigned mode) {
-  if (pin < PIN_COUNT)
-    pins[pin].mode = static_cast<uint8_t>(mode);
+  if (pin >= PIN_COUNT)
+    return;
+  pins[pin].mode = static_cast<uint8_t>(mode);
+  // An input with a pull resistor and nothing driving it sits at the rail the
+  // resistor pulls to — the level the firmware reads before any injected edge.
+  if (mode == INPUT_PULLUP)
+    pins[pin].level = HIGH;
+  else if (mode == INPUT_PULLDOWN)
+    pins[pin].level = LOW;
 }
 
 void digitalWrite(unsigned pin, uint8_t val) {
