@@ -74,9 +74,12 @@ constexpr Pin<OUTPUT, DISABLE> enable{15};
 
 // Controller side of each camera's opto GPIO pair: `trigger` drives the
 // camera's trigger INPUT pin, `strobe` reads the camera's strobe OUTPUT pin.
+// The camera's opto output is an open-collector sink referenced to opto GND —
+// it only pulls low, so the strobe pin must supply its own pull-up (3.3V
+// internal; the pin is not 5V tolerant) or it floats. Line idles HIGH.
 typedef struct CameraPinout {
   const Pin<OUTPUT> trigger;
-  const Pin<INPUT> strobe;
+  const Pin<INPUT_PULLUP> strobe;
   inline void init() const {
     trigger.init();
     strobe.init();
