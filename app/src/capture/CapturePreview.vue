@@ -254,20 +254,32 @@ function save(path: string, img_format: string) {
     margin: 0;
   }
 }
+// Responsive tile grid: each tile has a DEFINITE height (grid track width ×
+// aspect-ratio), which FrameView's absolutely positioned canvas needs for its
+// `max-height: 100%` to resolve. `min(22rem, 100%)` keeps a narrow pane from
+// clipping a tile; `scrollbar-gutter` keeps the gutter from reflowing the grid.
 .frame-container {
   padding: 2rem;
-  display: flex;
-  flex-direction: row;
-  flex-wrap: wrap;
-  justify-content: flex-start;
-  align-items: flex-start;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(22rem, 100%), 1fr));
+  gap: 1.5rem;
+  align-content: start;
+  align-items: start;
   overflow-x: hidden;
-  overflow-y: scroll;
-  gap: 2rem;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+
+  // FrameView reserves its hanging title row with an inline `margin-top`; the
+  // margin is part of the grid item, so the row gap stays clear of it.
   & > * {
-    width: 20rem;
-    height: 15rem;
-    margin: 0 1rem;
+    width: 100%;
+    aspect-ratio: 4 / 3;
+    min-width: 0;
+    min-height: 0;
+  }
+
+  & > * :deep(canvas.centered) {
+    object-fit: contain;
   }
 }
 </style>
