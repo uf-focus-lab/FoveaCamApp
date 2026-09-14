@@ -50,9 +50,10 @@ Hardware-gated checks for the `mirror-link` app (spec
   telemetry's `mismatch` flag must stay clear). A camera whose max frame rate is
   below `hz` should show its max rate with `exposure = period`.
 - **Restore leaves Manage Cameras byte-identical.** Note each fovea's exposure /
-  frame rate / frame-rate-enable / auto-exposure before scanning; stop the scan
-  (and separately, leave the app mid-scan) and confirm every value came back
-  unchanged.
+  frame rate / frame-rate-enable / auto-exposure AND gain / auto-gain before
+  scanning; stop the scan (and separately, leave the app mid-scan with the Gain
+  slider moved) and confirm every value came back unchanged. Gain is
+  session-wide, so its restore is only exercised on leaving the app.
 - **Dashed-ring readout.** Point at a blinker of KNOWN frequency and confirm the
   on/off pattern along the ring matches it (count the dashes per revolution
   against `blink_hz / scan_hz`).

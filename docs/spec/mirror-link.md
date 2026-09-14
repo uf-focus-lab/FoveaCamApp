@@ -79,6 +79,27 @@ the period by more than 2 % the `scan` telemetry flags `mismatch` and the reason
 the title-bar tray as a warning (`report("mirror-link", …, "warning")`). Apply L then R;
 a failure on either restores whatever was applied and refuses the start.
 
+## Gain override {#gain}
+
+Source: `gain.ts` (pure over a `Camera`-shaped seam, unit-tested with a fake).
+
+ONE gain (dB) drives BOTH foveas, and it is SESSION-WIDE, not scan-scoped — aligning on a
+dim source needs it before the scan. Same live-handle model as §exposure: written through
+`lease.reconfigure`, the per-camera config docs NEVER touched, `gain_auto` forced Off while
+overridden. `telemetry.gain_range` is the INTERSECTION of the two cameras' `gain_range`s
+(`{0,0}` until leased, and for a DISJOINT pair — no common value, so no slider rather than
+a bound one camera would reject).
+
+At activation both eyes' `gain`/`gain_auto` are snapshotted (a model with no `gain_auto`
+node records the value alone and skips that write on restore) and the range published. A
+null `state.gain` (first entry) is SEEDED from the L camera's live `gain`, read on its own
+and with NO camera write; a carried-over value is applied to both eyes, clamped to the
+shared range, and the clamped value is written back to `state.gain` so the readout never
+shows a gain the hardware did not take. The
+`gain` watch rides the SAME FIFO op chain as the exposure ops so a slider drag can never
+interleave with an apply/restore on the same lease. Teardown restores in the drain's scan
+slot (after the pacer stops, before `triple` clears): exposure timing FIRST, then gain.
+
 ## Views {#views}
 
 The L/R main views bind the RAW convert pipes (`nodeId.convert(serial)`) directly, at pipe
@@ -109,8 +130,12 @@ detail (and the blocked reason) in its `title` hover. The row is a PLAIN div, ne
 `<label>`/ConfigEntry: a label would forward a status-span click to the button and
 toggle the hardware override; the button's own explanation rides the ROW's `title`
 (a disabled button suppresses hover). The drawer carries the alignment sliders (Verge
-Distance + the four trims) left and the scan sliders (frequency, amplitude) + a Status
-row right; every slider carries a one-sentence `title`. No explanatory text anywhere —
+Distance + the four trims) left and Gain, the scan sliders (frequency, amplitude), and a
+Status row right — Gain leads the column because it is session-wide, not scan-scoped.
+Every slider carries a one-sentence `title`. Gain alone declares NO `neutral` — a stray
+right-click must never slam a live camera to range-min, and its `title` says so — and it
+is disabled (readout `—`) until `ready` with a non-degenerate `gain_range`; its `v-model`
+proxy CLAMPS on read and refuses writes while disabled. No explanatory text anywhere —
 hover tooltips only.
 
 ## Actuation {#actuation}

@@ -28,8 +28,9 @@ Three live columns sit across the top:
   sit the **Start Scan** button and the scan status readout.
 - **Right Fovea** (greenyellow) — the mirror image of the left column.
 
-A pull-up **drawer** along the bottom holds the alignment sliders on the left and
-the scan sliders (plus a **Status** row repeating the scan readout) on the right.
+A pull-up **drawer** along the bottom holds the alignment sliders on the left,
+and the **Gain** slider, the scan sliders, and a **Status** row repeating the
+scan readout on the right.
 Click the tab at the bottom edge to open it — `Ctrl-\`` toggles it from the
 keyboard — then drag the grip to resize it.
 
@@ -102,6 +103,24 @@ the current settings would apply.
 If **Start Scan** is refused (no cameras leased, or a camera rejected the
 exposure write) the status line reads *idle — refused* and its hover carries the
 reason.
+
+### To brighten a dim source
+
+The **Gain** slider at the top of the drawer's right half raises both foveas'
+sensor gain together, in decibels. Unlike the exposure override it applies for as
+long as MirrorLink is open — scanning or not — so you can use it to find a faint
+source before you start. Its range is whatever both cameras can honor, and it
+starts at the **left** fovea's current gain. It stays disabled, reading `—`,
+until the cameras are leased, or if the two cameras share no common gain range.
+
+Gain is the same kind of temporary override as the exposure: the pre-session
+gain and auto-gain of both foveas are remembered and written back when you leave
+the app, so [Manage Cameras](./manage-cameras.md) keeps whatever you configured
+there. More gain also means more noise — raise the exposure (a lower scan
+frequency) first when you can.
+
+Note that the slider has no right-click reset: that would slam a live camera to
+its minimum gain mid-alignment.
 
 ## Recording
 

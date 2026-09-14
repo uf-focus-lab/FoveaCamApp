@@ -61,6 +61,13 @@ import {
   snapshotTiming,
   type TimingSnapshot,
 } from "./exposure";
+import {
+  applyGain,
+  intersectRanges,
+  restoreGain,
+  snapshotGain,
+  type GainSnapshot,
+} from "./gain";
 
 const SIDES = ["L", "R"] as const;
 type Side = (typeof SIDES)[number];
@@ -306,6 +313,61 @@ export default function mirrorLinkSession(
       publishScanTelemetry(hz, applied);
     }
 
+    // --- gain override (spec §gain) -----------------------------------------
+    // Session-wide, not scan-scoped: aligning on a dim source needs it BEFORE
+    // the scan. Same live-handle model as the exposure override — the
+    // per-camera config docs are never written.
+
+    /** Pre-session gain per eye, restored on idle. */
+    const gainSnapshots: Partial<Record<Side, GainSnapshot>> = {};
+    /** The range BOTH foveas honor; {0,0} until leased (slider disabled). */
+    let gainRange = { min: 0, max: 0 };
+
+    /** Drive both eyes to `dB`, clamped to the shared range — the clamped value
+     *  goes back into state so the readout never shows a gain the hardware did
+     *  not take. Serialized on {@link queueScanOp}. */
+    async function applyGainNow(dB: number): Promise<void> {
+      const t = triple;
+      if (!t || gainRange.min === gainRange.max) return;
+      const want = Math.min(Math.max(dB, gainRange.min), gainRange.max);
+      if (want !== s.state.gain) s.setState("gain", want);
+      for (const side of SIDES) {
+        const lease = t.leases[side];
+        try {
+          await lease.reconfigure(() => {
+            if (!gainSnapshots[side])
+              gainSnapshots[side] = snapshotGain(lease.camera);
+            applyGain(lease.camera, want);
+          });
+        } catch (e) {
+          report(
+            "mirror-link",
+            `gain override failed: ${errorLine(e)}`,
+            "warning",
+          );
+        }
+      }
+    }
+
+    /** Restore both eyes' pre-session gain, best-effort (the lease may be
+     *  releasing). Runs AFTER the exposure restore. */
+    async function restoreGainNow(): Promise<void> {
+      const t = triple;
+      for (const side of SIDES) {
+        const snap = gainSnapshots[side];
+        if (!snap) continue;
+        if (t)
+          try {
+            await t.leases[side].reconfigure(() =>
+              restoreGain(t.leases[side].camera, snap),
+            );
+          } catch {
+            // best-effort — the lease may already be releasing
+          }
+        delete gainSnapshots[side];
+      }
+    }
+
     // --- recording (spec §recording) ---------------------------------------
 
     const recording = createRawRecording({
@@ -348,6 +410,38 @@ export default function mirrorLinkSession(
       if (!t) return; // frozen at "Leasing cameras" (contention/fail)
       triple = t;
       monitor.done("lease");
+
+      // Gain override (spec §gain): snapshot both eyes, publish the shared
+      // range, then SEED `state.gain` from the live camera on a first entry
+      // (no write) or re-apply a carried-over value.
+      const safeGain = <T>(read: () => T, fallback: T): T => {
+        try {
+          return read();
+        } catch {
+          return fallback;
+        }
+      };
+      const ZERO_RANGE = { min: 0, max: 0 };
+      // A camera with no gain surface records NO snapshot — restore then skips
+      // it rather than writing a value we never read.
+      for (const side of SIDES) {
+        const snap = safeGain(() => snapshotGain(t.leases[side].camera), null);
+        if (snap) gainSnapshots[side] = snap;
+      }
+      gainRange = intersectRanges(
+        safeGain(() => t.leases.L.camera.gain_range, ZERO_RANGE),
+        safeGain(() => t.leases.R.camera.gain_range, ZERO_RANGE),
+      );
+      s.telemetry({ gain_range: gainRange });
+      // The seed reads `gain` on its OWN — a model whose snapshot failed for an
+      // unrelated reason must not leave the slider permanently disabled.
+      const seed = safeGain<number | undefined>(
+        () => t.leases.L.camera.gain,
+        undefined,
+      );
+      if (s.state.gain === null) {
+        if (seed !== undefined) s.setState("gain", seed); // seed only — no write
+      } else void queueScanOp(() => applyGainNow(s.state.gain!));
 
       // DISPLAY-ONLY: label the leased triple by role (L/C/R) in the profiler.
       scope.defer(
@@ -455,9 +549,13 @@ export default function mirrorLinkSession(
       });
       // Restore the camera timing while the leases are still live (the restore
       // rides `lease.reconfigure`), after the pacer stopped so nothing re-arms.
+      // Exposure first, then the gain override (spec §gain).
       scope.defer(async () => {
         scanAllowed = false;
-        await queueScanOp(stopScanNow);
+        await queueScanOp(async () => {
+          await stopScanNow();
+          await restoreGainNow();
+        });
       });
       scope.defer(() => {
         stopActuation?.(); // drains FIRST — stop pushing immediately
@@ -481,7 +579,15 @@ export default function mirrorLinkSession(
         volts.L = { ...ORIGIN_POS };
         volts.R = { ...ORIGIN_POS };
         activeScan = null;
-        s.resetTelemetry(["scan", "scan_blocked", "scan_px", "L_PX", "R_PX"]);
+        gainRange = { min: 0, max: 0 };
+        s.resetTelemetry([
+          "scan",
+          "scan_blocked",
+          "scan_px",
+          "gain_range",
+          "L_PX",
+          "R_PX",
+        ]);
       },
       watch: {
         // Amplitude is live on the next tick; only the ring preview needs a push.
@@ -496,6 +602,11 @@ export default function mirrorLinkSession(
         scan_hz(hz) {
           if (scanActive)
             void queueScanOp(() => reapplyScanNow(clampHz(hz as number)));
+        },
+        // Gain rides the SAME FIFO chain as the exposure ops (spec §gain) — a
+        // drag must never interleave with an apply/restore on the same lease.
+        gain(dB) {
+          if (typeof dB === "number") void queueScanOp(() => applyGainNow(dB));
         },
       },
       commands: {

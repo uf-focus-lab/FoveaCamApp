@@ -47,6 +47,10 @@ export const mirrorLink = defineContract({
     trim_ly: 0,
     trim_rx: 0,
     trim_ry: 0,
+    /** Session-wide fovea gain override (dB, BOTH eyes; spec §gain). Null =
+     *  never set — the session seeds it from the leased cameras instead of
+     *  writing one. */
+    gain: null as number | null,
     // Scan parameters (spec §scan) — LIVE while active.
     scan_hz: 20,
     scan_amp: 0.5, // scan radius (deg)
@@ -65,6 +69,10 @@ export const mirrorLink = defineContract({
     /** Scan ring radius in wide px at the current center/amplitude; 0
      *  uncalibrated (spec §views). */
     scan_px: 0,
+    /** The gain range BOTH foveas honor — the intersection of their
+     *  `gain_range`s (spec §gain). `min === max === 0` until leased (or on a
+     *  disjoint pair): the slider stays disabled. */
+    gain_range: { min: 0, max: 0 } as { min: number; max: number },
     /** Applied scan timing — non-null exactly while ACTIVE (spec §lifecycle). */
     scan: null as ScanTelemetry | null,
     /** Human-readable reason the last `startScan` was refused (or why the

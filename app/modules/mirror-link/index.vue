@@ -70,6 +70,34 @@ const distance = computed(() => vergeToDistance(state.verge, state.baseline));
 const plusSign = (v: string) => (v.startsWith("-") ? v : "+" + v);
 const ms = (us: number) => (us / 1000).toFixed(1);
 
+// --- gain (spec §gain) ------------------------------------------------------
+// `state.gain` is null until the session seeds it from the leased cameras, and
+// a carried-over value may sit outside a new pair's range — so the proxy CLAMPS
+// on read (an out-of-range value would paint the cursor past the track) and
+// refuses writes while disabled (RangeSlider only checks `disabled` at
+// mousedown, so a lease drop mid-drag would otherwise persist range-min).
+const gainDisabled = computed(
+  () =>
+    !telemetry.ready ||
+    telemetry.gain_range.min === telemetry.gain_range.max ||
+    state.gain === null,
+);
+const gain = computed<number>({
+  get: () => {
+    const { min, max } = telemetry.gain_range;
+    return Math.min(Math.max(state.gain ?? min, min), max);
+  },
+  set: (v) => {
+    if (!gainDisabled.value) state.gain = v;
+  },
+});
+const gainTitle = computed(() =>
+  gainDisabled.value
+    ? "Waiting for both foveas to report a shared gain range."
+    : "Sensor gain applied to BOTH foveas while MirrorLink is open; Manage Cameras' gain is restored on exit. " +
+      "No right-click reset: that would slam a live camera to minimum gain.",
+);
+
 // --- scan (spec §lifecycle) -------------------------------------------------
 const scanning = computed(() => telemetry.scan !== null);
 const period_ms = computed(() =>
@@ -308,6 +336,20 @@ const scanHint = computed(() => {
       </template>
       <template #right>
         <div class="options fill">
+          <!-- Gain leads the column: it is SESSION-wide, not scan-scoped
+               (spec §gain). No `neutral` — a stray right-click must never slam
+               a LIVE camera to range-min. -->
+          <RangeSlider
+            v-model="gain"
+            :title="gainTitle"
+            :min="telemetry.gain_range.min"
+            :max="telemetry.gain_range.max"
+            :step="0.1"
+            :disabled="gainDisabled"
+          >
+            <span>Gain</span>
+            <span>{{ gainDisabled ? "—" : gain.toFixed(1) + " dB" }}</span>
+          </RangeSlider>
           <RangeSlider
             v-model="state.scan_hz"
             title="Revolutions per second — also the per-frame exposure the foveas are overridden to while scanning. Right-click resets to neutral."
