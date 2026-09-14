@@ -10,6 +10,10 @@
 // docs/spec/mirror-link.md.
 
 import { cmd, defineContract } from "@lib/orchestrator/protocol";
+import {
+  captureCommands,
+  captureTelemetry,
+} from "@lib/orchestrator/contracts";
 import type { Point2d } from "core/Geometry";
 import type { Pos } from "@lib/controller-codec";
 import type { Stat } from "@lib/orchestrator/contracts";
@@ -52,20 +56,30 @@ export const mirrorLink = defineContract({
      *  never set — the session seeds it from the leased cameras instead of
      *  writing one. */
     gain: null as number | null,
+    /** Frames averaged into one capture shot (spec §capture). 1 = a single
+     *  revolution, which is what a ring frame is. */
+    cap_stack: 1,
     /** Ring-reader node ON/OFF (spec §reader). Default OFF: the decoder is a
      *  worker thread over both fovea pipes, built only while this is set. */
     ring_reader: false as boolean,
     // Scan parameters (spec §scan) — LIVE while active.
-    scan_hz: 20,
+    scan_hz: 10, // 100 ms revolution
+
     scan_amp: 0.5, // scan radius (deg)
   },
   telemetry: {
     ready: false as boolean, // calibrated triple leased + conversions loaded
     target: { x: 0, y: 0 } as Point2d, // scan center, wide px
     target_angle: { x: 0, y: 0 } as Point2d, // ...and in radians (angular)
-    /** The INSTANTANEOUS commanded pose — the PosViews trace the circle at the
-     *  telemetry throttle (spec §views). */
+    /** The commanded pose: the mirrors' idle pose, and while scanning the
+     *  ring's CENTER — the PosView crosshair stays put instead of flickering at
+     *  the telemetry throttle (spec §views). */
     volt: { L: { x: 0, y: 0 }, R: { x: 0, y: 0 } } as { L: Pos; R: Pos },
+    /** The commanded scan circle in VOLT space, one closed loop per eye
+     *  (`SCAN_PATH_SAMPLES` points) — the PosViews draw the path itself.
+     *  Empty uncalibrated; republished on every geometry change, never per
+     *  tick (spec §views). */
+    scan_path: { L: [], R: [] } as { L: Pos[]; R: Pos[] },
     // Per-eye wide-px projection of the offset-free CENTER pose (trims
     // included) — where each fovea is aimed; {0,0} uncalibrated (spec §views).
     L_PX: { x: 0, y: 0 } as Point2d,
@@ -92,6 +106,9 @@ export const mirrorLink = defineContract({
     scan_blocked: null as string | null,
     // Control-path latency — `c.actuate()` round-trip, throttled like `volt`.
     perf: { actuateMs: { mean: 0, max: 0 } as Stat },
+    // Capture manifest telemetry (spec §capture); image data pulled via
+    // `getCapturePreview`.
+    ...captureTelemetry(),
     // Recording.
     recording_active: false as boolean,
     recordingStreams: {} as Record<
@@ -109,6 +126,9 @@ export const mirrorLink = defineContract({
     startScan: cmd<void, boolean>(),
     /** Stop the scan and restore the pre-scan camera timing. */
     stopScan: cmd(),
+    // Shared capture mixin: `captureShot`/`getCapturePreview`/`saveCapture`/
+    // `discardCapture` (spec §capture).
+    ...captureCommands(),
     /** Start writing raw L/C/R streams to disk at `path`. */
     startRecording: cmd<{ path: string }, boolean>(),
     /** Stop the active recording. */

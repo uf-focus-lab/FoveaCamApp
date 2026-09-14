@@ -42,6 +42,7 @@ function capturePreviewFor(session: string): Loader {
  *  `(session, "capture")` preview window, so AppWindow's camera icon toggles it. */
 const CAPTURE_SESSIONS = [
   "manual-control",
+  "mirror-link",
   "multi-fovea",
   "disparity-scope",
   "calibrate-drift",

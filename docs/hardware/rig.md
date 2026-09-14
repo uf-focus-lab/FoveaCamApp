@@ -57,6 +57,11 @@ Hardware-gated checks for the `mirror-link` app (spec
 - **Dashed-ring readout.** Point at a blinker of KNOWN frequency and confirm the
   on/off pattern along the ring matches it (count the dashes per revolution
   against `blink_hz / scan_hz`).
+- **Capture a ring frame.** With the emitter running, press the capture button and
+  save. Confirm both fovea images show the un-straightened ring, and that the
+  `.json` beside them carries a `mirror_link` block with the scan timing and the
+  reader's per-eye circle/reason. `python3 scripts/ring-debug.py <image>` must
+  reproduce the app's verdict on that frame — that is the offline-debugging loop.
 - **Decode a known message.** Drive the emitter with the ring-code frame
   (`docs/spec/ring-code.md`) for a known short string at a cycle equal to the
   scan period. Both fovea readouts must show that string, the fitted circle and

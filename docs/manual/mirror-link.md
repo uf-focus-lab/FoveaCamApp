@@ -22,7 +22,8 @@ Three live columns sit across the top:
   a frame that integrates a whole revolution has no single mirror position to
   straighten it against, and the un-straightened ring is what you are here to
   read. The readout row appears only with **Ring Reader** on (see *Reading the
-  emitter*). The voltage bar traces the circle live while the scan runs.
+  emitter*). The voltage bar draws the scan path the mirror is commanded to
+  follow, with the crosshair on the ring's center.
 - **Center Wide** (orange) — the wide view you steer on. It carries a crosshair
   at the scan center with its angle in degrees, the scan ring, and a small cyan
   and greenyellow circle showing where each fovea is currently aimed. Below it
@@ -74,7 +75,7 @@ separate as the trims diverge.
    hover the row to see what it is waiting for). The ring goes solid and the
    status line next to the button — repeated in the drawer's **Status** row —
    shows the applied timing, for example
-   `20.0 Hz · 50.0 ms · L 49.9 ms · R 49.9 ms`: the frequency, one revolution,
+   `10.0 Hz · 100.0 ms · L 99.9 ms · R 99.9 ms`: the frequency, one revolution,
    and each fovea's exposure.
 3. Adjust the frequency or amplitude while it runs; both take effect live
    (changing the frequency re-applies the exposure override).
@@ -84,6 +85,11 @@ The commanded circle is exact, but the mirrors themselves roll off at high
 frequency, so the ring you actually see shrinks as you raise the frequency. That
 is physical, not a bug — pick the highest frequency where the ring is still
 usable.
+
+The **voltage bars** under the fovea views draw that commanded circle in volt
+space — faint before you start, solid while it runs — with the crosshair parked
+on the ring's center. They show the shape the mirror is asked to trace, not a
+moving dot: at 10 revolutions per second a marker would only flicker.
 
 ### What the exposure override does
 
@@ -133,8 +139,10 @@ on screen:
 | `no ring` | No circular track was found — the emitter is out of frame, too dim (raise **Gain**), or the scan is not running. |
 | `no leader` | A ring, but no start marker: usually too dim or the emitter is not sending this format. |
 | `below resolution` | The message is too long for the ring you are drawing. Raise **Scan Amplitude**, or shorten the emitter's message. |
-| `no mid-bit transition`, `no terminating gap`, `truncated` | The ring was garbled — check focus, exposure (the **Status** line must not be amber) and that the emitter's cycle matches the scan frequency. |
-| `length mismatch`, `crc mismatch` | The message arrived damaged. Single frames fail all the time; a *persistent* failure means the emitter's rate and the scan frequency disagree. |
+| `low contrast @ bit N` | The chips have blurred together at that point in the message — the dot is too big for the chip arc. Raise **Scan Amplitude**, shorten the message, or improve focus. The hover shows the measured contrast. |
+| `chip period inconsistent with LEN` | What was read as a message does not fill the ring the way its length field says — usually a mis-locked start marker on a noisy frame. |
+| `no terminating gap`, `truncated` | The ring was garbled — check focus, exposure (the **Status** line must not be amber) and that the emitter's cycle matches the scan frequency. |
+| `crc mismatch` | The message arrived damaged. Single frames fail all the time; a *persistent* failure means the emitter's rate and the scan frequency disagree. |
 
 Nothing is corrected: a bad frame is dropped and the next revolution is a fresh read. That
 is why the readout can flicker between a decode and a reason while the last good value
@@ -158,6 +166,23 @@ frequency) first when you can.
 
 Note that the slider has no right-click reset: that would slam a live camera to
 its minimum gain mid-alignment.
+
+## Capturing a ring frame
+
+The title-bar camera button (or `Cmd/Ctrl-S`) grabs ONE full-depth shot — the left and
+right fovea frames and the wide view — and opens the capture preview window, where
+**Save** writes them to your save directory. Each image lands as `<name>.png` or
+`<name>.tiff` (16-bit for the foveae) beside a `<name>.json` of its metadata.
+
+The fovea images are saved exactly as the camera saw them: **not** straightened against a
+mirror position, because a frame that integrated a whole revolution has no single one. That
+raw ring is what an offline decoder needs.
+
+The JSON carries the app's state at that moment under `mirror_link`: the scan timing (or
+null if you were not scanning), what the **Ring Reader** last made of each eye — the circle
+it fitted, the chip width, the failure reason — the trims, the verge distance, the baseline,
+and where you were aiming. So a frame that failed to decode on the rig can be re-analyzed
+later with everything the reader saw attached to it.
 
 ## Recording
 

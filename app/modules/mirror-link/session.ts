@@ -34,6 +34,7 @@ import {
   radians,
   VOLT_TELEMETRY_INTERVAL_MS,
 } from "@orchestrator/fovea-pipeline";
+import { activeController } from "@orchestrator/controller";
 import { report } from "@orchestrator/diagnostics";
 import {
   advertiseUndistortPipe,
@@ -41,6 +42,13 @@ import {
   type UndistortPipeSeam,
 } from "@orchestrator/undistort-pipe";
 import { createRawRecording } from "@orchestrator/raw-recording";
+import {
+  createCaptureHelper,
+  rawTripleShot,
+  type CaptureHelper,
+} from "@orchestrator/capture-helper";
+import type { CaptureShot } from "@orchestrator/capture-node";
+import type { Serializable } from "@lib/orchestrator/protocol";
 import {
   createVisionWorker,
   type VisionWorkerHandle,
@@ -87,6 +95,13 @@ type AppliedTiming = { exposure_us: number; frame_rate: number };
 
 const clampHz = (hz: number): number =>
   Math.min(Math.max(hz, SCAN_HZ_RANGE.min), SCAN_HZ_RANGE.max);
+
+/** Points per drawn scan loop — dense enough that the polyline reads as a
+ *  circle at PosView scale, cheap enough to republish on every slider nudge. */
+const SCAN_PATH_SAMPLES = 48;
+
+/** Voltage envelope assumed while no controller is bound (controller.dv). */
+const DEFAULT_DV = 170.0;
 
 const errorLine = (e: unknown): string =>
   (e instanceof Error ? e.message : String(e)).split("\n", 1)[0];
@@ -152,10 +167,43 @@ export default function mirrorLinkSession(
       return triple.conv.A2P.C(triple.conv.V2A[side](v), false);
     }
 
-    /** Ring radius in wide px — the amplitude offset projected next to the
-     *  center (spec §views). Recomputed on steer / amplitude / activate. */
-    function publishScanPx(): void {
-      if (!triple?.undistort) {
+    /** Commanded volts are clamped to the controller's envelope before they
+     *  reach the wire (controller-codec); the drawn path says the same. */
+    function clampVolt(v: Pos): Pos {
+      const lim = activeController()?.dv ?? DEFAULT_DV;
+      return {
+        x: Math.min(Math.max(v.x, -lim), lim),
+        y: Math.min(Math.max(v.y, -lim), lim),
+      };
+    }
+
+    /** The scan's DRAWABLE geometry (spec §views): the ring radius in wide px,
+     *  and the commanded circle in volt space per eye. Recomputed on every
+     *  input that moves or reshapes the ring — never per pacer tick. */
+    function publishScanGeometry(): void {
+      if (!triple) {
+        s.telemetry({ scan_px: 0, scan_path: { L: [], R: [] } });
+        return;
+      }
+      const hz = clampHz(s.state.scan_hz);
+      const periodMs = 1000 / hz;
+      const L: Pos[] = [];
+      const R: Pos[] = [];
+      for (let k = 0; k < SCAN_PATH_SAMPLES; k++) {
+        // The SAME chain the pacer commands: offset → inverseTriangulate +
+        // trims → A2V, so the drawn path is the commanded path.
+        const pose = voltsFor(
+          anglesAt(
+            scanOffset((k / SCAN_PATH_SAMPLES) * periodMs, hz, s.state.scan_amp),
+          ),
+        );
+        // Clamped to the mirror's range, like every commanded pose: the drawn
+        // path is the path the mirror can actually take.
+        L.push(clampVolt(pose.l));
+        R.push(clampVolt(pose.r));
+      }
+      s.telemetry({ scan_path: { L, R } });
+      if (!triple.undistort) {
         s.telemetry({ scan_px: 0 });
         return;
       }
@@ -174,7 +222,7 @@ export default function mirrorLinkSession(
         ? triple.undistort.angular([px], false)[0]
         : { x: 0, y: 0 };
       s.telemetry({ target, target_angle: targetAngle });
-      publishScanPx();
+      publishScanGeometry();
     }
 
     // --- scan lifecycle (spec §lifecycle) ----------------------------------
@@ -497,6 +545,83 @@ export default function mirrorLinkSession(
       node?.dispose();
     }
 
+    // --- capture (spec §capture) --------------------------------------------
+    // The offline ring analyzer's input: full-depth L/R fovea frames + the
+    // undistorted center, with the scan/reader state alongside them.
+
+    let captureHelper: CaptureHelper | null = null;
+    let centerPipe: {
+      shmName: string;
+      maxBytes: number;
+      channels: number;
+    } | null = null;
+
+    /** The scan + reader context an offline decode needs next to the pixels. */
+    function mirrorLinkMeta(): Serializable {
+      const t = triple;
+      const A = t ? centerAngles() : null;
+      const V = t ? centerVolts() : null;
+      return {
+        scan: activeScan,
+        ring: { L: ring.L, R: ring.R },
+        trims: {
+          l: { x: s.state.trim_lx, y: s.state.trim_ly },
+          r: { x: s.state.trim_rx, y: s.state.trim_ry },
+          unit: "degree",
+        },
+        verge: s.state.verge,
+        baseline: s.state.baseline,
+        "baseline.unit": "millimeter",
+        target_angle: { x: targetAngle.x, y: targetAngle.y },
+        "target_angle.unit": "radian",
+        // The CENTER pose's homographies — recorded for reference only; the
+        // saved fovea frames are deliberately UNWARPED (see below).
+        center_pose:
+          t && V && A
+            ? {
+                volt: { L: V.l, R: V.r },
+                angle: { L: A.l, R: A.r },
+                H_L: Array.from(t.conv.A2H.L(A.l) as unknown as Float64Array),
+                H_R: Array.from(t.conv.A2H.R(A.r) as unknown as Float64Array),
+              }
+            : null,
+      } as Serializable;
+    }
+
+    /** One capture shot. IDENTITY homographies and a full-frame rect: a frame
+     *  that integrated a whole revolution has no single pose to warp against,
+     *  and the un-warped ring IS the thing being debugged (spec §capture). */
+    function captureSnapshot(reset: boolean, indexed: boolean): CaptureShot {
+      const shot = rawTripleShot({
+        reset,
+        indexed,
+        stackCount: Math.max(1, s.state.cap_stack),
+        note: "mirror-link: unwarped ring frames (a scanned frame has no single mirror pose)",
+      });
+      const link = mirrorLinkMeta();
+      const und = triple?.undistort;
+      const wide =
+        reset && und
+          ? {
+              sensor_size: und.sensor_size,
+              focal: und.focal,
+              center: und.center,
+              fov: und.fov,
+            }
+          : {};
+      const merge = (base: Serializable, extra: object): Serializable =>
+        ({ ...(base as object), ...extra, mirror_link: link }) as Serializable;
+      return {
+        ...shot,
+        meta: {
+          wide: reset ? merge(shot.meta.wide ?? {}, wide) : undefined,
+          fovea: merge(shot.meta.fovea, {}),
+          left: merge(shot.meta.left, {}),
+          right: merge(shot.meta.right, {}),
+        },
+      };
+    }
+
     // --- recording (spec §recording) ---------------------------------------
 
     const recording = createRawRecording({
@@ -592,15 +717,17 @@ export default function mirrorLinkSession(
       // The center intrinsic undistort pipe — the steering surface (spec
       // §views). The L/R views bind the RAW convert pipes directly: a frame
       // spanning a full revolution has no single mirror pose to warp against.
+      let undistortC: string | null = null;
       if (t.undistort) {
-        const undistortC = advertiseUndistortPipe(
+        undistortC = advertiseUndistortPipe(
           undistortSeam,
           t.leases.C.camera,
           t.undistort.calibration,
         );
-        s.setState("undistortPipe", undistortC);
+        const pipeId = undistortC;
+        s.setState("undistortPipe", pipeId);
         scope.defer(() => {
-          retireUndistortPipe(undistortSeam, undistortC);
+          retireUndistortPipe(undistortSeam, pipeId);
           s.setState("undistortPipe", null);
         });
       }
@@ -612,10 +739,54 @@ export default function mirrorLinkSession(
       scope.defer(() => disposeRingNode());
       monitor.done("pipes");
 
+      // Capture node (spec §capture): idle until a shot is asked for; the raw
+      // L/R producers are advertised/connected per shot. The center undistort
+      // pipe stays connected so its producer is live for the one-shot read.
+      {
+        const capCenterId = undistortC ?? nodeId.convert(t.leases.C.camera.serial);
+        const capCenter = broker.connect(capCenterId);
+        scope.defer(() => void broker.disconnect(capCenterId));
+        centerPipe = {
+          shmName: capCenter.shmName,
+          maxBytes: capCenter.spec.maxBytes ?? capCenter.spec.bytesPerFrame,
+          channels: capCenter.spec.channels,
+        };
+        scope.defer(() => {
+          centerPipe = null;
+        });
+        captureHelper = createCaptureHelper({
+          id: nodeId.win("mirror-link", "capture"),
+          broker,
+          rawPipes,
+          graphInputs: {
+            left: `camera/${t.leases.L.camera.serial}/raw`,
+            right: `camera/${t.leases.R.camera.serial}/raw`,
+            center: capCenterId,
+          },
+          cameras: () =>
+            triple
+              ? { left: triple.leases.L.camera, right: triple.leases.R.camera }
+              : null,
+          centerPipe: () => centerPipe,
+          snapshot: (reset, indexed) =>
+            triple ? captureSnapshot(reset, indexed) : null,
+          recordingActive: () => recording.active,
+          telemetry: (patch) => s.telemetry(patch),
+        });
+        captureHelper.build();
+      }
+
       monitor.start("recording");
       // Awaited drain: an in-flight recording finalizes BEFORE the pipes retire
       // + the leases release (LIFO — registered after the retirers above).
       scope.defer(async () => void (await recording.stop()));
+      // An in-flight capture must finish (its raw pipes release) before the
+      // recording drain and the lease release.
+      scope.defer(async () => {
+        await captureHelper?.activeCapture;
+        await captureHelper?.stop();
+        captureHelper = null;
+      });
       monitor.done("recording");
 
       monitor.start("controller");
@@ -628,7 +799,7 @@ export default function mirrorLinkSession(
         },
       });
       scanAllowed = true;
-      publishScanPx();
+      publishScanGeometry();
       // Push model (spec §actuation): the SESSION owns the 1 ms cadence. Idle
       // slews toward the center pose; active commands the scan pose DIRECTLY
       // (a smoother would lag and shrink the circle), and the slew resumes from
@@ -663,10 +834,15 @@ export default function mirrorLinkSession(
         if (tick - lastVoltEmit >= VOLT_TELEMETRY_INTERVAL_MS) {
           lastVoltEmit = tick;
           // Per-eye markers come from the CENTER pose (trims included), not the
-          // instantaneous scan pose — they show where each fovea is aimed.
+          // instantaneous scan pose — they show where each fovea is aimed. The
+          // published `volt` is that same center pose while scanning: sampling
+          // the circle at the telemetry throttle reads as random flicker, and
+          // the ring itself is drawn from `scan_path`.
           const c = centerVolts();
           s.telemetry({
-            volt: { L: p.left, R: p.right },
+            volt: scanActive
+              ? { L: { ...c.l }, R: { ...c.r } }
+              : { L: p.left, R: p.right },
             L_PX: projectPx("L", c.l),
             R_PX: projectPx("R", c.r),
             perf: {
@@ -721,15 +897,24 @@ export default function mirrorLinkSession(
           "scan",
           "scan_blocked",
           "scan_px",
+          "scan_path",
           "gain_range",
           "L_PX",
           "R_PX",
         ]);
       },
       watch: {
-        // Amplitude is live on the next tick; only the ring preview needs a push.
+        // Everything that moves or reshapes the commanded ring republishes the
+        // drawn geometry (the pacer never does — spec §views).
+        verge: publishScanGeometry,
+        baseline: publishScanGeometry,
+        trim_lx: publishScanGeometry,
+        trim_ly: publishScanGeometry,
+        trim_rx: publishScanGeometry,
+        trim_ry: publishScanGeometry,
+        // Amplitude is live on the next tick; only the drawn ring needs a push.
         scan_amp() {
-          publishScanPx();
+          publishScanGeometry();
           if (activeScan) {
             activeScan = { ...activeScan, amp_deg: s.state.scan_amp };
             s.telemetry({ scan: activeScan });
@@ -769,7 +954,24 @@ export default function mirrorLinkSession(
           await queueScanOp(stopScanNow);
           publishScanBlocked(null);
         },
+        // Capture — forwarded to the shared helper (its guards live inside).
+        async captureShot({ tag }) {
+          if (!captureHelper) throw new Error("Capture not ready");
+          await captureHelper.captureShot(tag);
+        },
+        async getCapturePreview({ resource, index }) {
+          return captureHelper ? captureHelper.getPreview(resource, index) : null;
+        },
+        async saveCapture({ path, format }) {
+          await captureHelper?.save(path, format);
+        },
+        async discardCapture() {
+          await captureHelper?.discard();
+        },
         async startRecording({ path }) {
+          // Exclusivity (spec §capture): no recording while a capture shot
+          // holds the shared raw pipes.
+          if (captureHelper?.capturing) return false;
           return recording.start(path);
         },
         async stopRecording() {
@@ -777,6 +979,7 @@ export default function mirrorLinkSession(
         },
       },
       busy() {
+        if (captureHelper?.capturing) return "capture in progress";
         if (recording.active) return "recording in progress";
         return null;
       },

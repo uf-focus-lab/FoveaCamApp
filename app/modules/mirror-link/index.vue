@@ -13,13 +13,16 @@ You may find the full license in project root directory.
 <script setup lang="ts">
 import { computed, ref, shallowRef, watch } from "vue";
 import type { Rect } from "core/Geometry";
+import type { Pos } from "@lib/controller-codec";
 import { ROLE, THEME } from "@lib/camera-config";
 import { useSession, usePipeFrame } from "@lib/orchestrator/client";
 import { nodeId } from "@lib/orchestrator/graph-contract";
 import { getController } from "@src/components/Controller.vue";
+import Capture from "@src/capture";
 import Recording from "@src/record";
 import StreamView from "@src/components/StreamView.vue";
 import PosView from "@src/components/PosView.vue";
+import Line2D from "@src/components/Line2D.vue";
 import FrameCursor from "@src/components/FrameCursor.vue";
 import RangeSlider from "@src/inputs/range-slider.vue";
 import SingleSelect, {
@@ -37,7 +40,9 @@ const session = useSession(mirrorLink, "mirror-link");
 const { state, telemetry } = session;
 const controller = computed(getController);
 
-// Title-bar record button (the facade registers itself on construction).
+// Title-bar capture + record buttons (the facades register themselves on
+// construction; capture opens the preview window with Cmd/Ctrl-S).
+new Capture(session, "mirror-link");
 new Recording(session, "mirror-link");
 
 // The L/R views bind the RAW convert pipes — a frame integrating a full
@@ -135,6 +140,15 @@ const scanStatus = computed<{ text: string; tone: string; title: string }>(
   },
 );
 
+// The commanded ring in volt space, closed back onto its first point so the
+// PosView polyline reads as a loop (spec §views). Empty stays empty.
+const close = (path: readonly Pos[]): Pos[] =>
+  path.length > 1 ? [...path, path[0]] : [...path];
+const scanPath = computed(() => ({
+  L: close(telemetry.scan_path.L),
+  R: close(telemetry.scan_path.R),
+}));
+
 // The button label stays telemetry-truthful (`scanning`); `busy` only disables
 // it while a start/stop round-trip is in flight.
 const busy = ref(false);
@@ -228,13 +242,26 @@ function ringStatus(side: "L" | "R"): {
       title: `"${text}" · ${r.hex ?? ""} · read ${directionOf(r.reverse)}`,
     };
   }
+  // A failure names WHERE it gave up when the read got that far — the bit index
+  // is the offline-debugging hook (spec ring-code.md §reader).
+  const at = r.bitIndex === undefined ? "" : ` @ bit ${r.bitIndex}`;
   const last = r.last ? ` · last ${ellipsis(r.last.text)}` : "";
+  const detail = [
+    r.contrast === undefined
+      ? null
+      : `contrast ${r.contrast.toFixed(2)} (needs 0.15)`,
+    r.chipPx === undefined ? null : `${r.chipPx.toFixed(1)} px/chip`,
+    r.ridgePx === undefined
+      ? null
+      : `path ${r.ridgePx.toFixed(1)} px off the fitted circle`,
+    r.last ? `last decode "${r.last.text}" · ${r.last.hex}` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
   return {
-    text: `${r.reason}${last}`,
+    text: `${r.reason}${at}${last}`,
     tone: r.last ? "muted" : "warn",
-    title: r.last
-      ? `Last decode on this eye: "${r.last.text}" · ${r.last.hex}`
-      : "No frame has decoded on this eye yet.",
+    title: detail || "No frame has decoded on this eye yet.",
   };
 }
 const statusL = computed(() => ringStatus("L"));
@@ -272,7 +299,17 @@ const statusR = computed(() => ringStatus("R"));
         :lim="controller?.dv ?? 200"
         :color="THEME.L"
         style="width: 100%"
-      />
+      >
+        <!-- The commanded scan circle in volt space; the crosshair marks its
+             CENTER (spec §views). An empty path draws nothing. -->
+        <Line2D
+          :data="scanPath.L"
+          :color="THEME.L"
+          :marker="null"
+          :line-width="(controller?.dv ?? 200) * 0.012"
+          :style="{ opacity: scanning ? 1 : 0.7 }"
+        />
+      </PosView>
     </div>
     <div class="view">
       <StreamView
@@ -332,7 +369,7 @@ const statusR = computed(() => ringStatus("R"));
       <div class="scan-row" :title="scanHint">
         <button
           class="scan-button"
-          :class="{ on: scanning }"
+          :class="{ on: scanning, busy }"
           :disabled="!telemetry.ready || busy"
           @click="toggleScan"
         >
@@ -373,7 +410,17 @@ const statusR = computed(() => ringStatus("R"));
         :lim="controller?.dv ?? 200"
         :color="THEME.R"
         style="width: 100%"
-      />
+      >
+        <!-- The commanded scan circle in volt space; the crosshair marks its
+             CENTER (spec §views). An empty path draws nothing. -->
+        <Line2D
+          :data="scanPath.R"
+          :color="THEME.R"
+          :marker="null"
+          :line-width="(controller?.dv ?? 200) * 0.012"
+          :style="{ opacity: scanning ? 1 : 0.7 }"
+        />
+      </PosView>
     </div>
   </div>
   <Drawer v-model="drawer_height">
@@ -468,7 +515,7 @@ const statusR = computed(() => ringStatus("R"));
             title="Revolutions per second — also the per-frame exposure the foveas are overridden to while scanning. Right-click resets to neutral."
             :min="SCAN_HZ_RANGE.min"
             :max="SCAN_HZ_RANGE.max"
-            :neutral="20"
+            :neutral="10"
             :step="0.5"
           >
             <span>Scan Frequency</span>
@@ -571,36 +618,71 @@ const statusR = computed(() => ringStatus("R"));
 
 // The button + status line under the center tile. A plain row (see the
 // template): a <label> would forward status-span clicks to the button.
+// The row spans the tile, and the button owns a FIXED first column: its left
+// edge is the row's, its width never depends on the label or on the status
+// text (which is confined to a `minmax(0, 1fr)` ellipsis cell). No status
+// string can move it.
 .scan-row {
-  display: flex;
-  justify-content: space-between;
+  width: 100%;
+  display: grid;
+  grid-template-columns: 9em minmax(0, 1fr);
   align-items: center;
   gap: 1ch;
   margin: 0.4em 0;
 }
 
-// ONE button whose label swaps — a fixed min-width keeps the row from
-// reflowing on the swap (interaction principle: layout-stable).
+// ONE button whose label swaps. Emphasis is a SOLID FILL, never a border
+// (Principles §5, borderless inline controls; the RecordControls action-button
+// recipe). Text/fill pairs are AA: #111 on --accent = 4.9:1, #fff on --danger
+// = 7.8:1, and both press/hover states BRIGHTEN the fill, which only raises the
+// dark-on-accent ratio. No transition — state changes snap.
 .scan-button {
-  min-width: 13ch;
+  width: 100%;
+  min-height: 2em;
+  padding: 0.35em 1em;
+  border: none;
+  border-radius: 4px;
+  background: var(--accent);
+  color: var(--bg-chrome);
+  font: inherit;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+
   &.on {
-    border-color: var(--accent);
-    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    background: var(--danger);
+    color: var(--text);
   }
-  &:disabled {
+  &:hover:not(:disabled) {
+    filter: brightness(1.15);
+  }
+  &:active:not(:disabled) {
+    filter: brightness(1.25);
+  }
+  &:focus-visible {
+    outline: 2px solid var(--accent-bright);
+    outline-offset: 2px;
+  }
+  // Mid-round-trip: hold the CURRENT fill, just dimmed (a flash through a
+  // neutral grey on every toggle reads as a third state).
+  &.busy {
+    opacity: 0.5;
+    cursor: progress;
+  }
+  &:disabled:not(.busy) {
+    background: var(--tint-2);
+    color: var(--text);
     opacity: 0.5;
     cursor: not-allowed;
-    background: none;
   }
 }
 
 .scan-status {
   font-family: var(--font-mono);
-  // Shrinkable so the declared ellipsis engages instead of re-packing the row
-  // when the text swaps.
-  flex: 1 1 auto;
+  // Confined to its grid cell so the declared ellipsis engages instead of
+  // widening the row (and with it, the button's column).
   min-width: 0;
-  text-align: right;
+  text-align: end;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -627,6 +709,11 @@ const statusR = computed(() => ringStatus("R"));
   justify-content: space-between;
   gap: 1ch;
   font-size: 0.9em;
+
+  // Flex needs the explicit shrink basis the grid cell provides on its own.
+  .scan-status {
+    flex: 1 1 auto;
+  }
 }
 
 // Ring Reader (spec §reader): a label + a compact two-option SingleSelect on

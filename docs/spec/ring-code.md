@@ -86,53 +86,82 @@ emitter's convention; the frame format does not change). Chip timing on the emit
 
 ## Reader {#reader}
 
-Source: `app/lib/ring-code.ts` (pure decoder over a binary ring sample array — Vue-free,
-core-free, unit-tested) and `app/orchestrator/ring-kernel.ts` (the vision-worker kernel
-that turns a fovea frame into that array and back-annotates the result).
+Source: `app/lib/ring-code.ts` (the pure decoder over a normalized profile — Vue-free,
+core-free, unit-tested) and `app/orchestrator/ring-kernel.ts` (the vision-worker kernel that
+turns a fovea frame into that profile and back-annotates the result). The offline analyzer
+`scripts/ring-debug.py` is the reference implementation; both sides must agree.
 
 ### Ring extraction (kernel)
 
-1. **Bright mask**: pixels above `dark + BRIGHT_FRACTION · (peak − dark)` of the frame's
-   luminance (BGRA → max channel), computed on a 2× decimated copy.
-2. **Circle fit**: algebraic least-squares (Kåsa) over the mask, then two robust
-   re-fits discarding points whose radial residual exceeds 3σ. Reject (`no ring`) if fewer
-   than `MIN_RING_POINTS` inliers, radius below `MIN_RADIUS_PX`, or the inliers occupy
-   under half the angular bins (72 × 5°) — a dot, not a ring. Output `circle {x, y, r}` in
-   fovea px (the fit runs on the decimated mask; the circle is scaled back).
-3. **Angular profile**: `N = clamp(round(2π·r), 512, 4096)` samples at angles
-   `θ_i = 2π·i/N` (image coordinates, +x → +y clockwise on screen), each the mean of 3
-   radial taps at `r − 1.5, r, r + 1.5` px (bilinear). Threshold at the midpoint of the
-   profile's 5th and 95th percentiles → the binary ring `s[0..N)`.
+1. **Circle SEED**: pixels above `dark + BRIGHT_FRACTION · (peak − dark)` of the frame's
+   luminance (BGRA → max channel) on a 2× decimated copy; algebraic (Kåsa) least squares
+   over the mask, then two robust re-fits discarding >3σ radial residuals. Reject (`no ring`)
+   on fewer than `MIN_RING_POINTS` inliers, a radius below `MIN_RADIUS_PX`, or inliers
+   occupying under half the angular bins (72 × 5°) — a dot, not a ring. The circle is only a
+   SEED: the real path is an ellipse (the two mirror axes never match in gain and phase).
+2. **Two-pass RIDGE**, `N = clamp(round(2π·r), 512, 4096)` angles. *Coarse*: the max
+   intensity over the WIDE band `[r·0.65, r·1.35]` (min ±6 px) at 2 px steps, giving a
+   brightness and the radius it sat at. Angles above the midpoint of the coarse p5/p95 are
+   LIT; the radius track is interpolated circularly across the dark ones and smoothed
+   (circular moving average, window `N/24`). *Fine*: the max within ±6 px of that track at
+   1 px steps → the profile and its per-angle ridge radius. This follows any smooth closed
+   path; a fixed band around the fitted circle loses half the ring on a real ellipse.
+3. **Arc-length resampling**: `ds_i = hypot(track_i · 2π/N, Δtrack_i)`, cumulated; the
+   profile is resampled uniformly in arc length to `M = round(total arc)` samples (linear
+   interpolation). Angle from an off-center point distorts chip arcs by up to ±25 % on an
+   elliptical path; arc length along the ridge does not. Everything downstream works on the
+   resampled profile, and the arc→angle table is KEPT so the overlay reports image angles.
+4. **Local envelope normalization**: circular running max/min over a window of ±`M/24`;
+   `norm = clamp((p − min) / max(max − min, floor), 0, 1)` with `floor` = 10 % of the global
+   p95−p5 span. Brightness varies around the turn (vignetting, angular speed, the mirror's
+   roll-off), so one global threshold cannot follow it.
 
-### Decode (`decodeRing(s)`)
+`telemetry.ring.ridgePx` reports the peak deviation of the smoothed track from the fitted
+circle — the ellipse diagnostic.
 
-1. **Median-3** (circular) — a one-sample dropout (the exposure seam, speckle) cannot fake an edge.
-2. **Run-length encode** the circular array.
-3. **Leader search** (start of sequence): an ON run of length `L` preceded, in reading
-   order, by an OFF run of ≥ 2.5 chip-estimates; chip estimate `spc = L/4`; verify the tail
-   `0 11 0` at chip centers. Refine `spc` over the 5-chip span from the burst start to the
-   `11` run start. Tried in the forward direction, then on the reversed array; the
-   asymmetric tail matches exactly one. No match in either → `no leader`.
-4. **Resolution guard**: `spc < MIN_CHIP_PX` → `below resolution` (the emitter is over
-   budget or the amplitude too small; nothing to recover).
-5. **Bits**: from the data start, read half-chips `a = s[pos + 0.5·spc]`,
-   `b = s[pos + 1.5·spc]`; `10` → 1, `01` → 0, equal → `no mid-bit transition`. Re-anchor
-   the clock on each bit's transition (searched within ±½ chip of its expected position),
-   `pos = edge + spc`. Stop when the next three chip centers are all OFF (the terminating
-   gap). A read exceeding `8·(2 + 255)` bits → `no terminating gap`.
-6. **Checks**: fewer than 16 bits → `truncated`; bit count ≠ `8 + 8·LEN + 8` →
-   `length mismatch`; CRC-8 over the first `8 + 8·LEN` bits ≠ the last 8 → `crc mismatch`.
-7. **Result**: `{ ok: true, data, reverse, chipPx, leaderStart, dataStart, fieldEdges }`
-   where `leaderStart`/`dataStart`/the edges are sample indices in the ORIGINAL array's
-   orientation (a reversed decode's sample `i` maps back to `N − 1 − i`) — the
-   GAP/LEADER/LEN/DATA/CRC boundaries plus every INTERIOR DATA byte boundary; or
-   `{ ok: false, reason }` with one of the reasons above.
+### Decode (`decodeRing(norm)`)
 
-The kernel converts sample indices to angles (`θ = 2π·i/N`, un-reversed) so the renderer
-draws the annotations in fovea px: the fitted circle, the leader arc, and radial divider
-lines at every field and byte boundary. Its readout (`RingReadout`) carries the circle even
-when the decode failed, so a failed frame still shows where the ring was found; the
-extraction's own failure is `no ring` (circle null).
+1. **Binary**: `median3(norm ≥ 0.5)` (circular) — used ONLY for the structural search, so a
+   one-sample dropout (the exposure seam, speckle) cannot fake an edge.
+2. **Leader candidates** by RUN-LENGTH structure, over the binary's circular run list. For
+   every ON run of length `L`, with `spc0 = L/4`: the preceding OFF run in `[2.5, 5.5]·spc0`,
+   the following OFF in `[0.4, 1.5]·spc0`, the following ON in `[1.5, 2.5]·spc0`, the next
+   OFF ≥ `0.5·spc0`. Measured as RUNS, never as point samples: under blur a 2-chip ON run
+   preceded by a 2-chip OFF run passes a point-sampled tail check at half scale.
+   `spc = mean(L/4, (start of the "11" run − burst start)/5)`; data start = burst start +
+   `8·spc`. EVERY candidate is tried, forward then reversed.
+3. **Resolution guard**: `spc < MIN_CHIP_PX` → `below resolution` (the emitter is over
+   budget; nothing to recover).
+4. **Bits** — a joint template + phase decision on the NORMALIZED profile. For nine offsets
+   `d` spanning `[−0.35, +0.35]·spc`: `A = mean(norm over [pos+d, pos+d+spc))`,
+   `B = mean(norm over [pos+d+spc, pos+d+2·spc))`; the most-separated `d` wins.
+   `|A − B| < 0.15` → `low contrast` (reported with the bit index and the measured
+   contrast). `bit = A > B`. The mid-bit edge is `pos + d + spc`; the chip period then
+   follows the least-squares slope of the last 8 `(chip index, edge)` pairs, accepted only
+   within `[0.6, 1.4]·spc`. `pos = edge + spc`.
+5. **LEN is a plausibility CHECK**: after 8 bits, `expected = M / (11 + 16·(LEN + 2))` (the
+   frame fills the whole ring by construction); `|spc − expected| > 0.35·expected` → `chip
+   period inconsistent with LEN`. The read then targets exactly `16 + 8·LEN` bits.
+6. **Termination is LENGTH-driven**: after the last bit the trailing gap is CONFIRMED —
+   `mean(norm over the next 3 chips) ≤ 0.35`, else `no terminating gap`. `truncated` only
+   when a candidate cannot reach 16 bits.
+7. **CRC-8** over the first `8 + 8·LEN` bits against the last 8 → `crc mismatch`.
+8. **Result**: the first CRC-valid candidate wins. `{ ok: true, data, reverse, chipPx,
+   leaderStart, dataStart, fieldEdges }` where `leaderStart`/`dataStart`/the edges are
+   sample indices in the ORIGINAL array's orientation (a reversed decode's sample `i` maps
+   back to `N − 1 − i`) — the GAP/LEADER/LEN/DATA/CRC boundaries plus every INTERIOR DATA
+   byte boundary. If no candidate passes, the reported failure is the one from the candidate
+   that got FURTHEST through the frame.
+
+Failure reasons, exhaustive: `no ring` (extraction) · `no leader` · `below resolution` ·
+`low contrast` · `chip period inconsistent with LEN` · `no terminating gap` · `truncated` ·
+`crc mismatch`.
+
+The kernel maps sample indices back to image angles through the arc→angle table, so the
+renderer draws the annotations in fovea px: the fitted circle, the leader arc, and radial
+divider lines at every field and byte boundary. `RingReadout` carries the circle even when
+the decode failed (plus `bitIndex`/`contrast` where the read gave up), so a failed frame
+still shows where the ring was found and why it was dropped.
 
 ### Error recovery
 
@@ -149,5 +178,13 @@ reason otherwise.
 `"Hello"`, `FF 00 A5 5A`, `"Hello, world!"`: the data, LEN, CRC-8, and the full chip
 string. `ring-code.test.ts` pins `encodeFrame` to them and proves `decodeRing` recovers
 each under every rotation, both directions, non-integer samples per chip, and a one-sample
-seam; and that a flipped bit yields `crc mismatch`, a truncated tail `length mismatch`,
-and an oversubscribed ring `below resolution`.
+seam; that a flipped bit yields `crc mismatch`, an oversubscribed ring `below resolution`,
+and a payload disagreeing with LEN is never decoded.
+
+`ring-kernel.test.ts` drives the EXTRACTION with a port of the analyzer's `synth`
+(elliptical path, brightness gradient, Gaussian dot, sensor noise) and asserts its
+`--selftest` cases: circle · mild ellipse (6 % gain, 3° phase) · + gradient ×0.4 · + fat
+dot · the harsh 1.5:1 ellipse · harsh + gradient + fat dot all decode `"Hello"`; merged
+chips (dot ≈ 2× the chip arc) is REFUSED, never mis-decoded. A 40-case randomized sweep
+(ecc ≤ 0.08, ±5° phase, gradient ≥ 0.35, σ 2.5–4 px, r 200–260 px) must decode ≥ 90 %, and
+every non-decode must be an honest refusal.

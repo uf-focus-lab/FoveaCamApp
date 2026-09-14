@@ -40,10 +40,11 @@ Phase is derived from the pacer's WALL CLOCK (`performance.now() − t0`), never
 tick counter — a late or coalesced tick lands at the correct phase instead of
 accumulating drift. Zero amplitude degenerates to the idle pose.
 
-Parameters (`scan_hz` 1–100 Hz, `scan_amp` 0–2°) are LIVE: a change while active takes
-effect on the next tick (amplitude) or re-applies the exposure override (frequency,
-§exposure). The mirror's own low-pass response attenuates the realized radius at higher
-frequencies — the commanded circle is exact, the physical one is a rig measurement.
+Parameters (`scan_hz` 1–100 Hz, default 10 — a 100 ms revolution; `scan_amp` 0–2°) are
+LIVE: a change while active takes effect on the next tick (amplitude) or re-applies the
+exposure override (frequency, §exposure). The mirror's own low-pass response attenuates
+the realized radius at higher frequencies — the commanded circle is exact, the physical
+one is a rig measurement.
 
 ## Scan lifecycle {#lifecycle}
 
@@ -152,13 +153,21 @@ stereo/composite/heatmap bricks. Overlays on the center view, all in wide px:
   offset-free volts, trims included), not the instantaneous scan pose — they show where
   each fovea is aimed, and separate as trims diverge. Hidden uncalibrated ({0,0}).
 
-`telemetry.volt` IS the instantaneous commanded pose (the PosViews trace the circle at
-the telemetry throttle — honest, and a cheap liveness cue). PosViews are read-only here
-(no split).
+The PosViews draw the scan as a STATIC path with a stable crosshair: `telemetry.volt` is
+the commanded pose while idle and the ring's CENTER while scanning (sampling the circle at
+the 30 Hz telemetry throttle reads as random flicker, not motion), and
+`telemetry.scan_path = { L, R }` carries the commanded circle in VOLT space —
+`SCAN_PATH_SAMPLES` (48) points per eye through the pacer's own chain (offset →
+`inverseTriangulate` + trims → `A2V`), which the renderer closes into a loop and draws with
+`Line2D` (faint idle, solid while active). It is republished on every input that moves or
+reshapes the ring (steer, `scan_amp`, `verge`, `baseline`, the four trims, activation) and
+NEVER per tick; empty without a leased triple. PosViews are read-only here (no split).
 
-Below the center tile: ONE button whose label swaps Start Scan / Stop Scan (fixed
-min-width so the swap is layout-stable; label tracks `telemetry.scan`; disabled until
-`ready` and while a start/stop round-trip is in flight; accent styling while active) and
+Below the center tile: ONE button whose label swaps Start Scan / Stop Scan (the row is a
+GRID with a fixed 9em first track, so neither the label nor the status text can move or
+resize it; label tracks `telemetry.scan`; disabled until `ready`, dimmed in place while a
+start/stop round-trip is in flight; solid `--accent` fill idle, solid `--danger` while
+scanning — emphasis is a FILL, never a border, and both pairs clear AA) and
 a compact status span — the applied `hz · period · per-eye exposure` while active,
 `idle` / `idle — refused` otherwise, warn-toned on `mismatch` or a refusal, with the
 detail (and the blocked reason) in its `title` hover. The row is a PLAIN div, never a
@@ -188,8 +197,28 @@ Volt/pose telemetry is throttled to `VOLT_TELEMETRY_INTERVAL_MS`.
 
 capture-recorder-everywhere: the title-bar record button writes the raw L/C/R streams
 through the shared `@orchestrator/raw-recording` facility (`recorder/mirror-link`; no
-per-frame fovea binding — a scanned frame has no single pose). Still capture is NOT
-offered (no capture helper, no capture window). `busy()` refuses a mid-recording drain.
+per-frame fovea binding — a scanned frame has no single pose). `busy()` refuses a
+mid-recording drain.
+
+## Capture {#capture}
+
+The offline debugging path: the title-bar capture button (or `Cmd/Ctrl-S`) runs ONE shot
+through the shared `@orchestrator/capture-helper` (`capture/mirror-link`), holding
+full-depth stacked L/R foveae + the undistorted center, and the preview sub-window saves
+them as `<resource>.<png|tiff>` (BGR, 16-bit for the foveae) + `<resource>.json`.
+
+`stackCount` is `state.cap_stack` (default 1 — one revolution IS the frame; no slider).
+The homographies are IDENTITY and the rect is the whole center frame: a frame that
+integrated a revolution has no single mirror pose to warp against, and the UNWARPED ring is
+exactly what the analyzer reads. Every resource's metadata carries a `mirror_link` block —
+`scan` (the applied timing, null when idle), `ring` (the last per-eye readout: fitted
+circle, chip arc, reason), the trims, `verge`, `baseline`, `target_angle`, and the
+center-pose volts/angles/`A2H` matrices for reference — so a saved frame explains itself.
+`scripts/ring-debug.py <image>` reads both.
+
+Exclusivity, as everywhere: a capture in flight refuses `startRecording`, a recording
+refuses a shot, and `busy()` names either. The drain awaits an in-flight capture before the
+recording drain and the lease release.
 
 ## Teardown ordering {#teardown}
 

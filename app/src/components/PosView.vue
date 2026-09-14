@@ -9,6 +9,8 @@ import { ref, computed, getCurrentInstance, useTemplateRef } from "vue";
 import { pointerObscured } from "@lib/pointer-obscured";
 
 export type Pos = { x: number; y: number };
+/** Per-instance id for the slot clip (several pads share a document). */
+const clipId = `posview-clip-${(getCurrentInstance()?.uid ?? 0).toString(36)}`;
 const emit = defineEmits<{ (e: "select", v: Pos | null): void }>();
 const canvas = useTemplateRef("canvas");
 
@@ -170,8 +172,14 @@ function track(e: MouseEvent) {
       fill="white"
       opacity="0.4"
     />
-    <!-- Slots -->
-    <slot></slot>
+    <!-- Slots: clipped to the pad so an overlay near the travel limit cannot
+         paint over the readouts or spill past the viewport. -->
+    <clipPath :id="clipId">
+      <rect :x="-lim" :y="-lim" :width="lim * 2" :height="lim * 2" />
+    </clipPath>
+    <g :clip-path="`url(#${clipId})`">
+      <slot></slot>
+    </g>
     <!-- Dashed lines -->
     <line v-for="(line, i) in crossHair()" :key="i" v-bind="line" />
     <!-- Position text -->

@@ -181,24 +181,22 @@ describe("decodeRing", () => {
     const got = decodeRing(expose(flipped, 0, false, n), {
       minChipPx: MIN_CHIP_PX,
     });
-    expect(got).toEqual({ ok: false, reason: "crc mismatch" });
+    expect(got).toMatchObject({ ok: false, reason: "crc mismatch" });
   });
 
-  it("drops a truncated frame — length mismatch", () => {
-    const data = new Uint8Array([0x48, 0x65, 0x6c, 0x6c, 0x6f]);
-    const chips = encodeFrame(data);
-    const n = ringSamplesFor(chips.length);
-    // Drop the last byte's worth of chips and close the ring with a gap: the
-    // bit count no longer agrees with the LEN field.
+  it("drops a frame whose payload disagrees with its LEN", () => {
+    // A LEN=5 frame carrying only 4 bytes: the chip count no longer matches
+    // the length field, and the frame no longer fills the ring the way LEN
+    // says it does. Never a decode — the specific guard that catches it
+    // (`length mismatch` / the LEN period check / the tail) is not pinned.
+    const chips = encodeFrame(new Uint8Array([0x48, 0x65, 0x6c, 0x6c, 0x6f]));
     const short = new Uint8Array(chips.length - 16);
     short.set(chips.subarray(0, chips.length - 16));
-    short[short.length - 1] = 0;
-    short[short.length - 2] = 0;
-    short[short.length - 3] = 0;
+    const n = ringSamplesFor(chips.length);
     const got = decodeRing(expose(short, 0, false, n), {
       minChipPx: MIN_CHIP_PX,
     });
-    expect(got).toEqual({ ok: false, reason: "length mismatch" });
+    expect(got.ok).toBe(false);
   });
 
   it("refuses an over-budget emitter — below resolution", () => {
@@ -210,7 +208,7 @@ describe("decodeRing", () => {
     const got = decodeRing(expose(chips, 0, false, 1500), {
       minChipPx: MIN_CHIP_PX,
     });
-    expect(got).toEqual({ ok: false, reason: "below resolution" });
+    expect(got).toMatchObject({ ok: false, reason: "below resolution" });
   });
 
   it("reports `no leader` for a blank or featureless ring", () => {

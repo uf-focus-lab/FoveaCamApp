@@ -36,9 +36,25 @@ const MIN_COVERAGE = 0.5;
 const ROBUST_REFITS = 2;
 const PROFILE_MIN = 512;
 const PROFILE_MAX = 4096;
-/** Radial taps averaged per angular sample. */
-const TAPS = [-1.5, 0, 1.5];
-
+/** COARSE ridge pass: a wide radial band (fraction of the fitted radius, min
+ *  px) found at 2 px steps — the real path is an ELLIPSE (mirror-axis gain and
+ *  phase never match), so the fitted circle is only a seed.
+ */
+const RIDGE_COARSE_BAND = 0.35;
+const RIDGE_COARSE_MIN_PX = 6;
+const COARSE_STEP_PX = 2;
+/** FINE pass: the max within this many px of the smoothed track, at 1 px. */
+const RIDGE_FINE_PX = 6;
+const FINE_STEP_PX = 1;
+/** Circular moving-average windows (fraction of the turn) for the radius track
+ *  in the coarse pass and in the arc-length resampling. */
+const TRACK_WINDOW_DIV = 24;
+const ARC_WINDOW_DIV = 36;
+/** Envelope window for the local normalization, as a fraction of the turn.
+ *  M/24 is the HALF width, so the span covers several chips either side. */
+const ENVELOPE_DIV = 24;
+/** Floor for the local span, as a fraction of the global p95-p5 span. */
+const ENVELOPE_FLOOR = 0.1;
 /** A frame the reader consumes — a plain view over interleaved 8-bit pixels. */
 export type RingImage = {
   data: Uint8Array;
@@ -50,6 +66,7 @@ export type RingImage = {
 
 export type RingReadOptions = {
   minChipPx?: number;
+  minContrast?: number;
   brightFraction?: number;
 };
 
@@ -171,12 +188,27 @@ function coverage(
 }
 
 export function createRingReader(): RingReader {
-  // Scratch, grown on demand and reused across frames.
+  // Scratch, grown on demand and reused across frames: the hot path allocates
+  // only when a bigger ring arrives.
   let xs = new Float64Array(0);
   let ys = new Float64Array(0);
+  // Angular-domain buffers (length n).
+  let coarseP = new Float32Array(0);
+  let coarseR = new Float32Array(0);
+  let bandLo = new Float32Array(0);
+  let bandHi = new Float32Array(0);
+  let track = new Float32Array(0);
   let profile = new Float32Array(0);
-  let sorted = new Float32Array(0);
-  let binary = new Uint8Array(0);
+  let ridgeR = new Float32Array(0);
+  let arcCum = new Float64Array(0);
+  // Arc-domain buffers (length m).
+  let resampled = new Float32Array(0);
+  let srcIndex = new Float32Array(0);
+  let norm = new Float32Array(0);
+  let envHi = new Float32Array(0);
+  let envLo = new Float32Array(0);
+  let sortBuf = new Float32Array(0);
+  let deque = new Int32Array(0);
   const bins = new Uint8Array(COVERAGE_BINS);
 
   function ensurePoints(n: number): void {
@@ -184,11 +216,245 @@ export function createRingReader(): RingReader {
     xs = new Float64Array(n);
     ys = new Float64Array(n);
   }
-  function ensureProfile(n: number): void {
-    if (profile.length >= n) return;
+
+  function ensureBuffers(n: number): void {
+    if (coarseP.length >= n) return;
+    coarseP = new Float32Array(n);
+    coarseR = new Float32Array(n);
+    bandLo = new Float32Array(n);
+    bandHi = new Float32Array(n);
+    track = new Float32Array(n);
     profile = new Float32Array(n);
-    sorted = new Float32Array(n);
-    binary = new Uint8Array(n);
+    ridgeR = new Float32Array(n);
+    arcCum = new Float64Array(n + 1);
+    resampled = new Float32Array(n);
+    srcIndex = new Float32Array(n);
+    norm = new Float32Array(n);
+    envHi = new Float32Array(n);
+    envLo = new Float32Array(n);
+    sortBuf = new Float32Array(n);
+    deque = new Int32Array(3 * n + 2);
+  }
+
+  /** `q`-th percentile of `src[0..n)` (sorts into scratch). */
+  function percentile(src: Float32Array, n: number, q: number): number {
+    sortBuf.set(src.subarray(0, n), 0);
+    sortBuf.subarray(0, n).sort();
+    return sortBuf[Math.floor(q * (n - 1))];
+  }
+
+  /** Per angle: the brightest sample over the radial band [lo, hi] and the
+   *  radius it sat at — the ring's own track, wherever it actually runs. */
+  function bandMax(
+    img: RingImage,
+    circle: RingCircle,
+    n: number,
+    lo: Float32Array,
+    hi: Float32Array,
+    step: number,
+    outP: Float32Array,
+    outR: Float32Array,
+  ): void {
+    for (let i = 0; i < n; i++) {
+      const a = (2 * Math.PI * i) / n;
+      const ca = Math.cos(a);
+      const sa = Math.sin(a);
+      const r0 = lo[i];
+      const r1 = hi[i];
+      const steps = Math.max(1, Math.ceil((r1 - r0) / step));
+      let peak = -1;
+      let peakAt = (r0 + r1) / 2;
+      for (let k = 0; k <= steps; k++) {
+        const rr = r0 + ((r1 - r0) * k) / steps;
+        const v = sample(img, circle.x + rr * ca, circle.y + rr * sa);
+        if (v > peak) {
+          peak = v;
+          peakAt = rr;
+        }
+      }
+      outP[i] = peak;
+      outR[i] = peakAt;
+    }
+  }
+
+  /** Bridge a per-angle track across the DARK angles (where the radius is not
+   *  measurable) by circular interpolation, then smooth it circularly. */
+  function smoothTrack(
+    values: Float32Array,
+    litOf: (i: number) => boolean,
+    n: number,
+    windowDiv: number,
+    out: Float32Array,
+  ): void {
+    let lit = 0;
+    for (let i = 0; i < n; i++) if (litOf(i)) lit++;
+    if (lit < 8) {
+      out.set(values.subarray(0, n), 0);
+      return;
+    }
+    // Nearest lit neighbour each way (two circular sweeps), then lerp.
+    const prevAt = new Float32Array(n);
+    const nextAt = new Float32Array(n);
+    let last = -1;
+    for (let pass = 0; pass < 2; pass++)
+      for (let i = 0; i < n; i++) {
+        if (litOf(i)) last = i;
+        prevAt[i] = last;
+      }
+    last = -1;
+    for (let pass = 0; pass < 2; pass++)
+      for (let i = n - 1; i >= 0; i--) {
+        if (litOf(i)) last = i;
+        nextAt[i] = last;
+      }
+    for (let i = 0; i < n; i++) {
+      if (litOf(i)) {
+        out[i] = values[i];
+        continue;
+      }
+      const p = prevAt[i];
+      const q = nextAt[i];
+      const dp = (((i - p) % n) + n) % n;
+      const dq = (((q - i) % n) + n) % n;
+      const w = dp + dq;
+      out[i] = w > 0 ? (values[p] * dq + values[q] * dp) / w : values[p];
+    }
+    // Circular moving average over 2w+1 via a running sum.
+    const w = Math.max(4, Math.floor(n / windowDiv));
+    const at_ = (i: number) => out[((i % n) + n) % n];
+    let sum = 0;
+    for (let k = -w; k <= w; k++) sum += at_(k);
+    const smoothed = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      smoothed[i] = sum / (2 * w + 1);
+      sum += at_(i + w + 1) - at_(i - w);
+    }
+    out.set(smoothed, 0);
+  }
+
+  /** Two-pass RIDGE (spec §reader): a WIDE coarse band finds the ring's radius
+   *  at every lit angle — any smooth closed path, not just a circle — and a
+   *  NARROW pass around that smoothed track takes the profile. */
+  function ridgeProfile(img: RingImage, circle: RingCircle): number {
+    const n = Math.min(
+      PROFILE_MAX,
+      Math.max(PROFILE_MIN, Math.round(2 * Math.PI * circle.r)),
+    );
+    ensureBuffers(n);
+    const half = Math.max(RIDGE_COARSE_MIN_PX, RIDGE_COARSE_BAND * circle.r);
+    for (let i = 0; i < n; i++) {
+      bandLo[i] = circle.r - half;
+      bandHi[i] = circle.r + half;
+    }
+    bandMax(img, circle, n, bandLo, bandHi, COARSE_STEP_PX, coarseP, coarseR);
+    const lit = (p5: number, p95: number) => {
+      const level = (p5 + p95) / 2;
+      return (i: number) => coarseP[i] > level;
+    };
+    smoothTrack(
+      coarseR,
+      lit(percentile(coarseP, n, 0.05), percentile(coarseP, n, 0.95)),
+      n,
+      TRACK_WINDOW_DIV,
+      track,
+    );
+    for (let i = 0; i < n; i++) {
+      bandLo[i] = track[i] - RIDGE_FINE_PX;
+      bandHi[i] = track[i] + RIDGE_FINE_PX;
+    }
+    bandMax(img, circle, n, bandLo, bandHi, FINE_STEP_PX, profile, ridgeR);
+    return n;
+  }
+
+  /**
+   * Resample the angular profile uniformly in ARC LENGTH along the detected
+   * ridge (spec §reader): the fitted circle's angle from an off-center point
+   * distorts chip arcs by up to ±25 % on an elliptical path; arc length does
+   * not. `srcIndex` keeps the arc→angle table so the overlay can be reported
+   * back in image angles.
+   *
+   * @returns the resampled length `m`.
+   */
+  function resampleByArc(n: number): number {
+    const level =
+      (percentile(profile, n, 0.05) + percentile(profile, n, 0.95)) / 2;
+    smoothTrack(ridgeR, (i) => profile[i] > level, n, ARC_WINDOW_DIV, track);
+    const dTheta = (2 * Math.PI) / n;
+    arcCum[0] = 0;
+    for (let i = 0; i < n; i++) {
+      const dr = track[(i + 1) % n] - track[i];
+      arcCum[i + 1] = arcCum[i] + Math.hypot(track[i] * dTheta, dr);
+    }
+    const total = arcCum[n];
+    const m = Math.max(16, Math.min(n, Math.round(total)));
+    let cursor = 0;
+    for (let k = 0; k < m; k++) {
+      const target = (k * total) / m;
+      while (cursor < n - 1 && arcCum[cursor + 1] <= target) cursor++;
+      const span = arcCum[cursor + 1] - arcCum[cursor];
+      const frac = span > 0 ? (target - arcCum[cursor]) / span : 0;
+      const src = cursor + frac;
+      srcIndex[k] = src;
+      const i0 = Math.floor(src);
+      const f = src - i0;
+      resampled[k] = profile[i0 % n] * (1 - f) + profile[(i0 + 1) % n] * f;
+    }
+    return m;
+  }
+
+  /** Local envelope normalization (spec §reader): brightness varies around the
+   *  turn — vignetting, angular speed, the mirror's own roll-off — so the
+   *  threshold has to be local. */
+  function normalizeEnvelope(m: number): void {
+    const w = Math.max(8, Math.floor(m / ENVELOPE_DIV));
+    slidingExtreme(resampled, m, w, envHi, true);
+    slidingExtreme(resampled, m, w, envLo, false);
+    const p5 = percentile(resampled, m, 0.05);
+    const p95 = percentile(resampled, m, 0.95);
+    const floor = ENVELOPE_FLOOR * Math.max(p95 - p5, 1e-9);
+    for (let i = 0; i < m; i++) {
+      const v =
+        (resampled[i] - envLo[i]) / Math.max(envHi[i] - envLo[i], floor);
+      norm[i] = v < 0 ? 0 : v > 1 ? 1 : v;
+    }
+  }
+
+  /** Circular sliding min/max over ±`half`, monotonic-deque so the envelope
+   *  costs one pass regardless of the window width. */
+  function slidingExtreme(
+    src: Float32Array,
+    n: number,
+    half: number,
+    out: Float32Array,
+    isMax: boolean,
+  ): void {
+    const val = (j: number) => src[((j % n) + n) % n];
+    let head = 0;
+    let tail = 0;
+    for (let j = -half; j < n + half; j++) {
+      const v = val(j);
+      while (
+        tail > head &&
+        (isMax ? val(deque[tail - 1]) <= v : val(deque[tail - 1]) >= v)
+      )
+        tail--;
+      deque[tail++] = j;
+      const i = j - half;
+      while (deque[head] < j - 2 * half) head++;
+      if (i >= 0 && i < n) out[i] = val(deque[head]);
+    }
+  }
+
+  /** Arc-domain sample index → image angle (radians), through the resampling
+   *  table — the overlay is drawn in the frame, not in arc space. */
+  function angleAt(index: number, m: number, n: number): number {
+    const i = ((index % m) + m) % m;
+    const i0 = Math.floor(i);
+    const f = i - i0;
+    const a = srcIndex[i0];
+    let b = srcIndex[(i0 + 1) % m];
+    if (b < a) b += n; // the table wraps once per turn
+    return (2 * Math.PI * (a + (b - a) * f)) / n;
   }
 
   /** Bright mask on the decimated frame → the fitted circle in FULL-res px. */
@@ -199,8 +465,8 @@ export function createRingReader(): RingReader {
     const dw = Math.floor(img.width / DECIMATE);
     const dh = Math.floor(img.height / DECIMATE);
     if (dw < 3 || dh < 3) return null;
-    let dark = 255;
-    let peak = 0;
+    let dark = Infinity;
+    let peak = -Infinity;
     for (let y = 0; y < dh; y++) {
       const row = y * DECIMATE * img.width;
       for (let x = 0; x < dw; x++) {
@@ -265,33 +531,16 @@ export function createRingReader(): RingReader {
     return full;
   }
 
-  /** Angular profile around `circle` → the thresholded binary ring. */
-  function profileOf(img: RingImage, circle: RingCircle): Uint8Array {
-    const n = Math.min(
-      PROFILE_MAX,
-      Math.max(PROFILE_MIN, Math.round(2 * Math.PI * circle.r)),
-    );
-    ensureProfile(n);
+  /** Peak deviation of the SMOOTHED ridge track from the fitted circle (frame
+   *  px) — how far the real path departs from a circle. The raw per-angle peak
+   *  is meaningless across the dark stretches; the track is interpolated. */
+  function ridgeDeviation(n: number, r: number): number {
+    let worst = 0;
     for (let i = 0; i < n; i++) {
-      const a = (2 * Math.PI * i) / n;
-      const ca = Math.cos(a);
-      const sa = Math.sin(a);
-      let sum = 0;
-      for (const d of TAPS)
-        sum += sample(
-          img,
-          circle.x + (circle.r + d) * ca,
-          circle.y + (circle.r + d) * sa,
-        );
-      profile[i] = sum / TAPS.length;
+      const d = Math.abs(track[i] - r);
+      if (d > worst) worst = d;
     }
-    sorted.set(profile.subarray(0, n), 0);
-    sorted.subarray(0, n).sort();
-    const p5 = sorted[Math.floor(0.05 * (n - 1))];
-    const p95 = sorted[Math.floor(0.95 * (n - 1))];
-    const level = (p5 + p95) / 2;
-    for (let i = 0; i < n; i++) binary[i] = profile[i] >= level ? 1 : 0;
-    return binary.subarray(0, n);
+    return worst;
   }
 
   return {
@@ -301,10 +550,25 @@ export function createRingReader(): RingReader {
         opts.brightFraction ?? DEFAULT_BRIGHT_FRACTION,
       );
       if (!circle) return { ok: false, reason: "no ring", circle: null };
-      const ring = profileOf(img, circle);
-      const decoded = decodeRing(ring, { minChipPx: opts.minChipPx });
-      if (!decoded.ok) return { ok: false, reason: decoded.reason, circle };
-      const angle = (i: number): number => (2 * Math.PI * i) / ring.length;
+      const n = ridgeProfile(img, circle);
+      const m = resampleByArc(n);
+      normalizeEnvelope(m);
+      const ridgePx = ridgeDeviation(n, circle.r);
+      const decoded = decodeRing(norm.subarray(0, m), {
+        minChipPx: opts.minChipPx,
+        minContrast: opts.minContrast,
+      });
+      if (!decoded.ok)
+        return {
+          ok: false,
+          reason: decoded.reason,
+          bitIndex: decoded.bitIndex,
+          contrast: decoded.contrast,
+          chipPx: decoded.chipPx,
+          ridgePx,
+          circle,
+        };
+      const angle = (i: number): number => angleAt(i, m, n);
       const dividers: { name: RingFieldName; angle: number }[] =
         decoded.fieldEdges.map((e) => ({ name: e.name, angle: angle(e.at) }));
       return {
@@ -314,6 +578,7 @@ export function createRingReader(): RingReader {
         circle,
         chipPx: decoded.chipPx,
         reverse: decoded.reverse,
+        ridgePx,
         leaderArc: {
           from: angle(decoded.leaderStart),
           to: angle(decoded.dataStart),
