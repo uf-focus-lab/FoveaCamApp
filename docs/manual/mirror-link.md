@@ -17,11 +17,12 @@ and the center view falls back to the raw, distorted image.
 
 Three live columns sit across the top:
 
-- **Left Fovea** (cyan) — the left fovea view with a voltage bar beneath it. The
-  view is the raw camera image, deliberately *not* straightened: a frame that
-  integrates a whole revolution has no single mirror position to straighten it
-  against, and the un-straightened ring is what you are here to read. The
-  voltage bar traces the circle live while the scan runs.
+- **Left Fovea** (cyan) — the left fovea view, a one-line ring readout, and a
+  voltage bar. The view is the raw camera image, deliberately *not* straightened:
+  a frame that integrates a whole revolution has no single mirror position to
+  straighten it against, and the un-straightened ring is what you are here to
+  read. The readout row appears only with **Ring Reader** on (see *Reading the
+  emitter*). The voltage bar traces the circle live while the scan runs.
 - **Center Wide** (orange) — the wide view you steer on. It carries a crosshair
   at the scan center with its angle in degrees, the scan ring, and a small cyan
   and greenyellow circle showing where each fovea is currently aimed. Below it
@@ -29,8 +30,8 @@ Three live columns sit across the top:
 - **Right Fovea** (greenyellow) — the mirror image of the left column.
 
 A pull-up **drawer** along the bottom holds the alignment sliders on the left,
-and the **Gain** slider, the scan sliders, and a **Status** row repeating the
-scan readout on the right.
+and the **Gain** slider, the scan sliders, the **Ring Reader** switch, and a
+**Status** row repeating the scan readout on the right.
 Click the tab at the bottom edge to open it — `Ctrl-\`` toggles it from the
 keyboard — then drag the grip to resize it.
 
@@ -103,6 +104,42 @@ the current settings would apply.
 If **Start Scan** is refused (no cameras leased, or a camera rejected the
 exposure write) the status line reads *idle — refused* and its hover carries the
 reason.
+
+### Reading the emitter
+
+The **Ring Reader** switch in the drawer's right half (under the scan sliders, above
+**Status**) turns the decoder on. It is **off by default** — it reads every fovea frame on
+its own worker thread, so it is only worth paying for when you are actually reading an
+emitter. It becomes available once the cameras are leased.
+
+With it on, and while the scan runs, MirrorLink decodes the ring in every fovea frame —
+separately for each eye — and annotates the view:
+
+- The **circle** it found, in that eye's color. Solid means the frame decoded; dim and
+  dashed means it found a ring but could not read it.
+- A short amber **arc** marking the *leader*, the start-of-message burst — where the
+  message begins. (For which way it runs, hover the readout.)
+- **Ticks** crossing the ring at the message's internal boundaries — long ticks between
+  fields (gap, leader, length, data, checksum), short ticks between data bytes.
+
+Under each view a one-line readout shows the decoded text and the measured width of one
+emitter slot (`px/chip`). Hover it for the full text, the raw hex and the reading
+direction. When a frame
+fails, the line shows why and keeps the last message that did decode, so a good read stays
+on screen:
+
+| Reason | What to do |
+|---|---|
+| `no ring` | No circular track was found — the emitter is out of frame, too dim (raise **Gain**), or the scan is not running. |
+| `no leader` | A ring, but no start marker: usually too dim or the emitter is not sending this format. |
+| `below resolution` | The message is too long for the ring you are drawing. Raise **Scan Amplitude**, or shorten the emitter's message. |
+| `no mid-bit transition`, `no terminating gap`, `truncated` | The ring was garbled — check focus, exposure (the **Status** line must not be amber) and that the emitter's cycle matches the scan frequency. |
+| `length mismatch`, `crc mismatch` | The message arrived damaged. Single frames fail all the time; a *persistent* failure means the emitter's rate and the scan frequency disagree. |
+
+Nothing is corrected: a bad frame is dropped and the next revolution is a fresh read. That
+is why the readout can flicker between a decode and a reason while the last good value
+stays visible. Turning the switch off removes the annotations and the readout rows
+entirely, and stops the decoding work.
 
 ### To brighten a dim source
 

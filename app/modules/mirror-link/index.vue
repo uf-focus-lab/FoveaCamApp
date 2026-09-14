@@ -22,9 +22,14 @@ import StreamView from "@src/components/StreamView.vue";
 import PosView from "@src/components/PosView.vue";
 import FrameCursor from "@src/components/FrameCursor.vue";
 import RangeSlider from "@src/inputs/range-slider.vue";
+import SingleSelect, {
+  type SingleSelectOption,
+} from "@src/inputs/single-select.vue";
 import Drawer from "@src/components/Drawer.vue";
 import HorizontalDivision from "@src/layouts/HorizontalDivision.vue";
 import { vergeToDistance } from "@lib/stereo";
+import RingOverlay from "./RingOverlay.vue";
+import { ringGeometry, strokeFor } from "./overlay";
 import { mirrorLink } from "./contract";
 import { SCAN_AMP_RANGE, SCAN_HZ_RANGE, TRIM_RANGE_DEG } from "./scan";
 
@@ -55,9 +60,7 @@ const size = computed(() => ({
   width: frameC.value?.shape[1] ?? 0,
   height: frameC.value?.shape[0] ?? 0,
 }));
-const stroke = computed(
-  () => Math.max(size.value.width, size.value.height, 1) * 0.003,
-);
+const stroke = computed(() => strokeFor(frameC.value?.shape));
 
 // --- steering (spec §targeting) ---------------------------------------------
 const cursor = shallowRef<(Rect & { buttons: number }) | null>(null);
@@ -154,6 +157,88 @@ const scanHint = computed(() => {
     ? "Stop the scan and restore both fovea cameras' exposure settings."
     : "Start the circular scan and override both fovea cameras so one frame spans one revolution.";
 });
+// --- ring reader (spec §reader) ---------------------------------------------
+// An OPTIONAL node, default off — the session builds/disposes it on this state.
+// SingleSelect over a string proxy is the house idiom for a boolean drawer
+// control (manual-control's Capture Mode).
+const RING_OPTIONS: readonly SingleSelectOption<"off" | "on">[] = [
+  { value: "off", label: "Off" },
+  { value: "on", label: "On" },
+];
+const ringReader = computed<"off" | "on">({
+  get: () => (state.ring_reader ? "on" : "off"),
+  set: (v) => (state.ring_reader = v === "on"),
+});
+const RING_TITLE =
+  "Decode the blinking emitter's message from the ring in each fovea frame. " +
+  "Runs only while the scan is active, and costs a worker thread reading every fovea frame.";
+
+// Annotations are drawn in FOVEA FRAME px. The stroke scalar is hoisted per eye
+// so a new frame with unchanged dims does NOT invalidate the geometry: the
+// overlay then recomputes only when the readout itself changes.
+const sL = computed(() => strokeFor(frameL.value?.shape));
+const sR = computed(() => strokeFor(frameR.value?.shape));
+
+/** Annotations assert a decode of the CURRENT frame — they are meaningless
+ *  with the reader off or the scan stopped (the session also clears the
+ *  readouts; this is the renderer-side belt). */
+const ringActive = computed(() => state.ring_reader && telemetry.scan !== null);
+
+const ringL = computed(() =>
+  ringGeometry(ringActive.value ? telemetry.ring.L : null, sL.value),
+);
+const ringR = computed(() =>
+  ringGeometry(ringActive.value ? telemetry.ring.R : null, sR.value),
+);
+
+const ellipsis = (t: string) => (t.length > 12 ? t.slice(0, 12) + "…" : t);
+// The kernel samples θ = 2πi/N with y DOWN (image coords), so a rising sample
+// index runs CLOCKWISE on screen.
+const directionOf = (reverse: boolean | undefined) =>
+  reverse ? "counter-clockwise" : "clockwise";
+
+/** The compact row under each fovea view: the decode, or why it dropped. */
+function ringStatus(side: "L" | "R"): {
+  text: string;
+  tone: string;
+  title: string;
+} {
+  if (!state.ring_reader)
+    return {
+      text: "off",
+      tone: "muted",
+      title: "Turn Ring Reader on in the drawer to decode the emitter.",
+    };
+  const r = ringActive.value ? telemetry.ring[side] : null;
+  if (!r)
+    return {
+      text: scanning.value ? "reading…" : "idle",
+      tone: "muted",
+      title: scanning.value
+        ? "Waiting for the first fovea frame of the scan."
+        : "The ring reader decodes only while the scan is running.",
+    };
+  if (r.ok) {
+    const text = r.text ?? "";
+    const chip =
+      r.chipPx === undefined ? "" : ` · ${r.chipPx.toFixed(1)} px/chip`;
+    return {
+      text: `${text}${chip}`,
+      tone: "ok",
+      title: `"${text}" · ${r.hex ?? ""} · read ${directionOf(r.reverse)}`,
+    };
+  }
+  const last = r.last ? ` · last ${ellipsis(r.last.text)}` : "";
+  return {
+    text: `${r.reason}${last}`,
+    tone: r.last ? "muted" : "warn",
+    title: r.last
+      ? `Last decode on this eye: "${r.last.text}" · ${r.last.hex}`
+      : "No frame has decoded on this eye yet.",
+  };
+}
+const statusL = computed(() => ringStatus("L"));
+const statusR = computed(() => ringStatus("R"));
 </script>
 
 <template>
@@ -167,7 +252,21 @@ const scanHint = computed(() => {
         :title="ROLE.L"
         :payload="frameL"
         :theme="THEME.L"
-      />
+      >
+        <RingOverlay
+          v-if="state.ring_reader"
+          :view="ringL"
+          :color="THEME.L"
+        />
+      </StreamView>
+      <div
+        v-if="state.ring_reader"
+        class="ring-row"
+        :class="statusL.tone"
+        :title="statusL.title"
+      >
+        {{ statusL.text }}
+      </div>
       <PosView
         :pos="telemetry.volt.L"
         :lim="controller?.dv ?? 200"
@@ -254,7 +353,21 @@ const scanHint = computed(() => {
         :title="ROLE.R"
         :payload="frameR"
         :theme="THEME.R"
-      />
+      >
+        <RingOverlay
+          v-if="state.ring_reader"
+          :view="ringR"
+          :color="THEME.R"
+        />
+      </StreamView>
+      <div
+        v-if="state.ring_reader"
+        class="ring-row"
+        :class="statusR.tone"
+        :title="statusR.title"
+      >
+        {{ statusR.text }}
+      </div>
       <PosView
         :pos="telemetry.volt.R"
         :lim="controller?.dv ?? 200"
@@ -375,6 +488,16 @@ const scanHint = computed(() => {
             <span>Scan Amplitude</span>
             <span>{{ state.scan_amp.toFixed(2) }}&deg;</span>
           </RangeSlider>
+          <div class="toggle-row" :title="RING_TITLE">
+            <span>Ring Reader</span>
+            <SingleSelect
+              v-model="ringReader"
+              :options="RING_OPTIONS"
+              :disabled="!telemetry.ready"
+              class="ring-toggle"
+              aria-label="Ring reader"
+            />
+          </div>
           <div class="status-row">
             <span>Status</span>
             <span
@@ -421,6 +544,29 @@ const scanHint = computed(() => {
 .fill {
   width: 100%;
   height: 100%;
+}
+
+// The ring readout under each fovea view. ALWAYS occupies its row (fixed
+// height, no reflow when the text swaps between a decode and a reason).
+.ring-row {
+  width: 100%;
+  height: 1.6em;
+  line-height: 1.6em;
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  // START-aligned: a centered nowrap row clips the HEAD of a long decode, which
+  // is exactly the part being read. The full text rides the `title`.
+  text-align: start;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  &.ok {
+    color: var(--text-bright);
+  }
+  &.warn {
+    color: var(--warn);
+  }
 }
 
 // The button + status line under the center tile. A plain row (see the
@@ -481,5 +627,28 @@ const scanHint = computed(() => {
   justify-content: space-between;
   gap: 1ch;
   font-size: 0.9em;
+}
+
+// Ring Reader (spec §reader): a label + a compact two-option SingleSelect on
+// ONE drawer row — the component stacks vertically by default, which would
+// tower over the slider rows it sits among.
+.toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1ch;
+  font-size: 0.9em;
+
+  .ring-toggle {
+    flex-direction: row;
+    gap: 0.25em;
+
+    :deep(.option) {
+      width: auto;
+      align-items: center;
+      text-align: center;
+      padding: 0.1em 0.9em;
+    }
+  }
 }
 </style>

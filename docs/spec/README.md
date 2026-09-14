@@ -20,6 +20,7 @@ file names and heading anchors stable when editing.
 ## Engine and infrastructure
 
 - [Stream graph](./graph.md) — node composition, topology, metering.
+- [Ring code](./ring-code.md) — the MirrorLink optical frame encoding and its reader.
 - [Pipes](./pipes.md) · [core Pipe](./core-pipe.md) · [core port pipe](./core-port-pipe.md) — SHM frame transport.
 - [core streams](./core-streams.md) · [core frame bricks](./core-frame-bricks.md) · [core trackers](./core-trackers.md) — native processing bricks.
 - [Orchestrator protocol](./orchestrator-protocol.md) · [Orchestrator runtime](./orchestrator-runtime.md)

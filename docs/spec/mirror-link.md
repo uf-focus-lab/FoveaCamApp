@@ -100,12 +100,47 @@ shows a gain the hardware did not take. The
 interleave with an apply/restore on the same lease. Teardown restores in the drain's scan
 slot (after the pacer stops, before `triple` clears): exposure timing FIRST, then gain.
 
+## Ring reader {#reader}
+
+The point of the scan: each fovea frame carries the emitter's blinking pattern as a ring,
+and the `ring` vision kernel (`ring-code.md` §reader) decodes it per frame, per eye. ONE
+worker over the two RAW convert pipes (roles `L`/`R` — the same un-warped views the
+operator reads), `meterName`/node id `win/mirror-link/ring`.
+
+The reader is an OPTIONAL NODE, DEFAULT OFF (`state.ring_reader`) — it costs a worker
+thread reading every fovea frame, so it exists only while asked for. `buildRingNode()`
+connects the two pipes, registers the wiring (node + its two frame edges), and spawns the
+worker with the live `enabled`; `disposeRingNode()` terminates the worker → unregisters the
+wiring → disconnects the pipes, in that order, and resets `telemetry.ring` to
+`{L: null, R: null}`. The `ring_reader` watch builds/disposes live (both directions
+idempotent, both no-ops without a leased triple); activation builds it iff the state is
+already on. The profiler therefore shows the node exactly while it exists.
+
+Gated on the scan too: `enabled` is pushed via `sendParams` on every scan start/stop (and
+at node creation), and a disabled kernel does NO pixel work — a frame that did not
+integrate a revolution holds no ring.
+
+`telemetry.ring = { L, R }` carries the per-eye `RingReadout` (null until that eye's first
+result). A failure keeps the CURRENT reason AND the last successful read on `last`
+(`ring-code.md` §error recovery), so a decoded value stays on screen while frames drop.
+STOPPING THE SCAN clears it (as does a failed re-apply, disposing the node, and `idle()`):
+the readout describes a frame that integrated a revolution, and free-running frames do
+not.
+
 ## Views {#views}
 
 The L/R main views bind the RAW convert pipes (`nodeId.convert(serial)`) directly, at pipe
 rate — deliberately NOT the homography-undistort bricks: a frame that integrates a full
 revolution has no single mirror pose to warp against, and the un-warped ring is the
-readout. The center view binds the intrinsic `undistort:<serial>` pipe (raw convert
+readout. While `ring_reader` is on AND the scan is running (and ONLY then — an off feature leaves no
+phantom row, and an annotation asserts a decode of the CURRENT frame) each carries the
+§reader annotations in FRAME px: the fitted circle (solid on a decode, dim + dashed when
+only the fit succeeded), the LEADER arc in `--warn` (distinct from both eye colors), and
+radial ticks at every field (long) and byte (short) boundary. The arc + ticks stay mounted
+and fade rather than remount — a marginal emitter flips ok↔fail at frame rate. Under it a
+fixed-height, START-aligned mono row reads the decoded text + `px/chip` (emphasized), or
+`off` / `idle` / `reading…` / the failure reason (with the last decode, muted); the full
+text, the hex and the reading direction ride its `title`. The center view binds the intrinsic `undistort:<serial>` pipe (raw convert
 fallback uncalibrated) and is the ONLY steering surface; no display worker, no
 stereo/composite/heatmap bricks. Overlays on the center view, all in wide px:
 
@@ -130,8 +165,9 @@ detail (and the blocked reason) in its `title` hover. The row is a PLAIN div, ne
 `<label>`/ConfigEntry: a label would forward a status-span click to the button and
 toggle the hardware override; the button's own explanation rides the ROW's `title`
 (a disabled button suppresses hover). The drawer carries the alignment sliders (Verge
-Distance + the four trims) left and Gain, the scan sliders (frequency, amplitude), and a
-Status row right — Gain leads the column because it is session-wide, not scan-scoped.
+Distance + the four trims) left and Gain, the scan sliders (frequency, amplitude), the
+Ring Reader toggle, and a Status row right — Gain leads the column because it is
+session-wide, not scan-scoped.
 Every slider carries a one-sentence `title`. Gain alone declares NO `neutral` — a stray
 right-click must never slam a live camera to range-min, and its `title` says so — and it
 is disabled (readout `—`) until `ready` with a non-degenerate `gain_range`; its `v-model`
@@ -158,10 +194,11 @@ offered (no capture helper, no capture window). `busy()` refuses a mid-recording
 ## Teardown ordering {#teardown}
 
 Resource-scope defers, registered in REVERSE of the drain (LIFO): stop the pacer FIRST →
-`stopScan` (exposure restore on the live leases) → `triple = null` / `ready: false` →
-await the recording drain → retire the C undistort producer + drop the serial taps →
-release the leases LAST. The session holds no pipe CONNECTIONS of its own (the renderer
-binds every view, the recorder node connects its own raw pipes).
+`stopScan` (exposure restore on the live leases) + the gain restore → `triple = null` /
+`ready: false` → await the recording drain → dispose the ring node if one exists (worker →
+wiring → its L/R pipes) → retire the C undistort producer + drop the serial taps → release
+the leases LAST. The ring node's pipes are the session's ONLY pipe connections (the
+renderer binds every view, the recorder node connects its own raw pipes).
 
 ## Rig pass {#rig}
 

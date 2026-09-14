@@ -13,6 +13,7 @@ import { cmd, defineContract } from "@lib/orchestrator/protocol";
 import type { Point2d } from "core/Geometry";
 import type { Pos } from "@lib/controller-codec";
 import type { Stat } from "@lib/orchestrator/contracts";
+import type { RingReadout } from "@lib/ring-code";
 
 /** The applied scan timing, published exactly while the scan is ACTIVE (spec
  *  §lifecycle). `exposure_us`/`frame_rate` are the values the cameras actually
@@ -51,6 +52,9 @@ export const mirrorLink = defineContract({
      *  never set — the session seeds it from the leased cameras instead of
      *  writing one. */
     gain: null as number | null,
+    /** Ring-reader node ON/OFF (spec §reader). Default OFF: the decoder is a
+     *  worker thread over both fovea pipes, built only while this is set. */
+    ring_reader: false as boolean,
     // Scan parameters (spec §scan) — LIVE while active.
     scan_hz: 20,
     scan_amp: 0.5, // scan radius (deg)
@@ -73,6 +77,14 @@ export const mirrorLink = defineContract({
      *  `gain_range`s (spec §gain). `min === max === 0` until leased (or on a
      *  disjoint pair): the slider stays disabled. */
     gain_range: { min: 0, max: 0 } as { min: number; max: number },
+    /** Per-eye ring-code readout (spec §reader) — null until the reader has
+     *  produced a result for that eye this session. A failure carries the
+     *  reason plus the LAST successful read, so the decoded value stays on
+     *  screen across dropped frames. */
+    ring: { L: null, R: null } as {
+      L: RingReadout | null;
+      R: RingReadout | null;
+    },
     /** Applied scan timing — non-null exactly while ACTIVE (spec §lifecycle). */
     scan: null as ScanTelemetry | null,
     /** Human-readable reason the last `startScan` was refused (or why the

@@ -57,6 +57,13 @@ Hardware-gated checks for the `mirror-link` app (spec
 - **Dashed-ring readout.** Point at a blinker of KNOWN frequency and confirm the
   on/off pattern along the ring matches it (count the dashes per revolution
   against `blink_hz / scan_hz`).
+- **Decode a known message.** Drive the emitter with the ring-code frame
+  (`docs/spec/ring-code.md`) for a known short string at a cycle equal to the
+  scan period. Both fovea readouts must show that string, the fitted circle and
+  leader arc must sit on the ring, and the measured `px/chip` must match
+  `C / chips` (ring circumference over the frame's chip count). Walk the message
+  length up until `below resolution` appears — that is the rig's real emitter
+  budget; record it against the `C / (1.5·d)` prediction.
 
 ## Bench flow
 

@@ -41,6 +41,16 @@ import {
   type UndistortPipeSeam,
 } from "@orchestrator/undistort-pipe";
 import { createRawRecording } from "@orchestrator/raw-recording";
+import {
+  createVisionWorker,
+  type VisionWorkerHandle,
+} from "@orchestrator/vision-worker-host";
+import type {
+  PipeInput,
+  VisionResult,
+} from "@orchestrator/vision-worker-protocol";
+import { nodeId } from "@lib/orchestrator/graph-contract";
+import type { RingReadout } from "@lib/ring-code";
 import type { PipeBroker } from "@orchestrator/pipe-session";
 import type { RawPipeRegistry } from "@orchestrator/raw-pipe";
 import type { CompressPipeSeam } from "@orchestrator/compress-pipe";
@@ -274,6 +284,7 @@ export default function mirrorLinkSession(
       }
       scanT0 = now();
       scanActive = true;
+      pushRingEnabled();
       publishScanBlocked(null);
       publishScanTelemetry(hz, applied);
       return true;
@@ -284,6 +295,8 @@ export default function mirrorLinkSession(
     async function stopScanNow(): Promise<void> {
       const wasActive = scanActive;
       scanActive = false;
+      pushRingEnabled();
+      resetRingTelemetry();
       if (triple) await restoreEyes(triple);
       if (wasActive) {
         activeScan = null;
@@ -304,6 +317,8 @@ export default function mirrorLinkSession(
           applied[side] = await applyEye(side, t.leases[side], hz);
       } catch (e) {
         scanActive = false;
+        pushRingEnabled();
+        resetRingTelemetry();
         await restoreEyes(t);
         activeScan = null;
         s.telemetry({ scan: null });
@@ -366,6 +381,120 @@ export default function mirrorLinkSession(
           }
         delete gainSnapshots[side];
       }
+    }
+
+    // --- ring reader (spec §reader) -----------------------------------------
+    // An OPTIONAL node (`state.ring_reader`, default OFF): one vision worker
+    // over the two RAW fovea pipes, with the pixel work further gated on the
+    // scan (a frame that didn't integrate a revolution holds no ring).
+
+    let ringWorker: VisionWorkerHandle | null = null;
+    let ringNode: { dispose(): void } | null = null;
+    const ring: { L: RingReadout | null; R: RingReadout | null } = {
+      L: null,
+      R: null,
+    };
+
+    /** Carry the last SUCCESSFUL read through failures so the decoded value
+     *  stays on screen while frames drop (spec ring-code.md §error recovery). */
+    function mergeReadout(side: Side, next: RingReadout): RingReadout {
+      if (next.ok) return next;
+      const prev = ring[side];
+      const last = prev?.ok
+        ? { text: prev.text ?? "", hex: prev.hex ?? "" }
+        : prev?.last;
+      return last ? { ...next, last } : next;
+    }
+
+    function onRingResult(r: VisionResult): void {
+      let changed = false;
+      for (const side of SIDES) {
+        const value = r.values[side] as RingReadout | undefined;
+        if (!value) continue;
+        ring[side] = mergeReadout(side, value);
+        changed = true;
+      }
+      if (changed) s.telemetry({ ring: { L: ring.L, R: ring.R } });
+    }
+
+    /** The reader only runs while the scan does; no node ⇒ nothing to push. */
+    function pushRingEnabled(): void {
+      ringWorker?.sendParams({ enabled: scanActive });
+    }
+
+    /** Drop the published readouts. The annotations assert a decode of THIS
+     *  frame; once the scan stops, the frames are free-running and un-scanned,
+     *  so keeping the last one on screen would be a lie. */
+    function resetRingTelemetry(): void {
+      if (!ring.L && !ring.R) return;
+      ring.L = ring.R = null;
+      s.telemetry({ ring: { L: null, R: null } });
+    }
+
+    /** Connect the two convert pipes, publish the node + its edges, and spawn
+     *  the worker. Idempotent; a no-op without a leased triple. */
+    function buildRingNode(): void {
+      const t = triple;
+      if (ringNode || !t) return;
+      const node = nodeId.win("mirror-link", "ring");
+      const pipeIds: string[] = [];
+      const pipes: PipeInput[] = SIDES.map((side) => {
+        const pipeId = nodeId.convert(t.leases[side].camera.serial);
+        const handle = broker.connect(pipeId);
+        pipeIds.push(pipeId);
+        const { width, height, channels, bytesPerFrame, maxBytes } = handle.spec;
+        return {
+          role: side,
+          shmName: handle.shmName,
+          width,
+          height,
+          channels,
+          bytesPerFrame: maxBytes ?? bytesPerFrame,
+        };
+      });
+      const unregister = registerGraphWiring({
+        nodes: [
+          {
+            id: node,
+            kind: "ring",
+            owner: "win/mirror-link",
+            output: { kind: "analysis", schema: "ring" },
+            transport: "worker",
+          },
+        ],
+        edges: pipes.map((pipe, i) => ({
+          from: pipeIds[i],
+          to: node,
+          port: pipe.role,
+          type: { kind: "frame", pixelFormat: "RGBA8", dtype: "U8" } as const,
+        })),
+      });
+      ringWorker = createVisionWorker(
+        {
+          pipes,
+          params: { kind: "ring", enabled: scanActive },
+          meterName: node,
+        },
+        onRingResult,
+      );
+      ringNode = {
+        dispose() {
+          // Stop reading BEFORE the consumer gate drops, and drop the profiler
+          // row with the node it describes.
+          ringWorker?.terminate();
+          ringWorker = null;
+          unregister();
+          for (const id of pipeIds) broker.disconnect(id);
+          ring.L = ring.R = null;
+          s.telemetry({ ring: { L: null, R: null } });
+        },
+      };
+    }
+
+    function disposeRingNode(): void {
+      const node = ringNode;
+      ringNode = null;
+      node?.dispose();
     }
 
     // --- recording (spec §recording) ---------------------------------------
@@ -475,6 +604,12 @@ export default function mirrorLinkSession(
           s.setState("undistortPipe", null);
         });
       }
+      // Ring reader (spec §reader): OPTIONAL, default OFF. Built here only when
+      // the toggle is already on; the `ring_reader` watch builds/disposes it
+      // live. ONE defer, in the same drain position: it stops reading + releases
+      // its pipes before the undistort retire and the lease release.
+      if (s.state.ring_reader) buildRingNode();
+      scope.defer(() => disposeRingNode());
       monitor.done("pipes");
 
       monitor.start("recording");
@@ -580,7 +715,9 @@ export default function mirrorLinkSession(
         volts.R = { ...ORIGIN_POS };
         activeScan = null;
         gainRange = { min: 0, max: 0 };
+        ring.L = ring.R = null;
         s.resetTelemetry([
+          "ring",
           "scan",
           "scan_blocked",
           "scan_px",
@@ -607,6 +744,13 @@ export default function mirrorLinkSession(
         // drag must never interleave with an apply/restore on the same lease.
         gain(dB) {
           if (typeof dB === "number") void queueScanOp(() => applyGainNow(dB));
+        },
+        // The reader node exists only while the toggle is on (spec §reader).
+        // Both directions are idempotent; without a triple neither does
+        // anything (activation builds it from the state).
+        ring_reader(on) {
+          if (on) buildRingNode();
+          else disposeRingNode();
         },
       },
       commands: {
