@@ -50,3 +50,4 @@ docs/.vitepress/cache/
 # unanchored `package-lock.json` rule above (docs/node_modules stays ignored).
 !docs/package-lock.json
 
+__pycache__/
