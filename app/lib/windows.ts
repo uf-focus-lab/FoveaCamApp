@@ -84,6 +84,11 @@ export const APP_REGISTRY = {
     session: "manual-control",
     group: "application",
   },
+  "mirror-link": {
+    title: "MirrorLink",
+    session: "mirror-link",
+    group: "application",
+  },
   "single-capture": {
     title: "Single Capture",
     session: "liveview",

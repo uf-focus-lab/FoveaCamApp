@@ -34,6 +34,7 @@ const baseLoaders = {
   "multi-fovea": () => import("@modules/multi-fovea/index.vue"),
   "split-tracking": () => import("@modules/split-tracking/index.vue"),
   "manual-control": () => import("@modules/manual-control/index.vue"),
+  "mirror-link": () => import("@modules/mirror-link/index.vue"),
   "single-capture": () => import("@modules/single-capture/index.vue"),
   "manage-cameras": () => import("@modules/manage-cameras/index.vue"),
   "calibrate-intrinsic": () => import("@modules/calibrate-intrinsic/index.vue"),

@@ -24,8 +24,9 @@ Read in this order the first time:
    needs/produces/redo-when table.
 5. **The working apps** — [Manual Control](./manual-control.md) (open-loop
    steering bench), [Tracking - Multi](./multi-fovea.md) (multiple tracked
-   targets), and [Disparity Scope](./disparity-scope.md) (closed-loop vergence
-   with PID tuning and a match debugger).
+   targets), [Disparity Scope](./disparity-scope.md) (closed-loop vergence
+   with PID tuning and a match debugger), and [MirrorLink](./mirror-link.md)
+   (circular fovea scan that reads a blinking source as a dashed ring).
 6. **[Recording and Capture](./recording-and-capture.md)** — record any app's
    session to a `.fcap` file or grab full-depth stills, from every app's title
    bar.
@@ -45,6 +46,7 @@ Read in this order the first time:
 | Point the foveas by hand | [Manual Control](./manual-control.md) |
 | Track several targets | [Tracking - Multi](./multi-fovea.md) |
 | Tune the vergence loop | [Disparity Scope](./disparity-scope.md) |
+| Read a blinking light source | [MirrorLink](./mirror-link.md) |
 | Record a session / save a still | [Recording and Capture](./recording-and-capture.md) |
 | Review a recording | [Viewer](./viewer.md) (`Cmd/Ctrl-O` from anywhere) |
 | Change preferences / manage calibration data | [Settings](./settings.md) (`Cmd/Ctrl-,` from anywhere) |

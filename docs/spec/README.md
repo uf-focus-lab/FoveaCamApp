@@ -10,6 +10,7 @@ file names and heading anchors stable when editing.
 - [Disparity Scope](./disparity-scope.md) — closed-loop vergence, template matching, PID, autotune.
 - [Multi-fovea](./multi-fovea.md) — multi-target tracking and mirror scheduling.
 - [Split tracking](./split-tracking.md) — per-eye split steering and tracking.
+- [MirrorLink](./mirror-link.md) — circular fovea scan with a one-revolution exposure override.
 - [Intrinsic calibration](./calibrate-intrinsic.md) · [Extrinsic calibration](./calibrate-extrinsic.md) · [Calibration data](./calibration.md)
 - [Viewer](./viewer.md) — standalone `.fcap` playback, timeline, export.
 - [Projection split-view](./projection.md) — pane splitting and cross-window drag & drop.

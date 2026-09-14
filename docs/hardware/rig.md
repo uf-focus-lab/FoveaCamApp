@@ -35,6 +35,28 @@ firmware adds position streams + synced frame capture (FIN carries the
 exposure-averaged mirror voltage). `verifyVersion()` decides v1/v2 at
 connect; v2-only surfaces are gated on `v2Capable`.
 
+## MirrorLink scan pass
+
+Hardware-gated checks for the `mirror-link` app (spec
+`docs/spec/mirror-link.md` §rig) — all need the full rig:
+
+- **Ring radius vs. amplitude across frequency.** With a point source in
+  view, scan at 5 / 20 / 50 / 100 Hz at a fixed `scan_amp` and measure the
+  REALIZED ring radius in each fovea frame. The commanded circle is exact; the
+  mirror's own low-pass response attenuates the realized radius as frequency
+  rises. Record the roll-off curve — it is the usable-frequency budget.
+- **Exposure readback equals the period.** On both foveas, read back the live
+  exposure while scanning and confirm it matches `1e6 / hz` µs (the `scan`
+  telemetry's `mismatch` flag must stay clear). A camera whose max frame rate is
+  below `hz` should show its max rate with `exposure = period`.
+- **Restore leaves Manage Cameras byte-identical.** Note each fovea's exposure /
+  frame rate / frame-rate-enable / auto-exposure before scanning; stop the scan
+  (and separately, leave the app mid-scan) and confirm every value came back
+  unchanged.
+- **Dashed-ring readout.** Point at a blinker of KNOWN frequency and confirm the
+  on/off pattern along the ring matches it (count the dashes per revolution
+  against `blink_hz / scan_hz`).
+
 ## Bench flow
 
 Firmware flashing + bench verification precede rig sessions (PlatformIO,

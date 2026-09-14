@@ -31,6 +31,7 @@ import {
   faObjectGroup,
   faObjectUngroup,
   faRulerCombined,
+  faSatelliteDish,
 } from "./icons";
 
 const titleBarHeight = ref(0);
@@ -87,6 +88,7 @@ const iconOf: Record<string, object> = {
   "multi-fovea": faObjectGroup,
   "split-tracking": faCrosshairs,
   "manual-control": faCompass,
+  "mirror-link": faSatelliteDish,
   "single-capture": faCameraAlt,
   playground: faObjectUngroup,
   "manage-cameras": faGears,

@@ -37,6 +37,7 @@ import { controllerNode } from "./controller-node.js";
 import liveViewSession from "@modules/single-capture/session";
 import manageCamerasSession from "@modules/manage-cameras/session";
 import manualControlSession from "@modules/manual-control/session";
+import mirrorLinkSession from "@modules/mirror-link/session";
 import multiFoveaSession from "@modules/multi-fovea/session";
 import disparityScopeSession from "@modules/disparity-scope/session";
 import splitTrackingSession from "@modules/split-tracking/session";
@@ -363,6 +364,14 @@ const manualControl = hub.add(
   ),
 );
 
+// --- mirror-link: circular fovea scan with a one-revolution exposure --------
+// A stripped manual-control: owns the triple, steers from the center view, and
+// records the raw L/C/R streams — the same broker / undistort seam / raw-pipe
+// registry / compress seam its template receives.
+const mirrorLink = hub.add(
+  mirrorLinkSession(asBroker(Pipe), undistortSeam, rawPipes, compressSeam),
+);
+
 // --- multi-fovea: protocol-v2 multi-target logic skeleton ------------------
 // Constructed here (not with its sibling seams above) so the paired-SGBM seam
 // (stereo-paired-inputs — the `pair/undistort` disparity node) is available.
@@ -436,6 +445,7 @@ const cameraOwning: ServerSession<any>[] = [
   liveview,
   manageCameras,
   manualControl,
+  mirrorLink,
   multiFovea,
   disparityScope,
   splitTracking,

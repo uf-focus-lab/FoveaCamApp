@@ -16,6 +16,7 @@ export {
 export {
   faTelevision,
   faCrosshairs,
+  faSatelliteDish,
   faGears,
   faFlagCheckered,
   faCameraRotate,
