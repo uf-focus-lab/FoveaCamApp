@@ -34,7 +34,7 @@ the renderer hide the boxes.
 
 ## Drag slew {#drag-slew}
 
-Source: `slew.ts`. Re-pushing the RAW latest pointer target every tick would idle the
+Source: `@lib/slew`. Re-pushing the RAW latest pointer target every tick would idle the
 serial link: between pointer samples the pose is IDENTICAL, the StreamUpdateGate/MirrorSink
 dedupes it, and the link runs only at the pointer sample rate despite ~600–1000 Hz of
 governed capacity. Instead the 1 ms pacer keeps the last COMMANDED pose and slews it toward

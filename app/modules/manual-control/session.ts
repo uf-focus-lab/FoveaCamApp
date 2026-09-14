@@ -77,7 +77,7 @@ import { createCaptureHelper, type CaptureHelper } from "@orchestrator/capture-h
 import type { PipeInput, VisionResult } from "@orchestrator/vision-worker-protocol";
 import { manualControl, coerceView, type CenterView } from "./contract";
 import { createRecording } from "./recording";
-import { slewStep, type SlewPair } from "./slew";
+import { slewStep, type SlewPair } from "@lib/slew";
 import { type SplitVolts, unifiedSplit, resolveVolts, splitFlags } from "./split";
 import { makeMat, matToArray } from "@lib/mat";
 import {

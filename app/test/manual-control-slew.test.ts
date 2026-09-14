@@ -1,5 +1,5 @@
 // Drag-target slew math — the pure first-order smoother behind the
-// manual-control pacer (@modules/manual-control/slew): convergence,
+// manual-control pacer (@lib/slew): convergence,
 // per-channel monotonicity (no overshoot), epsilon termination with an EXACT
 // final target, and dt scaling.
 
@@ -9,7 +9,7 @@ import {
   SLEW_TAU_MS,
   slewStep,
   type SlewPair,
-} from "@modules/manual-control/slew";
+} from "@lib/slew";
 
 const pair = (lx: number, ly = 0, rx = 0, ry = 0): SlewPair => ({
   l: { x: lx, y: ly },

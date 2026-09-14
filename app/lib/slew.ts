@@ -4,11 +4,11 @@
 // You may find the full license in project root directory.
 // -------------------------------------------------------
 //
-// Drag-target SLEW for the manual-control pacer — slew the commanded pose toward
-// the latest pointer target so each 1 ms tick is a DISTINCT pose the
-// StreamUpdateGate passes (else the raw re-push dedupes to the pointer rate),
-// then epsilon-snap and go quiet. Pure + Vue-free (unit-tested). Behavior spec:
-// docs/spec/manual-control.md §drag-slew.
+// Drag-target SLEW shared by the steering pacers (manual-control, mirror-link's
+// idle pose) — slew the commanded pose toward the latest pointer target so each
+// 1 ms tick is a DISTINCT pose the StreamUpdateGate passes (else the raw re-push
+// dedupes to the pointer rate), then epsilon-snap and go quiet. Pure + Vue-free
+// (unit-tested). Behavior spec: docs/spec/manual-control.md §drag-slew.
 
 export type SlewPos = { x: number; y: number };
 export type SlewPair = { l: SlewPos; r: SlewPos };
