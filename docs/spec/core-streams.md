@@ -129,7 +129,8 @@ v = slew(center) + J · amp · (cos φ, sin φ)
   wall-clock rule, natively. The 1 kHz is NOMINAL: wake latency puts the realized rate
   around 900 Hz, which is deliberately left alone — the phase accumulates with the measured
   `dt`, so the GEOMETRY does not depend on the rate, and the wire's own stream-update gate
-  is 1 ms anyway.
+  is 1 ms anyway. `setOrbit`'s `paceHz` (default 1000, clamped 200–1000) retunes the tick
+  rate live for a link that cannot carry 1 kHz.
 - **Guarded state.** The NAPI thread writes the pose (`setPose`: per-eye center volts +
   `jL`/`jR`, row-major 2×2 volts-per-radian) and the orbit params (`setOrbit`: `ampRad`,
   `hz`, `enabled`) under a `Threading::Guard`; the brick thread advances the slewed center
@@ -145,6 +146,10 @@ v = slew(center) + J · amp · (cos φ, sin φ)
   bit-identical tick over tick — then `iterate()` returns `nullptr` and the brick is
   silent. It has already slept out the tick by then, so the base loop's `yield()` path is
   not a spin.
+- **Thread QoS.** `start()` requests `QOS_CLASS_USER_INTERACTIVE` on macOS: this thread is
+  the mirrors' clock, and a nap-eligible child process otherwise lets the OS coalesce
+  timers, stretching a 1 ms wait toward ~16 ms — the pose rate collapses and the ring
+  degenerates into a polygon.
 - **Ports.** `volt_out` (tag `"volts"`, payload `VoltPair::Ptr`) pipes into the
   controller's native `pos_in`; `[Symbol.asyncIterator]` is the JS fallback consumer.
   `probe()` returns the thread meter (inputs `pose`/`orbit`, output `volt`).

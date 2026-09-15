@@ -34,6 +34,10 @@
 
 #include <napi.h>
 
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
+
 #include <Threading/Guard.h>
 
 #include "CoreObject.h"
@@ -65,8 +69,13 @@ static int64_t orbitNowMs() {
       .count();
 }
 
-/** Pacer period: 1 kHz, the cadence the JS pacer targeted. */
-static constexpr int64_t kTickNs = 1000000;
+/** Pacer rate: 1 kHz nominal (the cadence the JS pacer targeted), settable per
+ *  `setOrbit` when a link cannot sustain it. The GEOMETRY does not depend on
+ *  it — the phase accumulates with the measured dt — but the poses-per-
+ *  revolution the mirror sees does: `paceHz / hz`. */
+static constexpr double kDefaultPaceHz = 1000;
+static constexpr double kMinPaceHz = 200;
+static constexpr double kMaxPaceHz = 1000;
 /** Center-slew time constant / convergence epsilon — the @lib/slew constants
  *  (SLEW_TAU_MS, SLEW_EPSILON_V), ported so idle behavior is unchanged. */
 static constexpr double kSlewTauMs = 8.0;
@@ -83,6 +92,7 @@ struct OrbitState {
   bool posed = false;              // false until the first setPose
   double ampRad = 0;
   double hz = 0;
+  double paceHz = kDefaultPaceHz;
   bool enabled = false;
   bool phaseReset = false;         // consumed by the brick thread on enable
 };
@@ -121,13 +131,14 @@ public:
   /** NAPI thread: scan start/stop + live amplitude/frequency. Phase restarts
    *  at 0 on each disabled→enabled transition and otherwise ACCUMULATES, so a
    *  slider nudge never steps the ring. */
-  void setOrbit(double ampRad, double hz, bool enabled) {
+  void setOrbit(double ampRad, double hz, double paceHz, bool enabled) {
     {
       auto ref = state_.ref();
       if (enabled && !ref->enabled)
         ref->phaseReset = true;
       ref->ampRad = ampRad;
       ref->hz = hz;
+      ref->paceHz = std::min(kMaxPaceHz, std::max(kMinPaceHz, paceHz));
       ref->enabled = enabled;
     }
     meter_.ingest("orbit", orbitNowMs());
@@ -149,7 +160,15 @@ public:
   }
 
 protected:
-  void start() override { set_thread_name("orbit"); }
+  void start() override {
+    set_thread_name("orbit");
+#ifdef __APPLE__
+    // The mirrors' clock. Without an explicit QoS a nap-eligible child process
+    // lets macOS coalesce timers, stretching a 1 ms wait toward ~16 ms — the
+    // pose rate collapses and the ring degenerates into a polygon.
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+  }
   void stop() override {}
 
   VoltPair::Ptr iterate() override {
@@ -158,7 +177,7 @@ protected:
     const auto now = std::chrono::steady_clock::now();
     const double dtMs =
         lastTickAt_.time_since_epoch().count() == 0
-            ? kTickNs / 1e6
+            ? periodNs_ / 1e6
             : std::chrono::duration<double, std::milli>(now - lastTickAt_)
                   .count();
     lastTickAt_ = now;
@@ -169,6 +188,7 @@ protected:
     {
       auto ref = state_.ref();
       posed = ref->posed;
+      periodNs_ = static_cast<int64_t>(1e9 / ref->paceHz);
       if (ref->phaseReset) {
         phase_ = 0;
         ref->phaseReset = false;
@@ -219,7 +239,7 @@ private:
   /** Sleep out the tick on the steady clock. Returns false once `close()` has
    *  woken us — teardown never waits out a period. */
   bool pace() {
-    const auto period = std::chrono::nanoseconds(kTickNs);
+    const auto period = std::chrono::nanoseconds(periodNs_);
     const auto now = std::chrono::steady_clock::now();
     if (nextTickAt_.time_since_epoch().count() == 0 ||
         nextTickAt_ + period < now)
@@ -254,6 +274,7 @@ private:
   bool closing_ = false;
   std::atomic<bool> closed_{false};
   // Brick thread only.
+  int64_t periodNs_ = static_cast<int64_t>(1e9 / kDefaultPaceHz);
   std::chrono::steady_clock::time_point nextTickAt_{};
   std::chrono::steady_clock::time_point lastTickAt_{};
   double phase_ = 0;
@@ -354,7 +375,7 @@ public:
     JS_EXCEPT(env.Undefined())
   }
 
-  // setOrbit({ ampRad, hz, enabled }).
+  // setOrbit({ ampRad, hz, paceHz?, enabled }).
   FN(setOrbit) {
     auto env = info.Env();
     try {
@@ -366,7 +387,16 @@ public:
       JS_ASSERT(std::isfinite(amp) && std::isfinite(hz), TypeError,
                 "orbit setOrbit: `ampRad` and `hz` must be finite",
                 env.Undefined());
-      core()->setOrbit(amp, hz, o.Get("enabled").ToBoolean().Value());
+      double paceHz = kDefaultPaceHz;
+      if (o.Has("paceHz") && !o.Get("paceHz").IsUndefined()) {
+        paceHz = o.Get("paceHz").ToNumber().DoubleValue();
+        JS_ASSERT(std::isfinite(paceHz) && paceHz >= kMinPaceHz &&
+                      paceHz <= kMaxPaceHz,
+                  RangeError, "orbit setOrbit: `paceHz` out of range (200-1000)",
+                  env.Undefined());
+      }
+      core()->setOrbit(amp, hz, paceHz,
+                       o.Get("enabled").ToBoolean().Value());
       return env.Undefined();
     }
     JS_EXCEPT(env.Undefined())

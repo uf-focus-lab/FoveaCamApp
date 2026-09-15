@@ -95,6 +95,11 @@ export const mirrorLink = defineContract({
     scan_hz: 10, // 100 ms revolution
 
     scan_amp: 0.5, // scan radius (deg)
+    /** The native generator's tick rate (Hz, clamped 200–1000 by the brick).
+     *  No slider — a config/rig knob for a serial link that cannot carry
+     *  1 kHz; the geometry is unaffected, only the poses per revolution
+     *  (spec §actuation). */
+    orbit_pace_hz: 1000,
   },
   telemetry: {
     ready: false as boolean, // calibrated triple leased + conversions loaded
@@ -143,10 +148,24 @@ export const mirrorLink = defineContract({
     perf: {
       actuateMs: { mean: 0, max: 0 } as Stat,
       tickGapMs: { mean: 0, max: 0 } as Stat,
-      // The native scan generator: whether it owns the wire, and its measured
-      // emit rate (~1 kHz). A rate that holds while `tickGapMs.max` spikes is
-      // the whole point of the brick.
-      orbit: { native: false as boolean, rateHz: 0 },
+      // The native scan generator. `emitHz` is the brick's own thread (a rate
+      // that holds while `tickGapMs.max` spikes is the whole point of the
+      // brick); `sinkHz` is what reaches the WIRE after the mirror sink's gate
+      // and AIMD governor. `sinkHz / scan_hz` is the poses per revolution —
+      // too few and the ring is drawn as a polygon, so the governor block says
+      // which signal caused the backoff (spec §actuation).
+      orbit: {
+        native: false as boolean,
+        emitHz: 0,
+        sinkHz: 0,
+        governor: {
+          state: "off" as "off" | "steady" | "seeking" | "backoff",
+          effectiveRateHz: 0,
+          backoffs: 0,
+          softFails: 0,
+          outq: 0,
+        },
+      },
     },
     // Capture manifest telemetry (spec §capture); image data pulled via
     // `getCapturePreview`.

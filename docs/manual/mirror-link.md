@@ -219,6 +219,11 @@ Dragging Gain — or changing the scan frequency, which rewrites both foveas'
 exposure — no longer disturbs a running scan: the circle is generated on its own
 thread, so the mirrors keep turning while the cameras are being written.
 
+If the ring comes out as a polygon rather than a circle, the serial link to the
+controller is throttling the pose rate: the **Status** line under the scan
+button turns amber and its hover says how many poses per revolution are getting
+through and why.
+
 ## Capturing a ring frame
 
 The title-bar camera button (or `Cmd/Ctrl-S`) grabs ONE full-depth shot — the left and

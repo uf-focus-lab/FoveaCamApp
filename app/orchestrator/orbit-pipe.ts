@@ -30,6 +30,10 @@ export interface OrbitPose {
 export interface OrbitParams {
   ampRad: number;
   hz: number;
+  /** Tick rate of the brick's thread (default 1000, clamped 200–1000). The
+   *  GEOMETRY does not depend on it — the phase accumulates with the measured
+   *  dt — but the poses per revolution the mirror sees do: `paceHz / hz`. */
+  paceHz?: number;
   enabled: boolean;
 }
 

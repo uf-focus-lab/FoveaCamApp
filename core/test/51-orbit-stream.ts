@@ -7,7 +7,7 @@
 // Native circular-scan ORBIT brick — NO hardware. Proves:
 //   1. PACE — the brick emits at ~1 kHz off its own thread while the orbit is
 //      enabled (counted on the brick's own meter, so consumer drops cannot
-//      flatter the result).
+//      flatter the result), and `paceHz` retunes that rate live.
 //   2. GEOMETRY — per eye, `v − center` traces the circle `J · amp · (cos φ,
 //      sin φ)`: all four quadrants are visited, the RMS radius error is under
 //      1 %, and the row-major Jacobian ordering holds (the right eye's J is a
@@ -31,7 +31,12 @@ type XY = { x: number; y: number };
 type Volts = { left: XY; right: XY };
 type Orbit = {
   setPose(p: { centerL: XY; centerR: XY; jL: number[]; jR: number[] }): void;
-  setOrbit(p: { ampRad: number; hz: number; enabled: boolean }): void;
+  setOrbit(p: {
+    ampRad: number;
+    hz: number;
+    paceHz?: number;
+    enabled: boolean;
+  }): void;
   probe(): { outputs: Record<string, { count: number }> };
   volt_out: { streamTag: string; pipe(t: unknown, o?: unknown): Link };
   release(): void;
@@ -99,6 +104,20 @@ const wrapPi = (a: number): number => {
     rateHz > 800 && rateHz < 1100,
     `orbit paces at ~1 kHz (got ${rateHz.toFixed(0)} Hz)`,
   );
+
+  // ...and `paceHz` retunes it live (the rig knob for a link that cannot
+  // sustain 1 kHz; the geometry below is unaffected, only the pose density).
+  orb.setOrbit({ ampRad: AMP, hz: 2, paceHz: 500, enabled: true });
+  await sleep(100);
+  const tSlow = performance.now();
+  const cSlow = emitted();
+  await sleep(600);
+  const slowHz = ((emitted() - cSlow) * 1000) / (performance.now() - tSlow);
+  assert(
+    slowHz > 400 && slowHz < 560,
+    `paceHz retunes the tick rate (asked 500, got ${slowHz.toFixed(0)} Hz)`,
+  );
+  orb.setOrbit({ ampRad: AMP, hz: 2, enabled: true }); // back to the 1 kHz default
 
   // --- 2: geometry -----------------------------------------------------------
   const ring = since(t0, t1);
@@ -217,7 +236,8 @@ const wrapPi = (a: number): number => {
   );
   await Promise.race([drain, sleep(1000)]);
   console.log(
-    `51-orbit-stream: pace ${rateHz.toFixed(0)} Hz, radius RMS ${(rmsL * 100).toFixed(3)}/` +
+    `51-orbit-stream: pace ${rateHz.toFixed(0)} Hz (paceHz 500 → ${slowHz.toFixed(0)} Hz), ` +
+      `radius RMS ${(rmsL * 100).toFixed(3)}/` +
       `${(rmsR * 100).toFixed(3)} %, phase step ${step.toFixed(3)} rad, tail ${tailHz.toFixed(2)} Hz, ` +
       `idle release ${idleReleaseMs.toFixed(0)} ms.`,
   );

@@ -297,10 +297,41 @@ resumes from the last scan pose. While the brick owns the wire (`nativeEngaged()
 path pushes only the CENTER pose and only every 10 ms — the pacer itself keeps ticking at
 1 ms because its gap IS the stall meter.
 
-`telemetry.perf.orbit` reports `{ native, rateHz }` — `rateHz` differenced across telemetry
-windows off the brick's own meter (its snapshot rate is a lifetime average). A rate that
-holds at ~1 kHz while `tickGapMs.max` spikes is the brick doing its job. Volt/pose
-telemetry is throttled to `VOLT_TELEMETRY_INTERVAL_MS`.
+**Pose density and the sink governor.** What the mirror actually traces is
+`sinkHz / scan_hz` poses per revolution — `sinkHz` being what survives the native
+MirrorSink's 1 ms gate AND its AIMD governor, not what the brick emits. The mirror's own
+~120 Hz low-pass (τ ≈ 1.3 ms) smooths the steps between poses only while the update
+interval is well under that τ: at 1 kHz (1 ms) the steps blur into a circle; at 60 Hz
+(17 ms) each pose is a visible vertex. The compose path's governor defaults — halve on ANY
+pressure signal, floor 60 Hz, RTT inflation gate 2× — are right for a latency-sensitive
+tracker and wrong here: 60 poses/s at a 10 Hz scan is a HEXAGON, and the +25 Hz/100 ms
+climb makes it come and go. So on attach the session sets
+
+```
+sink.setGovernor({ ceilingHz: state.orbit_pace_hz, floorHz: 500, rttInflation: 8,
+                   enabled: true })
+```
+
+— genuine link overload (soft fails, outq above HIGH) still backs off, but never below
+500 Hz, which is still a 50-gon at 10 Hz and a 5-gon only past 100 Hz (the top of the
+`scan_hz` range, where the mirror's own roll-off dominates anyway). A busy MCU's inflated
+ACK RTT is not overload of the UPDATE path, so the inflation gate is widened 2× → 8×.
+
+`state.orbit_pace_hz` (default 1000, clamped 200–1000 by the brick) is the generator's tick
+rate AND the governor's ceiling — no slider, a config/rig knob for a link that cannot carry
+1 kHz. Lowering it does not change the geometry (the phase accumulates with the measured
+`dt`), only the pose density.
+
+`telemetry.perf.orbit` reports `{ native, emitHz, sinkHz, governor: { state,
+effectiveRateHz, backoffs, softFails, outq } }` — both rates differenced across 1 s probe
+windows (the meters report lifetime averages, which would hide a live stall), `emitHz` off
+the brick's thread meter, `sinkHz` off `MirrorSink.probe().written`, and the governor block
+off that same probe plus the `Device.stats` sensors the profiler's Serial-pressure block
+already reads. `emitHz` holding at ~1 kHz while `tickGapMs.max` spikes is the brick doing
+its job; `sinkHz` far below `emitHz` is the link throttling. The scan status line appends
+`· <sinkHz>/s` and turns warn below 20 poses per revolution, its tooltip naming WHICH rate
+is low and the governor's state/backoff count. Volt/pose telemetry is throttled to
+`VOLT_TELEMETRY_INTERVAL_MS`.
 
 ## Recording {#recording}
 

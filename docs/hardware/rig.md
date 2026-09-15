@@ -61,6 +61,16 @@ Hardware-gated checks for the `mirror-link` app (spec
   generator. `telemetry.perf.orbit.rateHz` must hold at ~1 kHz with
   `orbit.native` true throughout, even while `perf.tickGapMs.max` spikes (that
   spike is the JS loop, which no longer drives the mirrors).
+- **Hexagon test — pose density over time.** Scan a point source at 10 Hz for
+  5 minutes and watch the shape AND the **Status** line's `· <n>/s` suffix. The
+  ring must stay round: a rotating hexagon/polygon means the mirror sink's AIMD
+  governor has backed off (6 vertices ⇒ ~60 poses/s). Confirm
+  `telemetry.perf.orbit.governor.state` stays `steady` at
+  `effectiveRateHz` ≈ 1000 and `backoffs` does not climb; a `backoff` state with
+  rising `softFails`/`outq` is a genuine link problem, a `backoff` with both at
+  zero means the policy (floor 500 Hz, RTT inflation 8×) needs another look.
+  Also compare `emitHz` vs `sinkHz` — if BOTH are low the generator thread is
+  being starved (macOS timer coalescing), not the link.
 - **Dashed-ring readout.** Point at a blinker of KNOWN frequency and confirm the
   on/off pattern along the ring matches it (count the dashes per revolution
   against `blink_hz / scan_hz`).

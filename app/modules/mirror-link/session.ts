@@ -133,10 +133,19 @@ const FALLBACK_TICK_MS = 10;
 /** The orbit node's advertised output. */
 const PID_STREAM: StreamType = { kind: "analysis", schema: "pid" };
 
-/** How often the brick's meter is read for `perf.orbit.rateHz`. Far slower than
+/** How often the brick + sink meters are read for `perf.orbit`. Far slower than
  *  the telemetry throttle: a probe builds an object on the very loop the brick
  *  exists to keep free. */
 const ORBIT_PROBE_INTERVAL_MS = 1000;
+
+/** Orbit-sink GOVERNOR policy (spec §actuation). The compose path's AIMD
+ *  defaults suit a latency-sensitive tracker: halve on ANY pressure signal,
+ *  floor 60 Hz. A free-running orbit is different — 60 poses/s at a 10 Hz scan
+ *  is a hexagon. Genuine link overload must still back off (`enabled` stays
+ *  true), but never below a floor that keeps the ring round, and a busy MCU's
+ *  inflated ACK RTT is not overload of the UPDATE path. */
+const ORBIT_GOV_FLOOR_HZ = 500;
+const ORBIT_GOV_RTT_INFLATION = 8;
 
 const errorLine = (e: unknown): string =>
   (e instanceof Error ? e.message : String(e)).split("\n", 1)[0];
@@ -224,11 +233,12 @@ export default function mirrorLinkSession(
       orbit.setPose({ centerL: c.l, centerR: c.r, jL, jR });
     }
 
-    /** Hand the brick the ring shape + whether it is running. */
+    /** Hand the brick the ring shape, its tick rate, and whether it runs. */
     function pushOrbitParams(): void {
       orbit?.setOrbit({
         ampRad: radians(s.state.scan_amp),
         hz: clampHz(s.state.scan_hz),
+        paceHz: s.state.orbit_pace_hz,
         enabled: scanActive,
       });
     }
@@ -963,21 +973,65 @@ export default function mirrorLinkSession(
      *  under the native brick it only meters THIS loop, never the scan. */
     const tickGapMsStats = new RollingStats(0.9, 2, "ms");
 
-    let lastOrbitCount = 0;
+    type OrbitPerf = {
+      native: boolean;
+      emitHz: number;
+      sinkHz: number;
+      governor: {
+        state: "off" | "steady" | "seeking" | "backoff";
+        effectiveRateHz: number;
+        backoffs: number;
+        softFails: number;
+        outq: number;
+      };
+    };
+    let orbitPerf: OrbitPerf = {
+      native: false,
+      emitHz: 0,
+      sinkHz: 0,
+      governor: {
+        state: "off",
+        effectiveRateHz: 0,
+        backoffs: 0,
+        softFails: 0,
+        outq: 0,
+      },
+    };
+    let lastEmitCount = 0;
+    let lastSinkCount = 0;
     let lastOrbitAt = 0;
-    let orbitRate = 0;
 
-    /** The brick's own emit rate, differenced across probe windows (its meter
-     *  reports a LIFETIME average, which would hide a live stall). */
-    function orbitRateHz(tick: number): number {
-      if (!orbit) return 0;
-      if (tick - lastOrbitAt < ORBIT_PROBE_INTERVAL_MS) return orbitRate;
-      const count = orbit.probe().outputs.volt?.count ?? 0;
-      if (lastOrbitAt > 0)
-        orbitRate = ((count - lastOrbitCount) * 1000) / (tick - lastOrbitAt);
-      lastOrbitCount = count;
+    /** Both ends of the volt path, differenced across probe windows (the
+     *  meters report LIFETIME averages, which would hide a live stall):
+     *  `emitHz` off the brick's thread meter, `sinkHz` off the mirror sink's
+     *  `written` counter — the number that actually reaches the wire, and the
+     *  one the polygon diagnosis turns on (spec §actuation). */
+    function probeOrbit(tick: number): OrbitPerf {
+      const native = voltLink !== null;
+      if (!orbit) return { ...orbitPerf, native, emitHz: 0, sinkHz: 0 };
+      if (tick - lastOrbitAt < ORBIT_PROBE_INTERVAL_MS)
+        return { ...orbitPerf, native };
+      const emits = orbit.probe().outputs.volt?.count ?? 0;
+      const sink = nativePos?.sink?.probe();
+      const writes = sink?.written ?? 0;
+      const dt = tick - lastOrbitAt;
+      const stats = activeController()?.stats;
+      orbitPerf = {
+        native,
+        emitHz: lastOrbitAt > 0 ? ((emits - lastEmitCount) * 1000) / dt : 0,
+        sinkHz: lastOrbitAt > 0 ? ((writes - lastSinkCount) * 1000) / dt : 0,
+        governor: {
+          state: sink?.governorState ?? "off",
+          effectiveRateHz: sink?.effectiveRateHz ?? 0,
+          backoffs: sink?.backoffs ?? 0,
+          softFails: stats?.txSoftFail ?? 0,
+          outq: stats?.outqBytes ?? 0,
+        },
+      };
+      lastEmitCount = emits;
+      lastSinkCount = writes;
       lastOrbitAt = tick;
-      return orbitRate;
+      return orbitPerf;
     }
 
     async function activateSession(scope: ResourceScope): Promise<void> {
@@ -1171,6 +1225,18 @@ export default function mirrorLinkSession(
       nativePos = controllerNode().openNativePosition("mirror-link", {
         initial: { left: { ...volts.L }, right: { ...volts.R } },
         onAttach: (sink) => {
+          // A free-running orbit needs a different AIMD policy from the
+          // latency-sensitive compose path (spec §actuation).
+          try {
+            sink.setGovernor({
+              ceilingHz: s.state.orbit_pace_hz,
+              floorHz: ORBIT_GOV_FLOOR_HZ,
+              rttInflation: ORBIT_GOV_RTT_INFLATION,
+              enabled: true,
+            });
+          } catch {
+            // governor params rejected — the baked defaults still apply
+          }
           voltLink = orbit ? orbit.volt_out.pipe(sink.pos_in) : null;
         },
         onDetach: () => {
@@ -1244,7 +1310,7 @@ export default function mirrorLinkSession(
               // `native` is the LINK, not `nativeEngaged()`: during the attach
               // window the JS path is already suppressed and nothing is
               // driving the mirrors yet.
-              orbit: { native: voltLink !== null, rateHz: orbitRateHz(tick) },
+              orbit: probeOrbit(tick),
             },
           });
           actuateMsStats.resetMax();
@@ -1331,6 +1397,15 @@ export default function mirrorLinkSession(
           if (activeScan) {
             activeScan = { ...activeScan, amp_deg: s.state.scan_amp };
             s.telemetry({ scan: activeScan });
+          }
+        },
+        // The generator's tick rate is also the sink governor's ceiling.
+        orbit_pace_hz() {
+          pushOrbitParams();
+          try {
+            nativePos?.sink?.setGovernor({ ceilingHz: s.state.orbit_pace_hz });
+          } catch {
+            // governor params rejected — the baked defaults still apply
           }
         },
         // Frequency is live on the brick (the phase accumulates across the

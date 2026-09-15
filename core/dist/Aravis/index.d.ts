@@ -894,11 +894,15 @@ declare module "core/Aravis" {
     ampRad: number;
     /** Revolutions per second. */
     hz: number;
+    /** Tick rate of the brick's thread (default 1000, clamped 200-1000). The
+     *  GEOMETRY does not depend on it (the phase accumulates with the measured
+     *  dt) but the poses per revolution the mirror sees do: `paceHz / hz`. */
+    paceHz?: number;
     enabled: boolean;
   }
 
   /**
-   * The NATIVE circular-scan generator: a 1 kHz paced thread emitting
+   * The NATIVE circular-scan generator: a nominally 1 kHz paced thread emitting
    * `v = slew(center) + J · amp · (cos φ, sin φ)` per eye, so a synchronous
    * camera write on the JS event loop can no longer stall the scan. The center
    * follows the latest `setPose` through the shared @lib/slew first-order

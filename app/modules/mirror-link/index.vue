@@ -113,22 +113,64 @@ const period_ms = computed(() =>
   (1000 / Math.max(state.scan_hz, SCAN_HZ_RANGE.min)).toFixed(1),
 );
 
+/** Poses per revolution below which the commanded circle reaches the mirror as
+ *  a visible polygon (spec §actuation). */
+const POLYGON_POSES_PER_REV = 20;
+
+/** The pose-rate verdict: which end of the volt path is starving the ring, and
+ *  why the sink's governor backed off. Null while the ring is dense enough. */
+const poseRate = computed<{ sinkHz: number; warn: string | null }>(() => {
+  const o = telemetry.perf.orbit;
+  const hz = telemetry.scan?.hz ?? 0;
+  if (!o.native || hz <= 0)
+    return { sinkHz: o.sinkHz, warn: null };
+  const perRev = o.sinkHz / hz;
+  if (perRev >= POLYGON_POSES_PER_REV) return { sinkHz: o.sinkHz, warn: null };
+  const g = o.governor;
+  const low =
+    o.emitHz < o.sinkHz * 1.2
+      ? `the generator itself is slow (emit ${o.emitHz.toFixed(0)}/s)`
+      : `the serial link is throttling (emit ${o.emitHz.toFixed(0)}/s, wire ${o.sinkHz.toFixed(0)}/s)`;
+  return {
+    sinkHz: o.sinkHz,
+    warn:
+      `polygon: ${perRev.toFixed(0)} poses per revolution — ${low}. ` +
+      `Governor ${g.state} at ${g.effectiveRateHz.toFixed(0)} Hz, ` +
+      `${g.backoffs} backoffs, ${g.softFails} soft fails, outq ${g.outq} B.`,
+  };
+});
+
 const scanStatus = computed<{ text: string; tone: string; title: string }>(
   () => {
     const t = telemetry.scan;
-    if (t)
-      return {
-        text: `${t.hz.toFixed(1)} Hz · ${ms(t.period_us)} ms · L ${ms(t.exposure_us.L)} ms · R ${ms(
+    if (t) {
+      const rate = poseRate.value;
+      const text =
+        `${t.hz.toFixed(1)} Hz · ${ms(t.period_us)} ms · L ${ms(t.exposure_us.L)} ms · R ${ms(
           t.exposure_us.R,
-        )} ms`,
-        tone: t.mismatch ? "warn" : "",
-        title: t.mismatch
-          ? `A fovea exposure misses the ${ms(t.period_us)} ms revolution — its frame covers ` +
+        )} ms` + (rate.sinkHz > 0 ? ` · ${rate.sinkHz.toFixed(0)}/s` : "");
+      if (rate.warn) return { text, tone: "warn", title: rate.warn };
+      if (t.mismatch)
+        return {
+          text,
+          tone: "warn",
+          title:
+            `A fovea exposure misses the ${ms(t.period_us)} ms revolution — its frame covers ` +
             `only part of the ring. Applied frame rates: L ${t.frame_rate.L.toFixed(
               1,
-            )} Hz, R ${t.frame_rate.R.toFixed(1)} Hz.`
-          : `Each fovea frame integrates one full ${ms(t.period_us)} ms revolution.`,
+            )} Hz, R ${t.frame_rate.R.toFixed(1)} Hz.`,
+        };
+      return {
+        text,
+        tone: "",
+        title:
+          `Each fovea frame integrates one full ${ms(t.period_us)} ms revolution` +
+          (rate.sinkHz > 0
+            ? `, commanded at ${rate.sinkHz.toFixed(0)} poses/s ` +
+              `(${(rate.sinkHz / t.hz).toFixed(0)} per revolution).`
+            : "."),
       };
+    }
     const reason = telemetry.scan_blocked;
     return {
       text: reason ? "idle — refused" : "idle",
