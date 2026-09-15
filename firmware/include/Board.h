@@ -78,8 +78,8 @@ constexpr Pin<OUTPUT, DISABLE> enable{15};
 // it only pulls low, so the strobe pin must supply its own pull-up (3.3V
 // internal; the pin is not 5V tolerant) or it floats. Line idles HIGH.
 typedef struct CameraPinout {
-  const Pin<OUTPUT> trigger;
-  const Pin<INPUT_PULLUP> strobe;
+  const Pin<OUTPUT> trigger; // controller -> camera
+  const Pin<INPUT_PULLUP> strobe; // controller <- camera
   inline void init() const {
     trigger.init();
     strobe.init();
