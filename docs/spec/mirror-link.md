@@ -25,30 +25,59 @@ scan is active — they move the ring's center, never its shape.
 
 ### Auto align {#auto-align}
 
-Source: `align.ts` (pure, unit-tested). `autoAlign` re-aims both foveas at the emitter
-from ONE frame per eye: it runs a single observe-only capture shot (stack 1 regardless of
-`cap_stack`), pulls the two UNWARPED fovea previews, takes each frame's
-`brightestSpot` (centroid of pixels ≥ 90 % of the peak; refused below an 8-bit peak of 32
-or under 3 lit pixels), converts the spot to an angular offset against that eye's fovea
-intrinsics at its CURRENT gaze (`deriveFoveaIntrinsics(und, a_eye, 1)`, pinhole
-`atan((s − c)/f)`), and adds it to the eye's current angle. `solveAlignment` then inverts
-the fixation model in closed form — `z = 2b / (tan aL.x − tan aR.x)`,
-`x = z·tan aL.x − b`,
-`angle.y = mean`, `shift = (aL.y − aR.y)/2`, diverging/parallel ⇒ ∞ — and the result is
-APPLIED: the gaze ray becomes the scan center (`target`/`target_angle`), the crossing
-distance becomes `verge` (via `distanceToVerge`, clamped 0–1; ∞ ⇒ 0) and the vertical
-difference becomes `shift` (clamped to the slider range).
+A SERVO, not a one-shot (the marker-servo idiom: measurement node → PID nodes → applied
+command, stepped at the MEASUREMENT rate, never per tick). `startAlign`/`stopAlign` are
+COMMANDS — session-local intent like the scan — and `telemetry.align` is non-null exactly
+while engaged.
 
-Refused with a reason on `telemetry.align` (and the title-bar tray) when there is no
-leased/calibrated triple or capture helper (`not ready`), while the scan is ACTIVE
-(`scan active` — the emitter must read as a point, not a ring), or when either eye shows
-no spot (`no bright spot on L|R`). The last result stays on `telemetry.align` (reset on
-idle) so the UI tooltip can show both spots and the applied delta.
+**Measurement.** A `spot` vision kernel (`spot-kernel.ts`, node `win/mirror-link/spot`)
+over the two RAW convert pipes: per frame per eye it runs `findSpot` — `brightestSpot` on
+a 2× decimated scan, then a refine in a 32 px window (full-resolution fallback for a dot
+the decimation brackets) — and emits `{x, y, peak} | null`. Built and disposed exactly like
+the ring node (pipes → wiring → worker, LIFO), existing only while the servo is engaged.
+
+**Control.** Two PID nodes (`win/mirror-link/pid/L`, `…/R`), each holding a `PID2D` — the
+four controllers (L.x, L.y, R.x, R.y) share `state.pid_kp`/`pid_ki`/`pid_kd` and clamp
+each step to `state.pid_max_step_deg`. The gains are FLAT top-level state keys: the
+session client only emits `setState` from a top-level key's ref, so a nested object's
+fields would never reach the orchestrator. Per spot result: the eye's angular error is
+`spotOffsetAngle(spot, c, f)` against `deriveFoveaIntrinsics(und, desiredAngle, 1)`; the
+controller's velocity-form output is added to that eye's DESIRED angle. `dt` comes from the
+result arrival times (clamped to 0.5 s).
+
+**Application is COLLECTIVE by construction**: every step runs
+`solveAlignment(desiredL, desiredR, baseline)` and writes the gaze ray (`target`,
+`target_angle`), `verge` (clamped 0–1; ∞ ⇒ 0) and `shift` (clamped to the slider range)
+TOGETHER — the two eyes cannot walk apart.
+
+A blind eye HOLDS (no step); its integrator resets after 10 consecutive misses, so a
+blackout cannot wind it up. Both eyes blind for 2 s sets `align.reason` and the servo stays
+engaged. The servo works WHILE SCANNING (a ring's bright-pixel centroid is its center), so
+there is no scan gating; it only reads pipes, so capture and recording are independent of
+it. Engage needs `ready`; both commands ride the scan op chain so they cannot interleave
+with a start/stop. Idle disengages.
 
 RIG-GATED: the pixel→angle SIGN is `SPOT_TO_ANGLE_SIGN` in `align.ts`, defaulting to
-`{+1, +1}` — the same pinhole convention split-tracking's `eyeJInv` uses. A mounting flip
-shows up on the rig as the spot moving AWAY from the fovea center after an align; flipping
-the axis there is the whole fix.
+`{+1, +1}` — the same pinhole convention split-tracking's `eyeJInv` uses. Inverted for this
+mounting, the loop DIVERGES and `align.error_deg` grows; flipping the axis there is the
+whole fix.
+
+## Ring views {#ring-views}
+
+`state.ring_view` (`off` | `polar` | `binary` | `segments`, default `off`, persisted)
+selects a per-eye histogram of the reader's own intermediates, drawn at the bottom of the
+drawer's middle column. The ring worker builds a DEBUG STRIP only while it is not `off`
+(pushed with `enabled` via `sendParams`), so the views cost nothing when closed.
+
+The strip is ONE mono8 session frame per eye (`ring-L`, `ring-R`), width = the ANGULAR
+sample count `n` — the arc-domain rows are mapped back through the same arc→angle table the
+overlay uses, so every row lines up column-for-column. Rows, top to bottom: the polar image
+(`polarRows`, normalized to its own p1/p99), the envelope-normalized profile, the binary
+ring, and a segmentation row (0 none · 64 byte edge · 128 field edge · 192 leader span ·
+255 data start). `telemetry.ring.<eye>.strip` carries `{ polarRows, width, rows }` — the
+renderer needs no other agreement. Each strip is a FRESH buffer (the worker transfers
+emitted frames). Frames flow only while the ring node exists AND the scan runs; otherwise
+the canvas is empty and the caption says why.
 
 ## Circular scan {#scan}
 
@@ -202,10 +231,14 @@ a compact status span — the applied `hz · period · per-eye exposure` while a
 detail (and the blocked reason) in its `title` hover. The row is a PLAIN div, never a
 `<label>`/ConfigEntry: a label would forward a status-span click to the button and
 toggle the hardware override; the button's own explanation rides the ROW's `title`
-(a disabled button suppresses hover). The drawer carries the mirror controls (Verge
-Distance, Vertical Shift, the Auto Align button) left and Gain, the scan sliders
-(frequency, amplitude), the Ring Reader toggle, and a Status row right — Gain leads the
-column because it is session-wide, not scan-scoped.
+(a disabled button suppresses hover). The drawer carries THREE columns (a nested
+`HorizontalDivision`): the mirror controls (Verge Distance, Vertical Shift) left; the
+servo column in the middle — the Ring View
+selector and the two histogram strips (§ring-views) FIRST, so both eyes stay comparable
+at a typical drawer height, then the Align PID group (one range/step across Kp/Ki/Kd, a
+reset in its heading) and the Auto Align toggle with its error readout; and Gain, the
+scan sliders (frequency, amplitude), the Ring Reader toggle and a Status row right.
+Gain leads its column because it is session-wide, not scan-scoped.
 Every slider carries a one-sentence `title`. Gain alone declares NO `neutral` — a stray
 right-click must never slam a live camera to range-min, and its `title` says so — and it
 is disabled (readout `—`) until `ready` with a non-degenerate `gain_range`; its `v-model`

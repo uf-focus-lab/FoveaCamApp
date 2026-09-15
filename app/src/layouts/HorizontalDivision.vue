@@ -18,6 +18,8 @@ const props = defineProps({
     type: Number,
     default: 0.5,
   },
+  /** Smallest share of the width each pane may shrink to (0–1). A drag or a
+   *  bound `modelValue` is clamped so neither pane collapses. */
   minWidthLeft: {
     type: Number,
     optional: true,
@@ -44,10 +46,22 @@ watch(
     if (val !== null) local_value.value = val;
   },
 );
-watch(division, (val) => {
-  if (val < 0.0) division.value = 0.0;
-  if (val > 1.0) division.value = 1.0;
-});
+/** Clamp to [minLeft, 1 − minRight] (and to [0, 1]); an over-constrained pair
+ *  splits the difference rather than pinning one pane shut. */
+function clampDivision(val: number): number {
+  const lo = Math.max(0, Math.min(1, props.minWidthLeft ?? 0));
+  const hi = Math.min(1, Math.max(0, 1 - (props.minWidthRight ?? 0)));
+  if (lo > hi) return (lo + hi) / 2;
+  return Math.max(lo, Math.min(hi, val));
+}
+watch(
+  division,
+  (val) => {
+    const clamped = clampDivision(val);
+    if (clamped !== val) division.value = clamped;
+  },
+  { immediate: true },
+);
 const container = useTemplateRef<HTMLDivElement>("container");
 const size = new ElementSize(container);
 

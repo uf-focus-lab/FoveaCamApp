@@ -59,6 +59,7 @@ import type {
   VisionResult,
 } from "@orchestrator/vision-worker-protocol";
 import { nodeId } from "@lib/orchestrator/graph-contract";
+import { makeMat } from "@lib/mat";
 import type { RingReadout } from "@lib/ring-code";
 import type { PipeBroker } from "@orchestrator/pipe-session";
 import { rawPipeSpec, type RawPipeRegistry } from "@orchestrator/raw-pipe";
@@ -71,16 +72,23 @@ import {
   distanceToVerge,
   vergeToDistance,
 } from "@lib/stereo";
+import {
+  createPidNode,
+  outputOf,
+  type PidNodeHandle,
+} from "@orchestrator/pid-node";
+import type { SpotValue } from "@orchestrator/spot-kernel";
+import { PID2D, type PidParams } from "@lib/pid";
 import { deg } from "@lib/util/math";
 import { RollingStats } from "@lib/util/rolling";
 import type { Point2d } from "core/Geometry";
 import type { Pos } from "@lib/controller-codec";
-import { mirrorLink, type AlignResult, type ScanTelemetry } from "./contract";
 import {
-  brightestSpot,
-  solveAlignment,
-  spotOffsetAngle,
-} from "./align";
+  mirrorLink,
+  type AlignTelemetry,
+  type ScanTelemetry,
+} from "./contract";
+import { solveAlignment, spotOffsetAngle } from "./align";
 import { SCAN_HZ_RANGE, SHIFT_RANGE_DEG, scanAngles, scanOffset } from "./scan";
 import {
   applyScanTiming,
@@ -221,7 +229,6 @@ export default function mirrorLinkSession(
     }
 
     function setTargetFromPixel(px: Point2d): void {
-      clearAlign(); // a manual re-aim supersedes the solved one
       target = px;
       targetAngle = triple?.undistort
         ? triple.undistort.angular([px], false)[0]
@@ -247,14 +254,6 @@ export default function mirrorLinkSession(
       console.error("[mirror-link] scan op failed:", e),
     );
 
-    /** The last auto-align describes a pose the operator has since moved — drop
-     *  it rather than let a stale distance sit next to the button. */
-    function clearAlign(): void {
-      if (lastAlign === null) return;
-      lastAlign = null;
-      s.telemetry({ align: null });
-    }
-
     function publishScanBlocked(reason: string | null): void {
       s.telemetry({ scan_blocked: reason });
     }
@@ -262,8 +261,6 @@ export default function mirrorLinkSession(
     /** Local mirror of the published `scan` readout — the runtime doesn't hand
      *  back the last telemetry object, and the amplitude watch patches it. */
     let activeScan: ScanTelemetry | null = null;
-    /** Mirror of the published `align` readout (the runtime hands nothing back). */
-    let lastAlign: AlignResult | null = null;
 
     function publishScanTelemetry(
       hz: number,
@@ -470,6 +467,15 @@ export default function mirrorLinkSession(
     }
 
     function onRingResult(r: VisionResult): void {
+      // The per-eye debug strips (spec §ring-views) ride the session frame
+      // channels; the worker only emits them while a histogram is on screen.
+      for (const f of r.frames) {
+        const side = f.name.endsWith("-R") ? "R" : "L";
+        s.frame(
+          side === "R" ? "ring-R" : "ring-L",
+          makeMat(new Uint8Array(f.buffer), [f.height, f.width], f.channels),
+        );
+      }
       let changed = false;
       for (const side of SIDES) {
         const value = r.values[side] as RingReadout | undefined;
@@ -480,9 +486,13 @@ export default function mirrorLinkSession(
       if (changed) s.telemetry({ ring: { L: ring.L, R: ring.R } });
     }
 
-    /** The reader only runs while the scan does; no node ⇒ nothing to push. */
+    /** The reader only runs while the scan does, and only builds debug strips
+     *  while a histogram stage is selected; no node ⇒ nothing to push. */
     function pushRingEnabled(): void {
-      ringWorker?.sendParams({ enabled: scanActive });
+      ringWorker?.sendParams({
+        enabled: scanActive,
+        debug: s.state.ring_view !== "off",
+      });
     }
 
     /** Drop the published readouts. The annotations assert a decode of THIS
@@ -535,7 +545,11 @@ export default function mirrorLinkSession(
       ringWorker = createVisionWorker(
         {
           pipes,
-          params: { kind: "ring", enabled: scanActive },
+          params: {
+            kind: "ring",
+            enabled: scanActive,
+            debug: s.state.ring_view !== "off",
+          },
           meterName: node,
         },
         onRingResult,
@@ -565,9 +579,6 @@ export default function mirrorLinkSession(
     // undistorted center, with the scan/reader state alongside them.
 
     let captureHelper: CaptureHelper | null = null;
-    /** True only for the auto-align shot: ONE frame per eye, whatever
-     *  `cap_stack` says (spec §targeting). */
-    let alignShot = false;
     let centerPipe: {
       shmName: string;
       maxBytes: number;
@@ -610,7 +621,7 @@ export default function mirrorLinkSession(
       const shot = rawTripleShot({
         reset,
         indexed,
-        stackCount: alignShot ? 1 : Math.max(1, s.state.cap_stack),
+        stackCount: Math.max(1, s.state.cap_stack),
         note: "mirror-link: unwarped ring frames (a scanned frame has no single mirror pose)",
       });
       const link = mirrorLinkMeta();
@@ -637,57 +648,90 @@ export default function mirrorLinkSession(
       };
     }
 
-    /** Run ONE observe-only shot and solve both eyes onto the emitter
-     *  (spec §targeting). RIG-GATED: the pixel→angle sign lives in
-     *  `align.ts`'s `SPOT_TO_ANGLE_SIGN`. */
-    async function autoAlignNow(): Promise<AlignResult> {
+    // --- auto-align servo (spec §targeting) ---------------------------------
+    // A closed loop, not a one-shot: the `spot` kernel measures the emitter in
+    // each fovea frame and FOUR PID controllers (two PID2D, one per eye) drive
+    // the per-eye DESIRED angles until the spot sits at the frame center. Every
+    // step re-solves the fixation model and applies the pair COLLECTIVELY —
+    // gaze ray, verge distance and vertical shift together — so the two eyes can
+    // never walk apart. Session-local intent, like the scan.
+
+    let spotWorker: VisionWorkerHandle | null = null;
+    let spotNode: { dispose(): void } | null = null;
+    /** Per-eye PID node (each holds one PID2D = the eye's x and y controllers). */
+    const alignPid: Partial<Record<Side, PidNodeHandle<Point2d>>> = {};
+    const alignCtl: Partial<Record<Side, PID2D>> = {};
+    /** The angles the servo is driving toward (seeded from the live pose). */
+    const desired: Record<Side, Point2d> = {
+      L: { x: 0, y: 0 },
+      R: { x: 0, y: 0 },
+    };
+    const misses: Record<Side, number> = { L: 0, R: 0 };
+    let alignEngaged = false;
+    let lastSpotAt = 0;
+    let lastSeenAt = 0;
+    let alignTele: AlignTelemetry | null = null;
+
+    /** Integrator resets after this many consecutive blind frames on an eye. */
+    const MISS_RESET = 10;
+    /** Both eyes blind this long ⇒ say so (the servo stays engaged). */
+    const BLIND_MS = 2000;
+
+    function pidParams(): PidParams {
+      const { pid_kp: kp, pid_ki: ki, pid_kd: kd } = s.state;
+      const lim = radians(Math.max(0, s.state.pid_max_step_deg));
+      return { kp, ki, kd, limits: [-lim, lim] };
+    }
+
+    function publishAlign(patch?: Partial<AlignTelemetry>): void {
+      if (!alignEngaged) return;
+      alignTele = { ...(alignTele as AlignTelemetry), ...patch };
+      s.telemetry({ align: alignTele });
+    }
+
+    /** One servo step per spot result (spec §targeting): angle error per eye →
+     *  PID → desired angles → one collective solve. */
+    function onSpotResult(r: VisionResult): void {
+      if (!alignEngaged) return;
       const t = triple;
       const und = t?.undistort;
-      if (!t || !und || !captureHelper)
-        return { ok: false, reason: "not ready" };
-      if (scanActive) return { ok: false, reason: "scan active" };
-      if (recording.active) return { ok: false, reason: "recording active" };
-      alignShot = true;
-      try {
-        await captureHelper.captureShot();
-      } finally {
-        alignShot = false;
-      }
-      const spots: { L: Point2d | null; R: Point2d | null } = {
-        L: null,
-        R: null,
-      };
-      const angles = {} as Record<Side, Point2d>;
-      try {
-        for (const side of SIDES) {
-          const frame = await captureHelper.getPreview(
-            side === "L" ? "left" : "right",
-          );
-          const shape = frame?.shape ?? [];
-          const spot = frame?.data
-            ? brightestSpot({
-                data: new Uint8Array(frame.data),
-                width: shape[1] ?? 0,
-                height: shape[0] ?? 0,
-                channels: frame.channels,
-              })
-            : null;
-          if (!spot)
-            return { ok: false, reason: `no bright spot on ${side}`, spots };
-          spots[side] = { x: spot.x, y: spot.y };
-          // The eye's CURRENT gaze + the spot's pinhole offset in ITS fovea
-          // view (same intrinsics the capture snapshot records).
-          const current = t.conv.V2A[side](volts[side]);
-          const { f, c } = deriveFoveaIntrinsics(und, current, 1);
-          const d = spotOffsetAngle({ x: spot.x, y: spot.y }, c, f);
-          angles[side] = { x: current.x + d.x, y: current.y + d.y };
+      if (!t || !und) return;
+      const now = performance.now();
+      const dt = lastSpotAt > 0 ? Math.min(0.5, (now - lastSpotAt) / 1000) : 0;
+      lastSpotAt = now;
+      const spots: AlignTelemetry["spots"] = { L: null, R: null };
+      const errors: AlignTelemetry["error_deg"] = { L: null, R: null };
+      let sawAny = false;
+      for (const side of SIDES) {
+        const spot = r.values[side] as SpotValue | undefined;
+        const node = alignPid[side];
+        const ctl = alignCtl[side];
+        if (!node || !ctl) continue;
+        node.ingest("spot");
+        if (!spot) {
+          // Blind on this eye: HOLD its angle. A long blackout would otherwise
+          // wind the integrator up against a measurement that never comes.
+          if (++misses[side] === MISS_RESET) ctl.reset();
+          continue;
         }
-      } finally {
-        await captureHelper.discard();
+        sawAny = true;
+        misses[side] = 0;
+        spots[side] = { x: spot.x, y: spot.y };
+        // The error IS the spot's offset from the fovea center, in angle.
+        const { f, c } = deriveFoveaIntrinsics(und, desired[side], 1);
+        const err = spotOffsetAngle({ x: spot.x, y: spot.y }, c, f);
+        errors[side] = { x: deg(err.x), y: deg(err.y) };
+        ctl.setParams({ x: pidParams(), y: pidParams() });
+        const step = node.step(() => ctl.step(err, dt || 1 / 30));
+        const delta = outputOf(step);
+        desired[side] = {
+          x: desired[side].x + delta.x,
+          y: desired[side].y + delta.y,
+        };
       }
-      const solved = solveAlignment(angles.L, angles.R, s.state.baseline);
-      // Apply: the gaze ray becomes the scan center, the crossing distance the
-      // verge, and the vertical difference the shift.
+      if (sawAny) lastSeenAt = now;
+      // COLLECTIVE apply: one gaze ray, one distance, one shift.
+      const solved = solveAlignment(desired.L, desired.R, s.state.baseline);
       targetAngle = solved.angle;
       target = und.position([solved.angle], false)[0];
       const verge = Number.isFinite(solved.distanceMm)
@@ -703,9 +747,13 @@ export default function mirrorLinkSession(
       );
       s.telemetry({ target, target_angle: targetAngle });
       publishScanGeometry();
-      return {
-        ok: true,
-        spots: { L: spots.L!, R: spots.R! },
+      const blind =
+        !sawAny && lastSeenAt > 0 && now - lastSeenAt > BLIND_MS
+          ? "no emitter in either fovea"
+          : undefined;
+      publishAlign({
+        spots,
+        error_deg: errors,
         applied: {
           angle: solved.angle,
           distance_mm: Number.isFinite(solved.distanceMm)
@@ -713,7 +761,106 @@ export default function mirrorLinkSession(
             : null,
           shift_deg: s.state.shift,
         },
+        ...(blind ? { reason: blind } : { reason: undefined }),
+      });
+    }
+
+    /** Build the measurement node + the two PID nodes, and engage. */
+    function startAlignNow(): boolean {
+      const t = triple;
+      if (!t || !t.undistort || alignEngaged) return alignEngaged;
+      const node = nodeId.win("mirror-link", "spot");
+      const pipeIds: string[] = [];
+      const pipes: PipeInput[] = SIDES.map((side) => {
+        const pipeId = nodeId.convert(t.leases[side].camera.serial);
+        const handle = broker.connect(pipeId);
+        pipeIds.push(pipeId);
+        const { width, height, channels, bytesPerFrame, maxBytes } = handle.spec;
+        return {
+          role: side,
+          shmName: handle.shmName,
+          width,
+          height,
+          channels,
+          bytesPerFrame: maxBytes ?? bytesPerFrame,
+        };
+      });
+      const unregister = registerGraphWiring({
+        nodes: [
+          {
+            id: node,
+            kind: "spot",
+            owner: "win/mirror-link",
+            output: { kind: "analysis", schema: "spot" },
+            transport: "worker",
+          },
+        ],
+        edges: pipes.map((pipe, i) => ({
+          from: pipeIds[i],
+          to: node,
+          port: pipe.role,
+          type: { kind: "frame", pixelFormat: "RGBA8", dtype: "U8" } as const,
+        })),
+      });
+      // One PID node per eye: spot → pid → controller, exactly the marker
+      // servo's shape. Each holds a PID2D, so the four DOFs are the two nodes'
+      // x/y controllers.
+      for (const side of SIDES) {
+        desired[side] = t.conv.V2A[side](volts[side]);
+        misses[side] = 0;
+        const ctl = new PID2D({ x: pidParams(), y: pidParams() });
+        alignCtl[side] = ctl;
+        alignPid[side] = createPidNode<Point2d>({
+          id: nodeId.win("mirror-link", "pid", side),
+          kind: "pid",
+          owner: "win/mirror-link",
+          inputs: [{ from: node, port: "spot" }],
+          outputs: [{ to: nodeId.controller(), port: `align/${side}` }],
+          controllers: { angle: ctl },
+        });
+      }
+      spotWorker = createVisionWorker(
+        {
+          pipes,
+          params: { kind: "spot", enabled: true },
+          meterName: node,
+        },
+        onSpotResult,
+      );
+      spotNode = {
+        dispose() {
+          spotWorker?.terminate();
+          spotWorker = null;
+          for (const side of SIDES) {
+            alignPid[side]?.dispose();
+            delete alignPid[side];
+            delete alignCtl[side];
+          }
+          unregister();
+          for (const id of pipeIds) broker.disconnect(id);
+        },
       };
+      alignEngaged = true;
+      lastSpotAt = 0;
+      lastSeenAt = performance.now();
+      alignTele = {
+        engaged: true,
+        spots: { L: null, R: null },
+        error_deg: { L: null, R: null },
+        applied: null,
+      };
+      s.telemetry({ align: alignTele });
+      return true;
+    }
+
+    function stopAlignNow(): void {
+      if (!alignEngaged && !spotNode) return;
+      alignEngaged = false;
+      const node = spotNode;
+      spotNode = null;
+      node?.dispose();
+      alignTele = null;
+      s.telemetry({ align: null });
     }
 
     // --- recording (spec §recording) ---------------------------------------
@@ -986,6 +1133,7 @@ export default function mirrorLinkSession(
       scope.defer(async () => {
         scanAllowed = false;
         await queueScanOp(async () => {
+          stopAlignNow(); // the servo's worker + PID nodes go first
           await stopScanNow();
           await restoreGainNow();
         });
@@ -1012,7 +1160,6 @@ export default function mirrorLinkSession(
         volts.L = { ...ORIGIN_POS };
         volts.R = { ...ORIGIN_POS };
         activeScan = null;
-        lastAlign = null;
         gainRange = { min: 0, max: 0 };
         ring.L = ring.R = null;
         s.resetTelemetry([
@@ -1030,15 +1177,8 @@ export default function mirrorLinkSession(
       watch: {
         // Everything that moves or reshapes the commanded ring republishes the
         // drawn geometry (the pacer never does — spec §views).
-        // A manual verge/shift write supersedes a solved alignment.
-        verge() {
-          clearAlign();
-          publishScanGeometry();
-        },
-        shift() {
-          clearAlign();
-          publishScanGeometry();
-        },
+        verge: publishScanGeometry,
+        shift: publishScanGeometry,
         baseline: publishScanGeometry,
         // Amplitude is live on the next tick; only the drawn ring needs a push.
         scan_amp() {
@@ -1058,6 +1198,8 @@ export default function mirrorLinkSession(
         gain(dB) {
           if (typeof dB === "number") void queueScanOp(() => applyGainNow(dB));
         },
+        // Strips are built only while a histogram stage is on screen.
+        ring_view: pushRingEnabled,
         // The reader node exists only while the toggle is on (spec §reader).
         // Both directions are idempotent; without a triple neither does
         // anything (activation builds it from the state).
@@ -1070,22 +1212,18 @@ export default function mirrorLinkSession(
         async steer(px) {
           setTargetFromPixel(px);
         },
-        async autoAlign() {
-          // On the SAME FIFO chain as the scan ops: a start/stop must never
-          // interleave with the align shot (spec §targeting).
-          let result: AlignResult = { ok: false, reason: "not ready" };
+        async startAlign() {
+          // On the scan ops' FIFO chain: engaging must not interleave with a
+          // start/stop that is re-arming the same leases.
+          let ok = false;
           await queueScanOp(async () => {
-            try {
-              result = await autoAlignNow();
-            } catch (e) {
-              result = { ok: false, reason: errorLine(e) };
-            }
+            ok = startAlignNow();
+            if (!ok) report("mirror-link", "auto align: not ready", "warning");
           });
-          if (!result.ok)
-            report("mirror-link", `auto align: ${result.reason}`, "warning");
-          lastAlign = result;
-          s.telemetry({ align: result });
-          return result;
+          return ok;
+        },
+        async stopAlign() {
+          await queueScanOp(async () => stopAlignNow());
         },
         async startScan() {
           if (scanActive) return true;

@@ -99,13 +99,16 @@ turns a fovea frame into that profile and back-annotates the result). The offlin
    on fewer than `MIN_RING_POINTS` inliers, a radius below `MIN_RADIUS_PX`, or inliers
    occupying under half the angular bins (72 × 5°) — a dot, not a ring. The circle is only a
    SEED: the real path is an ellipse (the two mirror axes never match in gain and phase).
-2. **Two-pass RIDGE**, `N = clamp(round(2π·r), 512, 4096)` angles. *Coarse*: the max
-   intensity over the WIDE band `[r·0.65, r·1.35]` (min ±6 px) at 2 px steps, giving a
-   brightness and the radius it sat at. Angles above the midpoint of the coarse p5/p95 are
-   LIT; the radius track is interpolated circularly across the dark ones and smoothed
-   (circular moving average, window `N/24`). *Fine*: the max within ±6 px of that track at
-   1 px steps → the profile and its per-angle ridge radius. This follows any smooth closed
-   path; a fixed band around the fitted circle loses half the ring on a real ellipse.
+2. **POLAR IMAGE**: ONE bilinear resample of the annulus into a theta×rho buffer —
+   `N = clamp(round(2π·r), 512, 4096)` angles × `rows` radii spanning `[r(1−W), r(1+W)]`
+   (W = 0.35, min ±6 px) at 1 px. Every later stage reads THIS buffer instead of touching
+   the frame again, and it is what the debug views draw
+   (`mirror-link.md` §ring-views). The ridge is its per-column argmax: angles whose peak
+   is above the midpoint of the column-peak p5/p95 are LIT, the radius track is
+   interpolated circularly across the dark ones and smoothed (circular moving average,
+   window `N/24`), and the FINE profile is the per-column max within ±6 px of that track.
+   This follows any smooth closed path; a fixed band around the fitted circle loses half
+   the ring on a real ellipse.
 3. **Arc-length resampling**: `ds_i = hypot(track_i · 2π/N, Δtrack_i)`, cumulated; the
    profile is resampled uniformly in arc length to `M = round(total arc)` samples (linear
    interpolation). Angle from an off-center point distorts chip arcs by up to ±25 % on an

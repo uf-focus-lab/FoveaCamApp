@@ -26,16 +26,33 @@ const MIN_PEAK = 32;
 /** Fewer lit pixels than this is a hot pixel, not a dot. */
 const MIN_PIXELS = 3;
 
+export type SpotSearch = {
+  /** Lit-pixel threshold as a fraction of the window's peak (default 0.9). */
+  fraction?: number;
+  /** Sample every `step`-th pixel — a decimated first pass (default 1). */
+  step?: number;
+  /** Restrict the search to this window (full-res px; clamped to the frame). */
+  roi?: { x: number; y: number; width: number; height: number };
+};
+
 /**
  * Centroid of the brightest blob: every pixel at or above `fraction` of the
- * frame's peak luminance, averaged. Null when the frame holds no emitter (peak
- * under {@link MIN_PEAK}) or the blob is a single hot pixel.
+ * searched window's peak luminance, averaged, in FULL-RES frame coordinates.
+ * Null when there is no emitter (peak under {@link MIN_PEAK}) or the blob is a
+ * single hot pixel. `step` decimates the scan and `roi` bounds it — a coarse
+ * pass then a refine costs no copy of the frame.
  */
 export function brightestSpot(
   img: AlignImage,
-  fraction = 0.9,
+  opts: SpotSearch = {},
 ): { x: number; y: number; peak: number } | null {
   const { data, width, height, channels } = img;
+  const fraction = opts.fraction ?? 0.9;
+  const step = Math.max(1, Math.floor(opts.step ?? 1));
+  const x0 = Math.max(0, Math.floor(opts.roi?.x ?? 0));
+  const y0 = Math.max(0, Math.floor(opts.roi?.y ?? 0));
+  const x1 = Math.min(width, Math.ceil(x0 + (opts.roi?.width ?? width)));
+  const y1 = Math.min(height, Math.ceil(y0 + (opts.roi?.height ?? height)));
   const luma = (i: number): number => {
     const p = i * channels;
     if (channels < 3) return data[p];
@@ -44,20 +61,22 @@ export function brightestSpot(
     const r = data[p + 2];
     return b > g ? (b > r ? b : r) : g > r ? g : r;
   };
-  const count = width * height;
   let peak = 0;
-  for (let i = 0; i < count; i++) {
-    const v = luma(i);
-    if (v > peak) peak = v;
+  for (let y = y0; y < y1; y += step) {
+    const row = y * width;
+    for (let x = x0; x < x1; x += step) {
+      const v = luma(row + x);
+      if (v > peak) peak = v;
+    }
   }
   if (peak < MIN_PEAK) return null;
   const level = fraction * peak;
   let sx = 0;
   let sy = 0;
   let n = 0;
-  for (let y = 0; y < height; y++) {
+  for (let y = y0; y < y1; y += step) {
     const row = y * width;
-    for (let x = 0; x < width; x++)
+    for (let x = x0; x < x1; x += step)
       if (luma(row + x) >= level) {
         sx += x;
         sy += y;
@@ -66,6 +85,32 @@ export function brightestSpot(
   }
   if (n < MIN_PIXELS) return null;
   return { x: sx / n, y: sy / n, peak };
+}
+
+/** Coarse (decimated) pass then a refine in a window around it — what the
+ *  `spot` kernel runs per fovea frame. A dot small enough to fall between the
+ *  decimated samples falls back to the full-resolution scan rather than being
+ *  reported missing. */
+export function findSpot(
+  img: AlignImage,
+  { decimate = 2, refinePx = 32, fraction = 0.9 } = {},
+): { x: number; y: number; peak: number } | null {
+  const coarse =
+    brightestSpot(img, { fraction, step: decimate }) ??
+    brightestSpot(img, { fraction });
+  if (!coarse) return null;
+  const half = refinePx / 2;
+  return (
+    brightestSpot(img, {
+      fraction,
+      roi: {
+        x: coarse.x - half,
+        y: coarse.y - half,
+        width: refinePx,
+        height: refinePx,
+      },
+    }) ?? coarse
+  );
 }
 
 /** What one auto-align solved for. */

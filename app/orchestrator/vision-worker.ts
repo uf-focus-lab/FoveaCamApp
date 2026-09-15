@@ -26,19 +26,22 @@ import type {
 import { createTemplateMatchKernel } from "./template-match-kernel.js";
 import { createDisplayKernel } from "./display-kernel.js";
 import { createRingKernel } from "./ring-kernel.js";
+import { createSpotKernel } from "./spot-kernel.js";
 import { createDistortionKernel } from "@modules/calibrate-distortion/vision";
 import { createCheckerKernel } from "@modules/calibrate-intrinsic/vision";
 
 /** Kernel registry — keyed by `params.kind`. `template-match` is the generic
  *  needle-into-haystack correlator (disparity-scope spawns two); `display`
  *  serves manual-control + multi-fovea (center only); `distortion`/`checker`
- *  serve the calibrate apps; `ring` reads mirror-link's optical ring code. */
+ *  serve the calibrate apps; `ring` reads mirror-link's optical ring code and
+ *  `spot` measures its emitter for the auto-align servo. */
 const KERNELS: Record<string, KernelFactory> = {
   "template-match": createTemplateMatchKernel,
   display: createDisplayKernel,
   distortion: createDistortionKernel,
   checker: createCheckerKernel,
   ring: createRingKernel,
+  spot: createSpotKernel,
 };
 
 /** Idle backoff when no pipe produced a new frame (yield-loop, ~1-3ms). */

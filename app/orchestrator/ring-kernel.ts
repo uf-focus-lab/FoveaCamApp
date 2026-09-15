@@ -15,11 +15,18 @@ import {
   decodeRing,
   ringHex,
   ringText,
+  type RingDecode,
   type RingFieldName,
   type RingReadout,
 } from "@lib/ring-code";
 import type { Mat } from "core/Vision";
-import type { FrameSet, KernelOutput, VisionKernel } from "./vision-kernel.js";
+import { makeMat } from "@lib/mat";
+import type {
+  FrameSet,
+  KernelFrameOut,
+  KernelOutput,
+  VisionKernel,
+} from "./vision-kernel.js";
 
 /** Bright-mask level between the frame's dark floor and its peak. */
 const DEFAULT_BRIGHT_FRACTION = 0.5;
@@ -68,6 +75,14 @@ export type RingReadOptions = {
   minChipPx?: number;
   minContrast?: number;
   brightFraction?: number;
+  /** Also build the debug strip (spec mirror-link.md §ring-views). */
+  debug?: boolean;
+};
+
+/** One eye's read: the readout, plus the debug strip when it was asked for. */
+export type RingRead = {
+  readout: RingReadout;
+  strip?: { data: Uint8Array; rows: number; width: number };
 };
 
 export type RingCircle = { x: number; y: number; r: number };
@@ -75,7 +90,7 @@ export type RingCircle = { x: number; y: number; r: number };
 /** A reader owns its scratch buffers — one per input role, reused every frame
  *  (the hot path allocates only when the profile length grows). */
 export interface RingReader {
-  read(img: RingImage, opts?: RingReadOptions): RingReadout;
+  read(img: RingImage, opts?: RingReadOptions): RingRead;
 }
 
 const luma = (img: RingImage, index: number): number => {
@@ -201,6 +216,11 @@ export function createRingReader(): RingReader {
   let profile = new Float32Array(0);
   let ridgeR = new Float32Array(0);
   let arcCum = new Float64Array(0);
+  /** theta×rho image of the annulus (rows × n), reused across frames. */
+  let polar = new Float32Array(0);
+  let polarRows = 0;
+  /** Radius of polar row 0 (frame px). */
+  let polarR0 = 0;
   // Arc-domain buffers (length m).
   let resampled = new Float32Array(0);
   let srcIndex = new Float32Array(0);
@@ -217,7 +237,8 @@ export function createRingReader(): RingReader {
     ys = new Float64Array(n);
   }
 
-  function ensureBuffers(n: number): void {
+  function ensureBuffers(n: number, rows: number): void {
+    if (polar.length < rows * n) polar = new Float32Array(rows * n);
     if (coarseP.length >= n) return;
     coarseP = new Float32Array(n);
     coarseR = new Float32Array(n);
@@ -236,8 +257,13 @@ export function createRingReader(): RingReader {
     deque = new Int32Array(3 * n + 2);
   }
 
+  function ensureSort(count: number): void {
+    if (sortBuf.length < count) sortBuf = new Float32Array(count);
+  }
+
   /** `q`-th percentile of `src[0..n)` (sorts into scratch). */
   function percentile(src: Float32Array, n: number, q: number): number {
+    ensureSort(n);
     sortBuf.set(src.subarray(0, n), 0);
     sortBuf.subarray(0, n).sort();
     return sortBuf[Math.floor(q * (n - 1))];
@@ -332,37 +358,66 @@ export function createRingReader(): RingReader {
     out.set(smoothed, 0);
   }
 
-  /** Two-pass RIDGE (spec §reader): a WIDE coarse band finds the ring's radius
-   *  at every lit angle — any smooth closed path, not just a circle — and a
-   *  NARROW pass around that smoothed track takes the profile. */
+  /**
+   * POLAR SAMPLING (spec ring-code.md §reader): one bilinear resample of the
+   * annulus into a theta×rho image — `rows` radii spanning
+   * `[r(1−W), r(1+W)]` at 1 px, `n` angles. Every later stage reads THIS buffer
+   * instead of touching the frame again: the coarse lit mask and the ridge track
+   * are its per-column argmax, and the fine profile is the per-column max within
+   * ±`RIDGE_FINE_PX` of the smoothed track.
+   *
+   * @returns the angular sample count `n`.
+   */
   function ridgeProfile(img: RingImage, circle: RingCircle): number {
     const n = Math.min(
       PROFILE_MAX,
       Math.max(PROFILE_MIN, Math.round(2 * Math.PI * circle.r)),
     );
-    ensureBuffers(n);
     const half = Math.max(RIDGE_COARSE_MIN_PX, RIDGE_COARSE_BAND * circle.r);
+    const rows = 2 * Math.round(half) + 1;
+    ensureBuffers(n, rows);
+    polarRows = rows;
+    polarR0 = circle.r - half;
     for (let i = 0; i < n; i++) {
-      bandLo[i] = circle.r - half;
-      bandHi[i] = circle.r + half;
+      const a = (2 * Math.PI * i) / n;
+      const ca = Math.cos(a);
+      const sa = Math.sin(a);
+      let peak = -1;
+      let peakRow = 0;
+      for (let k = 0; k < rows; k++) {
+        const rr = polarR0 + k;
+        const v = sample(img, circle.x + rr * ca, circle.y + rr * sa);
+        polar[k * n + i] = v;
+        if (v > peak) {
+          peak = v;
+          peakRow = k;
+        }
+      }
+      coarseP[i] = peak;
+      coarseR[i] = polarR0 + peakRow;
     }
-    bandMax(img, circle, n, bandLo, bandHi, COARSE_STEP_PX, coarseP, coarseR);
-    const lit = (p5: number, p95: number) => {
-      const level = (p5 + p95) / 2;
-      return (i: number) => coarseP[i] > level;
-    };
-    smoothTrack(
-      coarseR,
-      lit(percentile(coarseP, n, 0.05), percentile(coarseP, n, 0.95)),
-      n,
-      TRACK_WINDOW_DIV,
-      track,
-    );
+    const p5 = percentile(coarseP, n, 0.05);
+    const p95 = percentile(coarseP, n, 0.95);
+    const level = (p5 + p95) / 2;
+    smoothTrack(coarseR, (i) => coarseP[i] > level, n, TRACK_WINDOW_DIV, track);
+    // FINE profile: the max within ±RIDGE_FINE_PX of the track, read back out
+    // of the polar buffer (no second pass over the frame).
     for (let i = 0; i < n; i++) {
-      bandLo[i] = track[i] - RIDGE_FINE_PX;
-      bandHi[i] = track[i] + RIDGE_FINE_PX;
+      const mid = track[i] - polarR0;
+      const lo = Math.max(0, Math.round(mid - RIDGE_FINE_PX));
+      const hi = Math.min(rows - 1, Math.round(mid + RIDGE_FINE_PX));
+      let peak = -1;
+      let peakRow = lo;
+      for (let k = lo; k <= hi; k++) {
+        const v = polar[k * n + i];
+        if (v > peak) {
+          peak = v;
+          peakRow = k;
+        }
+      }
+      profile[i] = peak;
+      ridgeR[i] = polarR0 + peakRow;
     }
-    bandMax(img, circle, n, bandLo, bandHi, FINE_STEP_PX, profile, ridgeR);
     return n;
   }
 
@@ -531,6 +586,75 @@ export function createRingReader(): RingReader {
     return full;
   }
 
+  /**
+   * DEBUG STRIP (spec mirror-link.md §ring-views): one mono8 image per eye that
+   * shows every stage of the read at once. Width is the ANGULAR sample count
+   * `n`; the arc-domain rows are mapped back through the same arc→angle table
+   * the overlay uses, so every row lines up column-for-column with the polar
+   * image above it. Rows, top to bottom:
+   *
+   *   [0 .. polarRows)  the polar image, normalized to the buffer's p1/p99
+   *   [polarRows]       the envelope-normalized profile (0..255)
+   *   [polarRows + 1]   the binary ring (0 / 255)
+   *   [polarRows + 2]   segmentation: 0 none · 64 byte edge · 128 field edge ·
+   *                     192 leader span · 255 data start
+   *
+   * A FRESH buffer per call: the worker TRANSFERS emitted frames, which would
+   * neuter a reused scratch array.
+   */
+  function buildStrip(
+    n: number,
+    m: number,
+    decoded: RingDecode,
+  ): { data: Uint8Array; rows: number } {
+    const rows = polarRows + 3;
+    const out = new Uint8Array(rows * n);
+    // Polar image, globally normalized (p1/p99 of the buffer itself).
+    const count = polarRows * n;
+    ensureSort(count);
+    sortBuf.set(polar.subarray(0, count), 0);
+    sortBuf.subarray(0, count).sort();
+    const lo = sortBuf[Math.floor(0.01 * (count - 1))];
+    const hi = sortBuf[Math.floor(0.99 * (count - 1))];
+    const span = Math.max(1e-6, hi - lo);
+    for (let k = 0; k < count; k++) {
+      const v = ((polar[k] - lo) / span) * 255;
+      out[k] = v < 0 ? 0 : v > 255 ? 255 : v;
+    }
+    // Arc-domain rows, scattered back to their angular column (a column no arc
+    // sample lands on keeps the previous one — the two lengths differ by <1 %).
+    const profRow = polarRows * n;
+    const binRow = profRow + n;
+    const segRow = binRow + n;
+    let lastCol = 0;
+    for (let k = 0; k < m; k++) {
+      const col = Math.min(n - 1, Math.max(0, Math.round(srcIndex[k])));
+      const v = Math.round(norm[k] * 255);
+      for (let c = lastCol; c <= col; c++) {
+        out[profRow + c] = v;
+        out[binRow + c] = norm[k] >= 0.5 ? 255 : 0;
+      }
+      lastCol = col + 1;
+    }
+    if (decoded.ok) {
+      const mark = (arcIndex: number, value: number): void => {
+        const k = Math.min(m - 1, Math.max(0, Math.round(arcIndex)));
+        const col = Math.min(n - 1, Math.max(0, Math.round(srcIndex[k])));
+        out[segRow + col] = value;
+      };
+      // The leader span first, so the field/byte edges paint over it.
+      const from = Math.round(decoded.leaderStart);
+      const to = Math.round(decoded.dataStart);
+      const steps = Math.abs(to - from);
+      for (let i = 0; i <= steps; i++)
+        mark(from + Math.sign(to - from) * i, 192);
+      for (const e of decoded.fieldEdges)
+        mark(e.at, e.name === "byte" ? 64 : 128);
+      mark(decoded.dataStart, 255);
+    }
+    return { data: out, rows };
+  }
+
   /** Peak deviation of the SMOOTHED ridge track from the fitted circle (frame
    *  px) — how far the real path departs from a circle. The raw per-angle peak
    *  is meaningless across the dark stretches; the track is interpolated. */
@@ -544,12 +668,13 @@ export function createRingReader(): RingReader {
   }
 
   return {
-    read(img, opts = {}): RingReadout {
+    read(img, opts = {}): RingRead {
       const circle = fitCircle(
         img,
         opts.brightFraction ?? DEFAULT_BRIGHT_FRACTION,
       );
-      if (!circle) return { ok: false, reason: "no ring", circle: null };
+      if (!circle)
+        return { readout: { ok: false, reason: "no ring", circle: null } };
       const n = ridgeProfile(img, circle);
       const m = resampleByArc(n);
       normalizeEnvelope(m);
@@ -558,32 +683,46 @@ export function createRingReader(): RingReader {
         minChipPx: opts.minChipPx,
         minContrast: opts.minContrast,
       });
+      const strip = opts.debug
+        ? { ...buildStrip(n, m, decoded), width: n }
+        : undefined;
+      const stripMeta = strip
+        ? { polarRows, width: strip.width, rows: strip.rows }
+        : undefined;
       if (!decoded.ok)
         return {
-          ok: false,
-          reason: decoded.reason,
-          bitIndex: decoded.bitIndex,
-          contrast: decoded.contrast,
-          chipPx: decoded.chipPx,
-          ridgePx,
-          circle,
+          readout: {
+            ok: false,
+            reason: decoded.reason,
+            bitIndex: decoded.bitIndex,
+            contrast: decoded.contrast,
+            chipPx: decoded.chipPx,
+            ridgePx,
+            circle,
+            strip: stripMeta,
+          },
+          strip,
         };
       const angle = (i: number): number => angleAt(i, m, n);
       const dividers: { name: RingFieldName; angle: number }[] =
         decoded.fieldEdges.map((e) => ({ name: e.name, angle: angle(e.at) }));
       return {
-        ok: true,
-        text: ringText(decoded.data),
-        hex: ringHex(decoded.data),
-        circle,
-        chipPx: decoded.chipPx,
-        reverse: decoded.reverse,
-        ridgePx,
-        leaderArc: {
-          from: angle(decoded.leaderStart),
-          to: angle(decoded.dataStart),
+        readout: {
+          ok: true,
+          text: ringText(decoded.data),
+          hex: ringHex(decoded.data),
+          circle,
+          chipPx: decoded.chipPx,
+          reverse: decoded.reverse,
+          ridgePx,
+          leaderArc: {
+            from: angle(decoded.leaderStart),
+            to: angle(decoded.dataStart),
+          },
+          dividers,
+          strip: stripMeta,
         },
-        dividers,
+        strip,
       };
     },
   };
@@ -595,6 +734,9 @@ export type RingParams = {
   enabled?: boolean;
   minChipPx?: number;
   brightFraction?: number;
+  /** Emit the per-eye debug strip (`strip-<role>`) — only while a histogram
+   *  view is actually on screen (spec mirror-link.md §ring-views). */
+  debug?: boolean;
 };
 
 /** Worker→main values: one readout per input role that produced a frame. */
@@ -609,6 +751,7 @@ export function createRingKernel(
     enabled: false,
     minChipPx: 0,
     brightFraction: DEFAULT_BRIGHT_FRACTION,
+    debug: false,
   };
   const readers = new Map<string, RingReader>();
 
@@ -618,18 +761,20 @@ export function createRingKernel(
       if (d.enabled !== undefined) p.enabled = d.enabled;
       if (d.minChipPx !== undefined) p.minChipPx = d.minChipPx;
       if (d.brightFraction !== undefined) p.brightFraction = d.brightFraction;
+      if (d.debug !== undefined) p.debug = d.debug;
     },
 
     process(frames: FrameSet): KernelOutput {
       if (!p.enabled) return null;
       const values: RingValues = {};
+      const out: KernelFrameOut[] = [];
       let any = false;
       for (const [role, frame] of Object.entries(frames)) {
         if (!frame) continue;
         let reader = readers.get(role);
         if (!reader) readers.set(role, (reader = createRingReader()));
         const mat = frame.mat as Mat<Uint8Array>;
-        values[role] = reader.read(
+        const read = reader.read(
           {
             data: mat,
             width: mat.shape[1] ?? 0,
@@ -639,12 +784,19 @@ export function createRingKernel(
           {
             minChipPx: p.minChipPx > 0 ? p.minChipPx : undefined,
             brightFraction: p.brightFraction,
+            debug: p.debug,
           },
         );
+        values[role] = read.readout;
+        if (read.strip)
+          out.push({
+            name: `strip-${role}`,
+            mat: makeMat(read.strip.data, [read.strip.rows, read.strip.width], 1),
+          });
         any = true;
       }
       if (!any) return null;
-      return { values: values as Record<string, unknown>, frames: [] };
+      return { values: values as Record<string, unknown>, frames: out };
     },
 
     dispose(): void {

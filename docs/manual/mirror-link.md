@@ -30,9 +30,11 @@ Three live columns sit across the top:
   sit the **Start Scan** button and the scan status readout.
 - **Right Fovea** (greenyellow) — the mirror image of the left column.
 
-A pull-up **drawer** along the bottom holds the alignment sliders on the left,
-and the **Gain** slider, the scan sliders, the **Ring Reader** switch, and a
-**Status** row repeating the scan readout on the right.
+A pull-up **drawer** along the bottom holds three columns: the mirror controls
+(**Verge Distance**, **Vertical Shift**) on the left; the **Auto Align** servo
+with its PID sliders and the **Ring View** strips in the middle; and the
+**Gain** slider, the scan sliders, the **Ring Reader** switch and a **Status**
+row repeating the scan readout on the right.
 Click the tab at the bottom edge to open it — `Ctrl-\`` toggles it from the
 keyboard — then drag the grip to resize it.
 
@@ -53,7 +55,7 @@ to the new center.
 
 ### To fine-align the foveas
 
-The drag is coarse. Two controls in the left half of the drawer finish the job — the
+The drag is coarse. Two controls in the drawer's left column finish the job — the
 same pair Manual Control uses, but stepped finer here: the emitter has to land in the
 middle of a fovea frame, not just somewhere in it.
 
@@ -69,27 +71,36 @@ where each fovea is aimed.
 
 ### To align automatically
 
-**Auto Align** (left half of the drawer, under Vertical Shift) does it for you:
+**Auto Align** (the drawer's middle column) is a *servo*, not a one-shot: switch it on and
+the mirrors keep hunting the emitter for as long as it is on.
 
-1. **Stop the scan** — the button is disabled while it runs, because auto align
-   needs the emitter to read as a *point*, not a ring.
-2. Press **Auto Align**. It takes one frame from each fovea, finds the brightest
-   spot in each, and works out where both eyes are really looking.
-3. The scan center, **Verge Distance** and **Vertical Shift** are rewritten from
-   that solution, and the line beside the button shows the distance it settled
-   on. Hover it for where the spot was found in each eye.
+1. Press **Auto Align**. It turns green and the line beside it starts reporting the
+   residual error for each eye, in degrees.
+2. Watch those numbers fall. When they settle near zero the emitter is centered in both
+   fovea views, and **Verge Distance** / **Vertical Shift** have been rewritten to match.
+3. Press **Stop Align** to hand control back; the mirrors stay where the servo left them.
 
-If it reports *no bright spot on L* (or R) the emitter is not in that fovea's
-view, or it is too dim — steer closer and raise **Gain** first.
+It works while the scan is running too — a ring's bright pixels average to its center — so
+you can leave it on and watch the ring stay put as the rig drifts.
 
-One caveat while the rig is new: if a press moves the source *away* from the
-fovea center instead of onto it, the pixel-to-angle sign is inverted for this
-mounting. Say so — it is a one-line change — and use the sliders meanwhile.
+If the readout says *no emitter in either fovea* the source is out of view or too dim:
+steer closer and raise **Gain**. If only one eye sees it, that eye keeps servoing and the
+other holds.
+
+**The PID sliders** above the button tune the loop (↺ in the heading puts them back):
+**Kp** how hard it corrects, **Ki** how it removes the last bit of standing error,
+**Kd** damping if it overshoots, and **Max Step** the largest angle it may move per
+measurement. The defaults are a slow, safe loop; raise Kp
+first if it crawls.
+
+One caveat while the rig is new: if the error numbers GROW instead of shrinking, the
+pixel-to-angle sign is inverted for this mounting. Stop the servo, say so — it is a
+one-line change — and use the sliders meanwhile.
 
 ### To scan
 
 1. Set **Scan Frequency** (1–100 Hz) and **Scan Amplitude** (0–2°, the ring's
-   radius) in the right half of the drawer.
+   radius) in the drawer's right column.
 2. Press **Start Scan** (it stays disabled until the three cameras are leased —
    hover the row to see what it is waiting for). The ring goes solid and the
    status line next to the button — repeated in the drawer's **Status** row —
@@ -132,7 +143,7 @@ reason.
 
 ### Reading the emitter
 
-The **Ring Reader** switch in the drawer's right half (under the scan sliders, above
+The **Ring Reader** switch in the drawer's right column (under the scan sliders, above
 **Status**) turns the decoder on. It is **off by default** — it reads every fovea frame on
 its own worker thread, so it is only worth paying for when you are actually reading an
 emitter. It becomes available once the cameras are leased.
@@ -168,9 +179,25 @@ is why the readout can flicker between a decode and a reason while the last good
 stays visible. Turning the switch off removes the annotations and the readout rows
 entirely, and stops the decoding work.
 
+### Looking inside the decoder
+
+**Ring View** (top of the drawer's middle column) draws what the decoder actually sees,
+one strip per eye. It needs **Ring Reader** on, and it only draws while the scan runs.
+
+- **Polar** — the ring unrolled: angle left-to-right, radius top-to-bottom. A healthy ring
+  is a bright horizontal band with dark gaps; a band that wanders up and down means the
+  path is an ellipse (normal), one that leaves the strip means the fit is off.
+- **Binary** — the brightness around the ring after normalization, with the on/off decision
+  drawn over it. Chips that merge into a smear here are why a decode fails.
+- **Segments** — the same trace with the decoded structure marked: the start burst shaded,
+  field boundaries as full-height lines, byte boundaries as short ticks, and a blue line
+  where the message's data begins.
+
+Turning it **Off** stops the work entirely.
+
 ### To brighten a dim source
 
-The **Gain** slider at the top of the drawer's right half raises both foveas'
+The **Gain** slider at the top of the drawer's right column raises both foveas'
 sensor gain together, in decibels. Unlike the exposure override it applies for as
 long as MirrorLink is open — scanning or not — so you can use it to find a faint
 source before you start. Its range is whatever both cameras can honor, and it

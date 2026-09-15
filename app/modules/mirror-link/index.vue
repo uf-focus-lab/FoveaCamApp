@@ -15,7 +15,7 @@ import { computed, ref, shallowRef, watch } from "vue";
 import type { Rect } from "core/Geometry";
 import type { Pos } from "@lib/controller-codec";
 import { ROLE, THEME } from "@lib/camera-config";
-import { useSession, usePipeFrame } from "@lib/orchestrator/client";
+import { useFrames, useSession, usePipeFrame } from "@lib/orchestrator/client";
 import { nodeId } from "@lib/orchestrator/graph-contract";
 import { getController } from "@src/components/Controller.vue";
 import Capture from "@src/capture";
@@ -32,6 +32,7 @@ import Drawer from "@src/components/Drawer.vue";
 import HorizontalDivision from "@src/layouts/HorizontalDivision.vue";
 import { vergeToDistance } from "@lib/stereo";
 import RingOverlay from "./RingOverlay.vue";
+import RingHistogram from "./RingHistogram.vue";
 import { ringGeometry, strokeFor } from "./overlay";
 import { mirrorLink } from "./contract";
 import { SCAN_AMP_RANGE, SCAN_HZ_RANGE, SHIFT_RANGE_DEG } from "./scan";
@@ -171,54 +172,117 @@ const scanHint = computed(() => {
     ? "Stop the scan and restore both fovea cameras' exposure settings."
     : "Start the circular scan and override both fovea cameras so one frame spans one revolution.";
 });
-// --- auto align (spec §targeting) -------------------------------------------
-// One shot per eye re-aims both foveas at the emitter and rewrites Verge
-// Distance + Vertical Shift from the solved geometry.
+// --- auto-align servo (spec §targeting) -------------------------------------
+// A closed loop, not a one-shot: engage it and the mirrors keep the emitter at
+// both fovea centers, rewriting Verge Distance + Vertical Shift every step.
+const engaged = computed(() => telemetry.align?.engaged === true);
 const aligning = ref(false);
-async function runAutoAlign(): Promise<void> {
+async function toggleAlign(): Promise<void> {
   if (aligning.value) return;
   aligning.value = true;
   try {
-    await session.call("autoAlign", undefined);
+    if (engaged.value) await session.call("stopAlign", undefined);
+    else await session.call("startAlign", undefined);
   } finally {
     aligning.value = false;
   }
 }
-const alignHint = computed(() => {
-  if (!telemetry.ready) return "Waiting for the camera triple to be leased.";
-  if (scanning.value)
-    return "Stop the scan first — auto align needs the emitter as a point, not a ring.";
-  return (
-    "Take one frame per fovea, find the emitter in each, and re-aim both mirrors " +
-    "at it — rewriting Verge Distance and Vertical Shift."
-  );
-});
+const alignHint = computed(() =>
+  !telemetry.ready
+    ? "Waiting for the camera triple to be leased."
+    : engaged.value
+      ? "Stop the servo — the mirrors hold where they are."
+      : "Track the emitter: both foveas are driven onto it and kept there, " +
+        "rewriting Verge Distance and Vertical Shift as they go.",
+);
 /** Metres, exactly as the Verge Distance readout writes them. */
 const metres = (mm: number | null): string =>
   mm !== null && Number.isFinite(mm) ? `${(mm / 1000).toFixed(4)}m` : "∞";
+const fmtErr = (e: { x: number; y: number } | null) =>
+  e ? `${e.x.toFixed(2)},${e.y.toFixed(2)}°` : "—";
 
-const alignStatus = computed<{ text: string; tone: string; title: string }>(() => {
-  const a = telemetry.align;
-  if (!a) return { text: "", tone: "", title: alignHint.value };
-  if (!a.ok)
+const alignStatus = computed<{ text: string; tone: string; title: string }>(
+  () => {
+    const a = telemetry.align;
+    if (!a) return { text: "off", tone: "", title: alignHint.value };
+    if (a.reason)
+      return {
+        text: a.reason,
+        tone: "warn",
+        title: `${a.reason} — the servo is engaged but blind; steer closer or raise Gain.`,
+      };
+    const text = `L ${fmtErr(a.error_deg.L)} · R ${fmtErr(a.error_deg.R)}`;
     return {
-      text: a.reason ?? "failed",
-      tone: "warn",
-      title: `Auto align failed: ${a.reason ?? "unknown"}`,
+      text,
+      tone: "ok",
+      title:
+        `${text} residual per eye. Applied ${metres(a.applied?.distance_mm ?? null)}, ` +
+        `shift ${plusSign((a.applied?.shift_deg ?? 0).toFixed(2))}°. ` +
+        "If the error GROWS, the pixel→angle sign is inverted for this rig.",
     };
-  const d = a.applied;
-  const dist = metres(d?.distance_mm ?? null);
-  return {
-    text: `aligned · ${dist}`,
-    tone: "ok",
+  },
+);
+
+/** The three gain terms, one range/step/precision across them (the
+ *  disparity-scope PID block's shape). */
+const PID_DEFAULTS = { kp: 0.5, ki: 0.05, kd: 0 } as const;
+const pidTerms = computed(() => [
+  {
+    label: "Kp",
+    value: state.pid_kp,
+    neutral: PID_DEFAULTS.kp,
+    set: (v: number) => (state.pid_kp = v),
     title:
-      `Spots L ${fmtSpot(a.spots?.L)} · R ${fmtSpot(a.spots?.R)} — ` +
-      `applied ${dist}, shift ${plusSign((d?.shift_deg ?? 0).toFixed(2))}°. ` +
-      "If the spot moved AWAY from center, the pixel→angle sign is inverted for this rig.",
-  };
-});
-const fmtSpot = (p?: { x: number; y: number } | null) =>
-  p ? `(${p.x.toFixed(0)}, ${p.y.toFixed(0)})` : "—";
+      "Proportional gain: how much of the measured angular error the servo corrects each step.",
+  },
+  {
+    label: "Ki",
+    value: state.pid_ki,
+    neutral: PID_DEFAULTS.ki,
+    set: (v: number) => (state.pid_ki = v),
+    title:
+      "Integral gain: removes the steady-state offset the proportional term leaves behind.",
+  },
+  {
+    label: "Kd",
+    value: state.pid_kd,
+    neutral: PID_DEFAULTS.kd,
+    set: (v: number) => (state.pid_kd = v),
+    title: "Derivative gain: damps overshoot; leave at 0 unless the servo rings.",
+  },
+]);
+function resetPid(): void {
+  state.pid_kp = PID_DEFAULTS.kp;
+  state.pid_ki = PID_DEFAULTS.ki;
+  state.pid_kd = PID_DEFAULTS.kd;
+  state.pid_max_step_deg = 0.2;
+}
+
+// --- ring histogram views (spec §ring-views) --------------------------------
+const RING_VIEW_OPTIONS: readonly SingleSelectOption<
+  "off" | "polar" | "binary" | "segments"
+>[] = [
+  { value: "off", label: "Off" },
+  { value: "polar", label: "Polar" },
+  { value: "binary", label: "Binary" },
+  { value: "segments", label: "Segments" },
+];
+const { "ring-L": stripL, "ring-R": stripR } = useFrames(session, [
+  "ring-L",
+  "ring-R",
+]);
+const ringViewOn = computed(
+  () => state.ring_reader && state.ring_view !== "off",
+);
+const RING_VIEW_TITLE =
+  "What the decoder sees, per eye: the polar image of the annulus, the " +
+  "normalized ring with its threshold, or the decoded frame boundaries. " +
+  "Needs the Ring Reader on; Off stops the worker building them.";
+const ringStage = computed(() =>
+  state.ring_view === "off"
+    ? ("polar" as const)
+    : (state.ring_view as "polar" | "binary" | "segments"),
+);
 
 // --- ring reader (spec §reader) ---------------------------------------------
 // An OPTIONAL node, default off — the session builds/disposes it on this state.
@@ -473,11 +537,13 @@ const statusR = computed(() => ringStatus("R"));
     </div>
   </div>
   <Drawer v-model="drawer_height">
+    <!-- THREE columns (spec §views): mirror controls · servo + ring views ·
+         scan. A nested split rather than a new layout component. -->
     <HorizontalDivision
-      :division="0.5"
+      :division="0.3"
       class="fill"
-      :min-width-left="0.25"
-      :min-width-right="0.25"
+      :min-width-left="0.2"
+      :min-width-right="0.4"
     >
       <template #left>
         <div class="options fill">
@@ -508,28 +574,102 @@ const statusR = computed(() => ringStatus("R"));
             <span>Vertical Shift</span>
             <span>{{ plusSign(state.shift.toFixed(2)) }}&deg;</span>
           </RangeSlider>
-          <!-- Auto Align: one frame per eye re-aims both foveas at the emitter
-               (spec §targeting). Ordinary control — no solid fill; the scan
-               must be stopped, so the emitter reads as a point, not a ring. -->
-          <div class="align-row" :title="alignHint">
-            <button
-              class="align-button"
-              :disabled="!telemetry.ready || scanning || busy || aligning"
-              @click="runAutoAlign"
-            >
-              {{ aligning ? "Aligning…" : "Auto Align" }}
-            </button>
-            <span
-              class="align-status"
-              :class="alignStatus.tone"
-              :title="alignStatus.title"
-            >
-              {{ alignStatus.text }}
-            </span>
-          </div>
         </div>
       </template>
       <template #right>
+        <!-- Nested split: the PID/servo column, then the scan column. -->
+        <HorizontalDivision
+          :division="0.5"
+          class="fill"
+          :min-width-left="0.3"
+          :min-width-right="0.3"
+        >
+          <template #left>
+            <div class="options fill">
+              <!-- The decoder's own view leads the column: at a typical drawer
+                   height both eyes stay comparable without scrolling. -->
+              <h4><span>Ring View</span></h4>
+              <SingleSelect
+                v-model="state.ring_view"
+                :options="RING_VIEW_OPTIONS"
+                :disabled="!state.ring_reader"
+                :title="RING_VIEW_TITLE"
+                class="ring-stage"
+                aria-label="Ring histogram stage"
+              />
+              <template v-if="ringViewOn">
+                <RingHistogram
+                  :title="ROLE.L"
+                  :color="THEME.L"
+                  :stage="ringStage"
+                  :payload="stripL.payload.value"
+                  :readout="telemetry.ring.L"
+                  :scanning="scanning"
+                  :reader="state.ring_reader"
+                />
+                <RingHistogram
+                  :title="ROLE.R"
+                  :color="THEME.R"
+                  :stage="ringStage"
+                  :payload="stripR.payload.value"
+                  :readout="telemetry.ring.R"
+                  :scanning="scanning"
+                  :reader="state.ring_reader"
+                />
+              </template>
+              <h4>
+                <span>Align PID</span>
+                <button class="reset" title="Reset to defaults" @click="resetPid">
+                  ↺
+                </button>
+              </h4>
+              <RangeSlider
+                v-for="term in pidTerms"
+                :key="term.label"
+                :model-value="term.value"
+                @update:model-value="term.set($event)"
+                :title="term.title"
+                :min="0"
+                :max="1"
+                :neutral="term.neutral"
+                :step="0.01"
+              >
+                <span>{{ term.label }}</span>
+                <span>{{ term.value.toFixed(2) }}</span>
+              </RangeSlider>
+              <RangeSlider
+                v-model="state.pid_max_step_deg"
+                title="Largest angle each controller may add per measurement — the servo's slew limit."
+                :min="0.01"
+                :max="1"
+                :neutral="0.2"
+                :step="0.01"
+              >
+                <span>Max Step</span>
+                <span>{{ state.pid_max_step_deg.toFixed(2) }}&deg;</span>
+              </RangeSlider>
+              <!-- The servo toggle: one button whose label swaps, styled like
+                   Start/Stop Scan (spec §targeting). -->
+              <div class="align-row" :title="alignHint">
+                <button
+                  class="align-button"
+                  :class="{ on: engaged, busy: aligning }"
+                  :disabled="!telemetry.ready || aligning"
+                  @click="toggleAlign"
+                >
+                  {{ engaged ? "Stop Align" : "Auto Align" }}
+                </button>
+                <span
+                  class="align-status"
+                  :class="alignStatus.tone"
+                  :title="alignStatus.title"
+                >
+                  {{ alignStatus.text }}
+                </span>
+              </div>
+            </div>
+          </template>
+          <template #right>
         <div class="options fill">
           <!-- Gain leads the column: it is SESSION-wide, not scan-scoped
                (spec §gain). No `neutral` — a stray right-click must never slam
@@ -590,7 +730,9 @@ const statusR = computed(() => ringStatus("R"));
               {{ scanStatus.text }}
             </span>
           </div>
-        </div>
+            </div>
+          </template>
+        </HorizontalDivision>
       </template>
     </HorizontalDivision>
   </Drawer>
@@ -736,6 +878,64 @@ const statusR = computed(() => ringStatus("R"));
   & > * {
     height: 2em;
   }
+
+  // Group heading + its reset, as in the disparity-scope drawer.
+  h4 {
+    height: auto;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin: 0.75em 0 0.25em;
+    font-weight: 600;
+    opacity: 0.7;
+    text-transform: uppercase;
+    font-size: 0.8em;
+    letter-spacing: 0.02em;
+
+    &:first-child {
+      margin-top: 0;
+    }
+  }
+
+  .reset {
+    min-width: 3ch;
+    cursor: pointer;
+    border: 1px solid var(--tint-4);
+    border-radius: 4px;
+    background: var(--tint-1);
+    color: inherit;
+    font: inherit;
+    text-transform: none;
+    letter-spacing: 0;
+    padding: 0.1em 0.6em;
+    opacity: 0.8;
+
+    &:hover {
+      background: var(--tint-3);
+      opacity: 1;
+    }
+  }
+
+  // The stage selector is a segmented row of its own.
+  .ring-stage {
+    height: auto;
+    flex-direction: row;
+    gap: 0.25em;
+
+    :deep(.option) {
+      width: auto;
+      flex: 1;
+      align-items: center;
+      text-align: center;
+      padding: 0.1em 0.4em;
+    }
+  }
+  // The histogram strips own their height (fixed aspect) — opt them out of the
+  // slider row cap.
+  & > .histogram {
+    height: auto;
+    margin-top: 0.5em;
+  }
 }
 
 // Auto Align: an ORDINARY control (Principles §5) — no solid fill, that is
@@ -748,29 +948,43 @@ const statusR = computed(() => ringStatus("R"));
   gap: 1ch;
   font-size: 0.9em;
 
+  // ONE running-toggle vocabulary app-wide: the same fills as Start/Stop Scan
+  // — `--accent` idle, `--danger` while it runs.
   .align-button {
     width: 100%;
     min-height: 2em;
     padding: 0.25em 1em;
     border: none;
     border-radius: 4px;
-    background: var(--tint-2);
-    color: var(--text);
+    background: var(--accent);
+    color: var(--bg-chrome);
     font: inherit;
+    font-weight: 600;
     white-space: nowrap;
     cursor: pointer;
 
+    &.on {
+      background: var(--danger);
+      color: var(--text);
+    }
     &:hover:not(:disabled) {
-      background: var(--tint-3);
+      filter: brightness(1.15);
     }
     &:active:not(:disabled) {
-      background: var(--tint-4);
+      filter: brightness(1.25);
     }
     &:focus-visible {
       outline: 2px solid var(--accent-bright);
       outline-offset: 2px;
     }
-    &:disabled {
+    // Mid-round-trip: hold the CURRENT fill, dimmed (mirrors .scan-button).
+    &.busy {
+      opacity: 0.5;
+      cursor: progress;
+    }
+    &:disabled:not(.busy) {
+      background: var(--tint-2);
+      color: var(--text);
       opacity: 0.5;
       cursor: not-allowed;
     }

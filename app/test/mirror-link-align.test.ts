@@ -11,11 +11,15 @@
 import { describe, expect, it } from "vitest";
 import {
   brightestSpot,
+  findSpot,
   solveAlignment,
   spotOffsetAngle,
   SPOT_TO_ANGLE_SIGN,
   type AlignImage,
 } from "@modules/mirror-link/align";
+import { createSpotKernel } from "@orchestrator/spot-kernel";
+import { PID2D } from "@lib/pid";
+import { makeMat } from "@lib/mat";
 import { inverseTriangulate } from "@lib/stereo";
 
 /** A BGRA frame with a Gaussian dot at (cx, cy). */
@@ -131,5 +135,148 @@ describe("spotOffsetAngle", () => {
     expect(
       spotOffsetAngle({ x: 5, y: 5 }, { x: 0, y: 0 }, { x: 0, y: NaN }),
     ).toEqual({ x: 0, y: 0 });
+  });
+});
+
+describe("findSpot (the spot kernel's per-frame work)", () => {
+  it("matches the full-resolution centroid after its decimated first pass", () => {
+    const img = dotFrame(41.25, 22.75, 255, 6);
+    const full = brightestSpot(img)!;
+    const got = findSpot(img)!;
+    expect(got.x).toBeCloseTo(full.x, 1);
+    expect(got.y).toBeCloseTo(full.y, 1);
+  });
+
+  it("returns null on a frame with no emitter", () => {
+    expect(findSpot(dotFrame(20, 30, 20))).toBeNull();
+  });
+
+  it("recovers a TIGHT dot the decimated pass can only bracket", () => {
+    // Sub-pixel dot on odd coordinates: the coarse grid never samples its core,
+    // so the answer has to come from the refine window (or the full-res
+    // fallback) — either way within a pixel of the truth.
+    const tight = dotFrame(21, 31, 255, 0.7);
+    const got = findSpot(tight)!;
+    expect(got.x).toBeCloseTo(21, 0);
+    expect(got.y).toBeCloseTo(31, 0);
+  });
+});
+
+describe("spot kernel", () => {
+  const frameOf = (img: AlignImage) => ({
+    mat: makeMat(img.data, [img.height, img.width], img.channels),
+    seq: 1,
+  });
+
+  it("emits nothing while disabled, a per-role measurement once enabled", () => {
+    const k = createSpotKernel({ kind: "spot" });
+    const frames = {
+      L: frameOf(dotFrame(20, 30, 255, 6)),
+      R: frameOf(dotFrame(44, 12, 255, 6)),
+    } as never;
+    expect(k.process(frames)).toBeNull();
+    k.setParams({ enabled: true });
+    const out = k.process(frames) as { values: Record<string, unknown> };
+    expect(out).not.toBeNull();
+    const L = out.values.L as { x: number; y: number };
+    const R = out.values.R as { x: number; y: number };
+    expect(L.x).toBeCloseTo(20, 0);
+    expect(L.y).toBeCloseTo(30, 0);
+    expect(R.x).toBeCloseTo(44, 0);
+    expect(R.y).toBeCloseTo(12, 0);
+  });
+
+  it("reports null for an eye with no emitter", () => {
+    const k = createSpotKernel({ kind: "spot", enabled: true });
+    const out = k.process({
+      L: frameOf(dotFrame(20, 30, 255, 6)),
+      R: frameOf(dotFrame(20, 30, 10)),
+    } as never) as { values: Record<string, unknown> };
+    expect(out.values.L).not.toBeNull();
+    expect(out.values.R).toBeNull();
+  });
+});
+
+describe("the servo's step math", () => {
+  // The session's loop, reduced to arithmetic: error → PID → desired angles →
+  // one collective solve. Proves the sign convention CLOSES the loop (the error
+  // shrinks) rather than running away.
+  const focal = { x: 4000, y: 4000 };
+  const center = { x: 320, y: 240 };
+  const baseline = 200;
+
+  function run(steps: number, kp: number) {
+    // Truth: the emitter sits at a fixed angle; each eye's spot is where that
+    // angle lands in its fovea frame given the eye's current gaze.
+    const truth = { x: 0.02, y: -0.01 };
+    const desired = {
+      L: { x: 0, y: 0 },
+      R: { x: 0, y: 0 },
+    };
+    const pid = {
+      L: new PID2D({ x: { kp }, y: { kp } }),
+      R: new PID2D({ x: { kp }, y: { kp } }),
+    };
+    let last = Infinity;
+    for (let i = 0; i < steps; i++) {
+      for (const side of ["L", "R"] as const) {
+        const d = desired[side];
+        // Where the emitter appears, inverting spotOffsetAngle.
+        const spot = {
+          x:
+            center.x + Math.tan(truth.x - d.x) * focal.x * SPOT_TO_ANGLE_SIGN.x,
+          y:
+            center.y + Math.tan(truth.y - d.y) * focal.y * SPOT_TO_ANGLE_SIGN.y,
+        };
+        const err = spotOffsetAngle(spot, center, focal);
+        const step = pid[side].step(err, 1);
+        desired[side] = { x: d.x + step.x, y: d.y + step.y };
+        last = Math.hypot(err.x, err.y);
+      }
+    }
+    return { desired, residual: last };
+  }
+
+  it("drives the measured error to zero with the default sign", () => {
+    const { desired, residual } = run(40, 0.5);
+    expect(residual).toBeLessThan(1e-4);
+    expect(desired.L.x).toBeCloseTo(0.02, 4);
+    expect(desired.R.y).toBeCloseTo(-0.01, 4);
+  });
+
+  it("converges onto a solvable pair the fixation model reproduces", () => {
+    const { desired } = run(40, 0.5);
+    const solved = solveAlignment(desired.L, desired.R, baseline);
+    const back = inverseTriangulate(
+      solved.angle,
+      baseline,
+      solved.distanceMm,
+      solved.shiftRad,
+    );
+    expect(back.l.x).toBeCloseTo(desired.L.x, 9);
+    expect(back.r.y).toBeCloseTo(desired.R.y, 9);
+  });
+
+  it("diverges when the sign is inverted — the rig's tell", () => {
+    // Same loop with the opposite convention: the error must GROW.
+    const focalNeg = { x: -focal.x, y: -focal.y };
+    const pid = new PID2D({ x: { kp: 0.5 }, y: { kp: 0.5 } });
+    let d = { x: 0, y: 0 };
+    const truth = { x: 0.02, y: 0 };
+    const errAt = (g: { x: number; y: number }) =>
+      spotOffsetAngle(
+        {
+          x: center.x + Math.tan(truth.x - g.x) * focal.x,
+          y: center.y,
+        },
+        center,
+        focalNeg,
+      );
+    const first = Math.abs(errAt(d).x);
+    for (let i = 0; i < 5; i++) {
+      const step = pid.step(errAt(d), 1);
+      d = { x: d.x + step.x, y: d.y + step.y };
+    }
+    expect(Math.abs(errAt(d).x)).toBeGreaterThan(first);
   });
 });

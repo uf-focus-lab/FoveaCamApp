@@ -99,7 +99,7 @@ function synth(text: string, o: Synth = {}): RingImage {
 }
 
 const read = (img: RingImage) =>
-  createRingReader().read(img, { minChipPx: MIN_CHIP_PX });
+  createRingReader().read(img, { minChipPx: MIN_CHIP_PX }).readout;
 
 describe("ring reader", () => {
   it("decodes a synthesized fovea frame and fits its circle to within a pixel", () => {
@@ -226,7 +226,7 @@ describe("ring reader", () => {
         r: rnd(200, 260),
         seed: i,
       });
-      const got = reader.read(img, { minChipPx: MIN_CHIP_PX });
+      const got = reader.read(img, { minChipPx: MIN_CHIP_PX }).readout;
       if (got.ok) {
         // A decode must be the RIGHT decode.
         expect(got.text, `case ${i}`).toBe("Hello");
@@ -242,13 +242,57 @@ describe("ring reader", () => {
     ).toBeGreaterThanOrEqual(0.9);
   });
 
+  it("builds the debug strip only when asked, with the documented layout", () => {
+    const img = synth("Hello", { ecc: 0, phaseDeg: 0, grad: 1 });
+    const reader = createRingReader();
+    const plain = reader.read(img, { minChipPx: MIN_CHIP_PX });
+    expect(plain.strip).toBeUndefined();
+    expect(plain.readout.strip).toBeUndefined();
+
+    const dbg = reader.read(img, { minChipPx: MIN_CHIP_PX, debug: true });
+    expect(dbg.readout.ok, dbg.readout.reason).toBe(true);
+    const strip = dbg.strip!;
+    const meta = dbg.readout.strip!;
+    // rows = the polar image + profile + binary + segmentation.
+    expect(strip.rows).toBe(meta.polarRows + 3);
+    expect(meta.rows).toBe(strip.rows);
+    expect(strip.width).toBe(meta.width);
+    expect(strip.data.length).toBe(strip.rows * strip.width);
+    // The polar rows span the coarse band around the fitted radius.
+    expect(meta.polarRows).toBeGreaterThan(2 * 6);
+    // Normalized: the polar image uses most of the 8-bit range.
+    let lo = 255;
+    let hi = 0;
+    for (let i = 0; i < meta.polarRows * strip.width; i++) {
+      const v = strip.data[i];
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+    }
+    expect(lo).toBe(0);
+    expect(hi).toBe(255);
+    // The binary row is strictly two-valued, and both values occur.
+    const binRow = (meta.polarRows + 1) * strip.width;
+    const values = new Set<number>();
+    for (let i = 0; i < strip.width; i++) values.add(strip.data[binRow + i]);
+    expect([...values].sort((a, b) => a - b)).toEqual([0, 255]);
+    // The segmentation row carries only the documented marks, and marks the
+    // leader span + the data start.
+    const segRow = (meta.polarRows + 2) * strip.width;
+    const marks = new Set<number>();
+    for (let i = 0; i < strip.width; i++) marks.add(strip.data[segRow + i]);
+    for (const v of marks) expect([0, 64, 128, 192, 255]).toContain(v);
+    expect(marks.has(192)).toBe(true);
+    expect(marks.has(255)).toBe(true);
+    expect(marks.has(128)).toBe(true);
+  });
+
   it("reuses its scratch across frames (same reader, repeated reads)", () => {
     const reader = createRingReader();
     const a = synth("Hi", { ecc: 0, phaseDeg: 0, grad: 1 });
     const b = synth("ok", { ecc: 0, phaseDeg: 0, grad: 1, r: 200 });
     const opts = { minChipPx: MIN_CHIP_PX };
-    expect(reader.read(a, opts).text).toBe("Hi");
-    expect(reader.read(b, opts).text).toBe("ok");
-    expect(reader.read(a, opts).text).toBe("Hi");
+    expect(reader.read(a, opts).readout.text).toBe("Hi");
+    expect(reader.read(b, opts).readout.text).toBe("ok");
+    expect(reader.read(a, opts).readout.text).toBe("Hi");
   });
 });

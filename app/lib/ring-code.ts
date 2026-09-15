@@ -147,6 +147,9 @@ export type RingReadout = {
   leaderArc?: { from: number; to: number };
   /** Field + byte boundaries, radians in image coordinates. */
   dividers?: { name: RingFieldName; angle: number }[];
+  /** Debug-strip geometry when the histogram views asked for one (spec
+   *  mirror-link.md §ring-views); absent otherwise. */
+  strip?: { polarRows: number; width: number; rows: number };
   /** The last SUCCESSFUL read on this eye, carried through failures. */
   last?: { text: string; hex: string };
 };
