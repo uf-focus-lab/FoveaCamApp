@@ -8,8 +8,10 @@
 // split): sizing (`foveaTileSize`, `matchMagnification`), `stepVergence`,
 // `followTarget`, `seedVergence`, and the capture-epoch target ring
 // (`recordTarget`/`targetAtEpoch`). Core-free (types only) so the control law +
-// its tests never load the native addon. Behavior spec: docs/spec/disparity-scope.md
-// (§control-law, §seed-space, §magnification, §needle-geometry).
+// its tests never load the native addon. SHARED by every app that runs the
+// fovea-into-wide template-match loop (disparity-scope, mirror-link). Behavior
+// spec: docs/spec/disparity-scope.md (§control-law, §seed-space, §magnification,
+// §needle-geometry).
 
 import type { Point2d, Size } from "core/Geometry";
 import { VEC } from "@lib/util/geometry";

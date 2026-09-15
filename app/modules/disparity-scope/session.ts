@@ -83,7 +83,7 @@ import {
   type ScopeProjection,
   type TargetSample,
   type VergenceControllers,
-} from "./vergence";
+} from "@lib/vergence/vergence";
 import { hostNowNs } from "@orchestrator/time-align";
 import { createSlicePipe, type SliceHandle, type SlicePipeSeam } from "@orchestrator/slice-pipe";
 import { createScalePipe, type ScaleHandle, type ScalePipeSeam } from "@orchestrator/scale-pipe";
@@ -108,7 +108,7 @@ import {
   TRACKER_STALL_DEADLINE_MS,
   trackerResultStale,
 } from "./tracker-feed";
-import { matchPartnerStale } from "./match-join";
+import { matchPartnerStale } from "@lib/vergence/match-join";
 import { matchStaleMsFor, pairEpochGateTrips } from "./trigger-sync";
 import {
   createTriggerOpChain,

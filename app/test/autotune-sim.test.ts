@@ -13,7 +13,7 @@ import {
   followTarget,
   stepVergence,
   type ScopeProjection,
-} from "@modules/disparity-scope/vergence";
+} from "@lib/vergence/vergence";
 import {
   AutotuneRun,
   DOF_ORDER,

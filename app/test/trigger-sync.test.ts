@@ -16,7 +16,7 @@ import {
   pairEpochGateTrips,
   pairWindowNs,
 } from "@modules/disparity-scope/trigger-sync";
-import { MATCH_STALE_MS } from "@modules/disparity-scope/match-join";
+import { MATCH_STALE_MS } from "@lib/vergence/match-join";
 
 describe("pairWindowNs", () => {
   it("is half the trigger interval, in ns", () => {

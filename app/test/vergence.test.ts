@@ -21,7 +21,7 @@ import {
   type ScopeProjection,
   type TargetSample,
   type VergenceControllers,
-} from "@modules/disparity-scope/vergence";
+} from "@lib/vergence/vergence";
 import type { Point2d } from "core/Geometry";
 import {
   fitMagnification,

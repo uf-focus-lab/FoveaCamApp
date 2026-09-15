@@ -12,7 +12,7 @@
 // without the session (trigger-sync.test.ts) — same idiom as match-join.ts /
 // tracker-feed.ts.
 
-import { MATCH_STALE_MS, pairEpochSkewed } from "./match-join";
+import { MATCH_STALE_MS, pairEpochSkewed } from "@lib/vergence/match-join";
 
 /** Pair window (ns) = half the trigger interval — see match-join.ts header. */
 export function pairWindowNs(minIntervalMs: number): number {

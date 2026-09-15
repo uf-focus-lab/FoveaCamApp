@@ -16,6 +16,14 @@ import {
   pidOverrideCmd,
   pidOverrideState,
 } from "@lib/orchestrator/pid-override-contract";
+import {
+  DEFAULT_VERGENCE_TUNING,
+  SHIFT_LIMIT_DEG,
+  VERGE_MIN_DISTANCE_MM,
+  VSHIFT_LIMIT_DEG,
+  type Gains,
+  type VergenceTuning,
+} from "@lib/vergence/tuning";
 import { DEFAULT_TRACKER_TYPE, type TrackerType } from "./tracker-swap";
 import type { AutotuneProgress, AutotuneStage } from "./autotune";
 import type { TriggerTelemetry } from "@lib/trigger-sync";
@@ -30,43 +38,20 @@ const ZERO: Point2d = { x: 0, y: 0 };
 /** Matched fovea footprint + confidence, lifted into wide-frame pixels. */
 export type MatchInfo = { rect: Rect; score: number };
 
-/** kp / ki / kd, in order — one triple per PID group. */
-export type Gains = [number, number, number];
-
-/** All control tuning; persisted authoritatively by the orchestrator. */
-export type Tuning = {
-  pan: Gains;
-  depth: Gains;
-  v_shift: Gains;
-  /** Control time-step per ms elapsed; higher = faster convergence. */
-  sensitivity: number;
-  /** Fovea-tile match scale in [0, 1] (0 = coarse/fast, 1 = full detail). */
-  scale: number;
-  /** Min CCOEFF score in [-1, 1] required to trust a correction. */
-  min_score: number;
-  /** Guide-strip expansion around the target tile. */
-  expand_x: number;
-  expand_y: number;
+/** All control tuning; persisted authoritatively by the orchestrator. The gain
+ *  triples + match knobs are the SHARED vergence surface (@lib/vergence/tuning
+ *  — identical in every app running the loop); `timeout` is this app's own. */
+export type Tuning = VergenceTuning & {
   /** Convergence window (ms); 0 = no timeout (iterate forever, slider max);
    *  -1 = auto-vergence DISABLED entirely (slider min — manual control only). */
   timeout: number;
 };
 
-// Physical saturation limits, shared by the session (PID construction) and the
-// renderer (slider ranges — the PIDs are server-side, so the UI recomputes them).
-export const VERGE_MIN_DISTANCE_MM = 150;
-export const SHIFT_LIMIT_DEG = 5;
-export const VSHIFT_LIMIT_DEG = 2;
+export type { Gains };
+export { VERGE_MIN_DISTANCE_MM, SHIFT_LIMIT_DEG, VSHIFT_LIMIT_DEG };
 
 export const DEFAULT_TUNING: Tuning = {
-  pan: [0.02, 0.02, 0],
-  depth: [1.0, 0.2, 0.5],
-  v_shift: [0.02, 0.02, 0],
-  sensitivity: 0.1,
-  scale: 0,
-  min_score: 0.1,
-  expand_x: 3.0,
-  expand_y: 2.0,
+  ...DEFAULT_VERGENCE_TUNING,
   timeout: 2000,
 };
 

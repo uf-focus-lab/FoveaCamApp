@@ -35,7 +35,7 @@ import {
 } from "./contract";
 // Core-free display math (NOT ./vergence — that module runtime-imports
 // core/Vision, which the renderer must never pull).
-import { foveaFootprintOnWide } from "./display-geometry";
+import { foveaFootprintOnWide } from "@lib/vergence/display-geometry";
 import Recording from "@src/record";
 import Capture from "@src/capture";
 import StreamView from "@src/components/StreamView.vue";
@@ -245,15 +245,26 @@ function resetGain(key: GainKey): void {
 type GainGroup = {
   key: GainKey;
   title: string;
+  /** One-line explanation of what this DOF does, on the heading. */
+  hint: string;
   range: [number, number];
   step: number;
   terms: [ReturnType<typeof gainRef>, ReturnType<typeof gainRef>, ReturnType<typeof gainRef>];
 };
 const gainGroups: GainGroup[] = [
-  { key: "pan", title: "Pan PID", range: [0, 1], step: 0.01, terms: [gainRef("pan", 0), gainRef("pan", 1), gainRef("pan", 2)] },
-  { key: "depth", title: "Depth PID", range: [0, 10], step: 0.02, terms: [gainRef("depth", 0), gainRef("depth", 1), gainRef("depth", 2)] },
-  { key: "v_shift", title: "Vertical PID", range: [0, 1], step: 0.01, terms: [gainRef("v_shift", 0), gainRef("v_shift", 1), gainRef("v_shift", 2)] },
+  { key: "pan", title: "Pan PID", hint: "Common-mode aim: how the PAIR is centred on the target.", range: [0, 1], step: 0.01, terms: [gainRef("pan", 0), gainRef("pan", 1), gainRef("pan", 2)] },
+  { key: "depth", title: "Depth PID", hint: "Convergence distance: nulls the horizontal disparity between the foveas.", range: [0, 10], step: 0.02, terms: [gainRef("depth", 0), gainRef("depth", 1), gainRef("depth", 2)] },
+  { key: "v_shift", title: "Vertical PID", hint: "Vertical toe: nulls the residual vertical disparity between the foveas.", range: [0, 1], step: 0.01, terms: [gainRef("v_shift", 0), gainRef("v_shift", 1), gainRef("v_shift", 2)] },
 ];
+
+/** kp / ki / kd, in order — one label + hover per term, across all three
+ *  groups (shared verbatim with mirror-link's identical block). */
+const GAIN_LABELS = ["Kp", "Ki", "Kd"] as const;
+const GAIN_TITLES = [
+  "Proportional gain: how much of the measured error this DOF corrects each step.",
+  "Integral gain: removes the steady-state offset the proportional term leaves behind.",
+  "Derivative gain: damps overshoot; leave at 0 unless the loop rings.",
+] as const;
 
 // --- vergence PID debug/manual-nudge sliders --------------------------------
 type Dof = "verge" | "panX" | "panY" | "v_shift";
@@ -691,7 +702,7 @@ function onCursor(c: (Point2d & Size & { buttons: number }) | null): void {
       </div>
       <!-- Columns 2-4: per-DOF gain PIDs (Pan / Depth / Vertical) -->
       <div class="options" v-for="g in gainGroups" :key="g.key">
-        <h4>
+        <h4 :title="g.hint">
           <span>{{ g.title }}</span>
           <button class="reset" title="Reset to defaults" @click="resetGain(g.key)"><Icon :icon="faArrowRotateLeft" /></button>
         </h4>
@@ -700,12 +711,13 @@ function onCursor(c: (Point2d & Size & { buttons: number }) | null): void {
           :key="i"
           :model-value="term.value"
           @update:model-value="term.value = $event"
+          :title="GAIN_TITLES[i]"
           :min="g.range[0]"
           :max="g.range[1]"
           :neutral="DEFAULT_TUNING[g.key][i]"
           :step="g.step"
         >
-          <span>{{ ["Kp", "Ki", "Kd"][i] }}</span>
+          <span>{{ GAIN_LABELS[i] }}</span>
           <span>{{ term.value.toFixed(2) }}</span>
         </RangeSlider>
       </div>

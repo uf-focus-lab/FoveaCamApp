@@ -13,7 +13,7 @@ import {
   pairEpochSkewed,
   MATCH_STALE_MS,
   MATCH_STALE_SEQ_GAP,
-} from "@modules/disparity-scope/match-join";
+} from "@lib/vergence/match-join";
 
 describe("matchPartnerStale", () => {
   it("fresh partner (small age, small gap) steers", () => {

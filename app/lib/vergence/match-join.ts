@@ -4,7 +4,8 @@
 // You may find the full license in project root directory.
 // -------------------------------------------------------
 //
-// PURE staleness bound for the disparity-scope L/R match JOIN (spec §match-join):
+// PURE staleness bound for the L/R match JOIN (spec disparity-scope §match-join,
+// shared by every app running the vergence loop):
 // per pairing attempt, decide whether the partner result is still fresh enough to
 // steer on (else the caller holds + surfaces "match stale"). Two bounds, either
 // trips: AGE (wall-clock ms — a wedged side stops producing seqs) and SEQ GAP
