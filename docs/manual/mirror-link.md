@@ -27,16 +27,17 @@ Three live columns sit across the top:
 - **Center Wide** (orange) — the wide view you steer on. It carries a crosshair
   at the scan center with its angle in degrees, the scan ring, and a small cyan
   and greenyellow circle showing where each fovea is currently aimed. Below it
-  sit the **Start Scan** button and the scan status readout.
+  sit the **Start Scan** button and the scan status readout, then the
+  **Ring View** selector and its two decoder strips (see *Looking inside the
+  decoder*).
 - **Right Fovea** (greenyellow) — the mirror image of the left column.
 
 A pull-up **drawer** along the bottom holds three columns: the mirror controls
-(**Verge Distance**, **Vertical Shift**) on the left; the **Auto Align** servo
-with its PID sliders and the **Ring View** strips in the middle; and the
-**Gain** slider, the scan sliders, the **Ring Reader** switch and a **Status**
-row repeating the scan readout on the right.
-Click the tab at the bottom edge to open it — `Ctrl-\`` toggles it from the
-keyboard — then drag the grip to resize it.
+(**Verge Distance**, **Vertical Shift**) on the left; the **Auto Align** servo with
+its PID sliders in the middle; and the **Gain** slider, the scan sliders, the
+**Ring Reader** switch and a **Status** row repeating the scan readout on the
+right. Click the tab at the bottom edge to open it — `Ctrl-\`` toggles it from
+the keyboard — then drag the grip to resize it.
 
 ### To aim
 
@@ -181,8 +182,9 @@ entirely, and stops the decoding work.
 
 ### Looking inside the decoder
 
-**Ring View** (top of the drawer's middle column) draws what the decoder actually sees,
-one strip per eye. It needs **Ring Reader** on, and it only draws while the scan runs.
+**Ring View** — the row of buttons under the **Center Wide** view — draws what the decoder
+actually sees, one strip per eye, right below it. It needs **Ring Reader** on (drawer,
+right column), and it only draws while the scan runs.
 
 - **Polar** — the ring unrolled: angle left-to-right, radius top-to-bottom. A healthy ring
   is a bright horizontal band with dark gaps; a band that wanders up and down means the

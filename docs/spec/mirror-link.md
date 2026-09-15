@@ -65,9 +65,13 @@ whole fix.
 ## Ring views {#ring-views}
 
 `state.ring_view` (`off` | `polar` | `binary` | `segments`, default `off`, persisted)
-selects a per-eye histogram of the reader's own intermediates, drawn at the bottom of the
-drawer's middle column. The ring worker builds a DEBUG STRIP only while it is not `off`
-(pushed with `enabled` via `sendParams`), so the views cost nothing when closed.
+selects a per-eye histogram of the reader's own intermediates, drawn in the CENTER column
+of the main view, directly under the scan row — the column is shorter than L/R by their
+PosViews, and the rings belong under the wide tile they were measured from. The strips
+take the tile's own width (4:1, so 7.5vw each at a 30vw tile), and the stage selector sits
+on its own layout-stable row above them. The ring worker builds a DEBUG STRIP only while
+it is not `off` (pushed with `enabled` via `sendParams`), so the views cost nothing when
+closed.
 
 The strip is ONE mono8 session frame per eye (`ring-L`, `ring-R`), width = the ANGULAR
 sample count `n` — the arc-domain rows are mapped back through the same arc→angle table the
@@ -198,6 +202,7 @@ ticks stay mounted and fade rather than remount — a marginal emitter flips ok�
 frame rate. Under it a fixed-height, START-aligned mono row reads the decoded text +
 `px/chip` (emphasized), or `off` / `idle` / `reading…` / the failure reason (with the
 last decode, muted); the full text, the hex and the reading direction ride its `title`.
+Below the center tile's scan row sit the §ring-views stage selector and the two strips.
 
 The center view binds the intrinsic `undistort:<serial>` pipe (raw convert fallback
 uncalibrated) and is the ONLY steering surface; no display worker, no
@@ -232,13 +237,13 @@ detail (and the blocked reason) in its `title` hover. The row is a PLAIN div, ne
 `<label>`/ConfigEntry: a label would forward a status-span click to the button and
 toggle the hardware override; the button's own explanation rides the ROW's `title`
 (a disabled button suppresses hover). The drawer carries THREE columns (a nested
-`HorizontalDivision`): the mirror controls (Verge Distance, Vertical Shift) left; the
-servo column in the middle — the Ring View
-selector and the two histogram strips (§ring-views) FIRST, so both eyes stay comparable
-at a typical drawer height, then the Align PID group (one range/step across Kp/Ki/Kd, a
-reset in its heading) and the Auto Align toggle with its error readout; and Gain, the
-scan sliders (frequency, amplitude), the Ring Reader toggle and a Status row right.
-Gain leads its column because it is session-wide, not scan-scoped.
+`HorizontalDivision`, ≈ 0.26 / 0.31 / 0.43 — the right column holds the most rows and the
+longest strings): the mirror controls (Verge Distance, Vertical Shift) left; the servo in
+the middle — the Align PID group (one range/step across Kp/Ki/Kd, a reset in its heading)
+and the Auto Align toggle with its error readout; and Gain, the scan sliders (frequency,
+amplitude), the Ring Reader toggle and a Status row right, Gain leading because it is
+session-wide, not scan-scoped. The §ring-views strips are NOT in the drawer — they live
+under the center tile.
 Every slider carries a one-sentence `title`. Gain alone declares NO `neutral` — a stray
 right-click must never slam a live camera to range-min, and its `title` says so — and it
 is disabled (readout `—`) until `ready` with a non-degenerate `gain_range`; its `v-model`

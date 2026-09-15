@@ -496,6 +496,42 @@ const statusR = computed(() => ringStatus("R"));
           {{ scanStatus.text }}
         </span>
       </div>
+      <!-- The decoder's own views (spec §ring-views) fill the center column's
+           tail — it is shorter than L/R by their PosViews — so both eyes' rings
+           sit under the wide tile they came from. -->
+      <div class="ring-views">
+        <!-- The title rides the ROW: a disabled option suppresses hover. -->
+        <div class="toggle-row" :title="RING_VIEW_TITLE">
+          <span>Ring View</span>
+          <SingleSelect
+            v-model="state.ring_view"
+            :options="RING_VIEW_OPTIONS"
+            :disabled="!state.ring_reader"
+            class="ring-stage"
+            aria-label="Ring histogram stage"
+          />
+        </div>
+        <template v-if="ringViewOn">
+          <RingHistogram
+            :title="ROLE.L"
+            :color="THEME.L"
+            :stage="ringStage"
+            :payload="stripL.payload.value"
+            :readout="telemetry.ring.L"
+            :scanning="scanning"
+            :reader="state.ring_reader"
+          />
+          <RingHistogram
+            :title="ROLE.R"
+            :color="THEME.R"
+            :stage="ringStage"
+            :payload="stripR.payload.value"
+            :readout="telemetry.ring.R"
+            :scanning="scanning"
+            :reader="state.ring_reader"
+          />
+        </template>
+      </div>
     </div>
     <div class="view">
       <StreamView
@@ -540,7 +576,7 @@ const statusR = computed(() => ringStatus("R"));
     <!-- THREE columns (spec §views): mirror controls · servo + ring views ·
          scan. A nested split rather than a new layout component. -->
     <HorizontalDivision
-      :division="0.3"
+      :division="0.26"
       class="fill"
       :min-width-left="0.2"
       :min-width-right="0.4"
@@ -579,44 +615,13 @@ const statusR = computed(() => ringStatus("R"));
       <template #right>
         <!-- Nested split: the PID/servo column, then the scan column. -->
         <HorizontalDivision
-          :division="0.5"
+          :division="0.42"
           class="fill"
           :min-width-left="0.3"
           :min-width-right="0.3"
         >
           <template #left>
             <div class="options fill">
-              <!-- The decoder's own view leads the column: at a typical drawer
-                   height both eyes stay comparable without scrolling. -->
-              <h4><span>Ring View</span></h4>
-              <SingleSelect
-                v-model="state.ring_view"
-                :options="RING_VIEW_OPTIONS"
-                :disabled="!state.ring_reader"
-                :title="RING_VIEW_TITLE"
-                class="ring-stage"
-                aria-label="Ring histogram stage"
-              />
-              <template v-if="ringViewOn">
-                <RingHistogram
-                  :title="ROLE.L"
-                  :color="THEME.L"
-                  :stage="ringStage"
-                  :payload="stripL.payload.value"
-                  :readout="telemetry.ring.L"
-                  :scanning="scanning"
-                  :reader="state.ring_reader"
-                />
-                <RingHistogram
-                  :title="ROLE.R"
-                  :color="THEME.R"
-                  :stage="ringStage"
-                  :payload="stripR.payload.value"
-                  :readout="telemetry.ring.R"
-                  :scanning="scanning"
-                  :reader="state.ring_reader"
-                />
-              </template>
               <h4>
                 <span>Align PID</span>
                 <button class="reset" title="Reset to defaults" @click="resetPid">
@@ -770,6 +775,35 @@ const statusR = computed(() => ringStatus("R"));
   height: 100%;
 }
 
+// The decoder's views under the wide tile: a segmented stage row, then the two
+// strips at the tile's own width (4:1 → 7.5vw each, so the column still ends
+// well short of L/R's PosViews).
+.ring-views {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4em;
+
+  .ring-stage {
+    flex: 1;
+    flex-direction: row;
+    gap: 0.25em;
+
+    :deep(.option) {
+      width: auto;
+      flex: 1;
+      align-items: center;
+      text-align: center;
+      padding: 0.1em 0.4em;
+    }
+    // The GROUP's 0.5 is the whole dim — SingleSelect also fades each disabled
+    // option, and 0.5 × 0.55 on --bg-app is unreadable.
+    :deep(.option:disabled) {
+      opacity: 1;
+    }
+  }
+}
+
 // The ring readout under each fovea view. ALWAYS occupies its row (fixed
 // height, no reflow when the text swaps between a decode and a reason).
 .ring-row {
@@ -914,27 +948,6 @@ const statusR = computed(() => ringStatus("R"));
       background: var(--tint-3);
       opacity: 1;
     }
-  }
-
-  // The stage selector is a segmented row of its own.
-  .ring-stage {
-    height: auto;
-    flex-direction: row;
-    gap: 0.25em;
-
-    :deep(.option) {
-      width: auto;
-      flex: 1;
-      align-items: center;
-      text-align: center;
-      padding: 0.1em 0.4em;
-    }
-  }
-  // The histogram strips own their height (fixed aspect) — opt them out of the
-  // slider row cap.
-  & > .histogram {
-    height: auto;
-    margin-top: 0.5em;
   }
 }
 
