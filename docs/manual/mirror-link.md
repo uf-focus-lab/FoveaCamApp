@@ -51,21 +51,40 @@ pixel into a mirror angle.
 Aiming works the same whether or not the scan is running: the ring simply moves
 to the new center.
 
-### To fine-align each fovea
+### To fine-align the foveas
 
-The drag is coarse — it puts the ring roughly where you want it, but each mirror
-has its own small pointing offset. Use the four trim sliders in the left half of
-the drawer:
+The drag is coarse. Two controls in the left half of the drawer finish the job — the
+same pair Manual Control uses, but stepped finer here: the emitter has to land in the
+middle of a fovea frame, not just somewhere in it.
 
-1. Watch one fovea view and find your source in it.
-2. Nudge **Left Trim H** / **Left Trim V** (or the **Right** pair) until the
-   source sits at the center of that fovea's frame.
-3. Repeat for the other eye.
+- **Verge Distance** — the depth the two eyes converge on. Too near or too far
+  and the source sits off-center in opposite directions in the two fovea views.
+- **Vertical Shift** — the vertical toe between the eyes (±0.5°): it raises the
+  left fovea and lowers the right by the same amount, for when the source sits
+  high in one view and low in the other.
 
-Each trim moves only its own eye, up to ±0.5°, and moves the ring's center
-without changing its size or shape — so you can trim while the scan runs. The
-two small circles on the Center Wide view show where each fovea is aimed and
-separate as the trims diverge.
+Both move the ring's center without changing its size or shape, so you can use
+them while the scan runs. The two small circles on the Center Wide view show
+where each fovea is aimed.
+
+### To align automatically
+
+**Auto Align** (left half of the drawer, under Vertical Shift) does it for you:
+
+1. **Stop the scan** — the button is disabled while it runs, because auto align
+   needs the emitter to read as a *point*, not a ring.
+2. Press **Auto Align**. It takes one frame from each fovea, finds the brightest
+   spot in each, and works out where both eyes are really looking.
+3. The scan center, **Verge Distance** and **Vertical Shift** are rewritten from
+   that solution, and the line beside the button shows the distance it settled
+   on. Hover it for where the spot was found in each eye.
+
+If it reports *no bright spot on L* (or R) the emitter is not in that fovea's
+view, or it is too dim — steer closer and raise **Gain** first.
+
+One caveat while the rig is new: if a press moves the source *away* from the
+fovea center instead of onto it, the pixel-to-angle sign is inverted for this
+mounting. Say so — it is a one-line change — and use the sliders meanwhile.
 
 ### To scan
 
@@ -180,9 +199,9 @@ raw ring is what an offline decoder needs.
 
 The JSON carries the app's state at that moment under `mirror_link`: the scan timing (or
 null if you were not scanning), what the **Ring Reader** last made of each eye — the circle
-it fitted, the chip width, the failure reason — the trims, the verge distance, the baseline,
-and where you were aiming. So a frame that failed to decode on the rig can be re-analyzed
-later with everything the reader saw attached to it.
+it fitted, the chip width, the failure reason — the vertical shift, the verge distance,
+the baseline, and where you were aiming. So a frame that failed to decode on the rig can
+be re-analyzed later with everything the reader saw attached to it.
 
 ## Recording
 

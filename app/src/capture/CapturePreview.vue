@@ -254,10 +254,10 @@ function save(path: string, img_format: string) {
     margin: 0;
   }
 }
-// Responsive tile grid: each tile has a DEFINITE height (grid track width ×
-// aspect-ratio), which FrameView's absolutely positioned canvas needs for its
-// `max-height: 100%` to resolve. `min(22rem, 100%)` keeps a narrow pane from
-// clipping a tile; `scrollbar-gutter` keeps the gutter from reflowing the grid.
+// Responsive tile grid. The TILE (preview-image/index.vue) owns its own box,
+// clipping and the explicit size it hands FrameView — this rule only lays the
+// tracks out. `min(22rem, 100%)` keeps a narrow pane from clipping a tile;
+// `scrollbar-gutter` keeps the gutter from reflowing the grid.
 .frame-container {
   padding: 2rem;
   display: grid;
@@ -268,18 +268,5 @@ function save(path: string, img_format: string) {
   overflow-x: hidden;
   overflow-y: auto;
   scrollbar-gutter: stable;
-
-  // FrameView reserves its hanging title row with an inline `margin-top`; the
-  // margin is part of the grid item, so the row gap stays clear of it.
-  & > * {
-    width: 100%;
-    aspect-ratio: 4 / 3;
-    min-width: 0;
-    min-height: 0;
-  }
-
-  & > * :deep(canvas.centered) {
-    object-fit: contain;
-  }
 }
 </style>

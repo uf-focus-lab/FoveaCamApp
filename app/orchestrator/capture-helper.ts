@@ -46,8 +46,11 @@ export interface CaptureLeases {
   right: RawGeometrySource;
 }
 
-/** A short capture-burst ring depth for the on-demand per-shot advertise. */
-const CAPTURE_RING_DEPTH = 8;
+/** A short capture-burst ring depth for the per-shot advertise. Exported so a
+ *  session can PRE-ACQUIRE the same raw pipes at activation: the per-shot
+ *  acquire then finds the entry and only bumps its refcount, keeping the ring
+ *  allocation (and its native attach) off the shot path. */
+export const CAPTURE_RING_DEPTH = 8;
 
 export interface CaptureHelperDeps {
   /** Graph node id — `capture/<session>` (compose via `nodeId.win`). */

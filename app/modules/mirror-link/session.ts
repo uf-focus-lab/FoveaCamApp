@@ -43,6 +43,7 @@ import {
 } from "@orchestrator/undistort-pipe";
 import { createRawRecording } from "@orchestrator/raw-recording";
 import {
+  CAPTURE_RING_DEPTH,
   createCaptureHelper,
   rawTripleShot,
   type CaptureHelper,
@@ -60,17 +61,27 @@ import type {
 import { nodeId } from "@lib/orchestrator/graph-contract";
 import type { RingReadout } from "@lib/ring-code";
 import type { PipeBroker } from "@orchestrator/pipe-session";
-import type { RawPipeRegistry } from "@orchestrator/raw-pipe";
+import { rawPipeSpec, type RawPipeRegistry } from "@orchestrator/raw-pipe";
 import type { CompressPipeSeam } from "@orchestrator/compress-pipe";
 import type { CameraLease } from "@orchestrator/registry";
 import { createTriggerOpChain } from "@lib/trigger-sync";
 import { slewStep, type SlewPair } from "@lib/slew";
-import { vergeToDistance } from "@lib/stereo";
+import {
+  deriveFoveaIntrinsics,
+  distanceToVerge,
+  vergeToDistance,
+} from "@lib/stereo";
+import { deg } from "@lib/util/math";
 import { RollingStats } from "@lib/util/rolling";
 import type { Point2d } from "core/Geometry";
 import type { Pos } from "@lib/controller-codec";
-import { mirrorLink, type ScanTelemetry } from "./contract";
-import { SCAN_HZ_RANGE, scanAngles, scanOffset, type ScanTrims } from "./scan";
+import { mirrorLink, type AlignResult, type ScanTelemetry } from "./contract";
+import {
+  brightestSpot,
+  solveAlignment,
+  spotOffsetAngle,
+} from "./align";
+import { SCAN_HZ_RANGE, SHIFT_RANGE_DEG, scanAngles, scanOffset } from "./scan";
 import {
   applyScanTiming,
   exposureMismatch,
@@ -131,13 +142,6 @@ export default function mirrorLinkSession(
 
     // --- targeting ---------------------------------------------------------
 
-    function trims(): ScanTrims {
-      return {
-        l: { x: radians(s.state.trim_lx), y: radians(s.state.trim_ly) },
-        r: { x: radians(s.state.trim_rx), y: radians(s.state.trim_ry) },
-      };
-    }
-
     /** Per-eye angles for a scan offset (zero offset = the idle/center pose). */
     function anglesAt(offset: Point2d): { l: Point2d; r: Point2d } {
       return scanAngles(
@@ -145,7 +149,7 @@ export default function mirrorLinkSession(
         offset,
         s.state.baseline,
         vergeToDistance(s.state.verge, s.state.baseline),
-        trims(),
+        radians(s.state.shift),
       );
     }
 
@@ -191,7 +195,7 @@ export default function mirrorLinkSession(
       const R: Pos[] = [];
       for (let k = 0; k < SCAN_PATH_SAMPLES; k++) {
         // The SAME chain the pacer commands: offset → inverseTriangulate +
-        // trims → A2V, so the drawn path is the commanded path.
+        // shift → A2V, so the drawn path is the commanded path.
         const pose = voltsFor(
           anglesAt(
             scanOffset((k / SCAN_PATH_SAMPLES) * periodMs, hz, s.state.scan_amp),
@@ -217,6 +221,7 @@ export default function mirrorLinkSession(
     }
 
     function setTargetFromPixel(px: Point2d): void {
+      clearAlign(); // a manual re-aim supersedes the solved one
       target = px;
       targetAngle = triple?.undistort
         ? triple.undistort.angular([px], false)[0]
@@ -242,6 +247,14 @@ export default function mirrorLinkSession(
       console.error("[mirror-link] scan op failed:", e),
     );
 
+    /** The last auto-align describes a pose the operator has since moved — drop
+     *  it rather than let a stale distance sit next to the button. */
+    function clearAlign(): void {
+      if (lastAlign === null) return;
+      lastAlign = null;
+      s.telemetry({ align: null });
+    }
+
     function publishScanBlocked(reason: string | null): void {
       s.telemetry({ scan_blocked: reason });
     }
@@ -249,6 +262,8 @@ export default function mirrorLinkSession(
     /** Local mirror of the published `scan` readout — the runtime doesn't hand
      *  back the last telemetry object, and the amplitude watch patches it. */
     let activeScan: ScanTelemetry | null = null;
+    /** Mirror of the published `align` readout (the runtime hands nothing back). */
+    let lastAlign: AlignResult | null = null;
 
     function publishScanTelemetry(
       hz: number,
@@ -550,6 +565,9 @@ export default function mirrorLinkSession(
     // undistorted center, with the scan/reader state alongside them.
 
     let captureHelper: CaptureHelper | null = null;
+    /** True only for the auto-align shot: ONE frame per eye, whatever
+     *  `cap_stack` says (spec §targeting). */
+    let alignShot = false;
     let centerPipe: {
       shmName: string;
       maxBytes: number;
@@ -564,11 +582,8 @@ export default function mirrorLinkSession(
       return {
         scan: activeScan,
         ring: { L: ring.L, R: ring.R },
-        trims: {
-          l: { x: s.state.trim_lx, y: s.state.trim_ly },
-          r: { x: s.state.trim_rx, y: s.state.trim_ry },
-          unit: "degree",
-        },
+        shift: s.state.shift,
+        "shift.unit": "degree",
         verge: s.state.verge,
         baseline: s.state.baseline,
         "baseline.unit": "millimeter",
@@ -595,7 +610,7 @@ export default function mirrorLinkSession(
       const shot = rawTripleShot({
         reset,
         indexed,
-        stackCount: Math.max(1, s.state.cap_stack),
+        stackCount: alignShot ? 1 : Math.max(1, s.state.cap_stack),
         note: "mirror-link: unwarped ring frames (a scanned frame has no single mirror pose)",
       });
       const link = mirrorLinkMeta();
@@ -618,6 +633,85 @@ export default function mirrorLinkSession(
           fovea: merge(shot.meta.fovea, {}),
           left: merge(shot.meta.left, {}),
           right: merge(shot.meta.right, {}),
+        },
+      };
+    }
+
+    /** Run ONE observe-only shot and solve both eyes onto the emitter
+     *  (spec §targeting). RIG-GATED: the pixel→angle sign lives in
+     *  `align.ts`'s `SPOT_TO_ANGLE_SIGN`. */
+    async function autoAlignNow(): Promise<AlignResult> {
+      const t = triple;
+      const und = t?.undistort;
+      if (!t || !und || !captureHelper)
+        return { ok: false, reason: "not ready" };
+      if (scanActive) return { ok: false, reason: "scan active" };
+      if (recording.active) return { ok: false, reason: "recording active" };
+      alignShot = true;
+      try {
+        await captureHelper.captureShot();
+      } finally {
+        alignShot = false;
+      }
+      const spots: { L: Point2d | null; R: Point2d | null } = {
+        L: null,
+        R: null,
+      };
+      const angles = {} as Record<Side, Point2d>;
+      try {
+        for (const side of SIDES) {
+          const frame = await captureHelper.getPreview(
+            side === "L" ? "left" : "right",
+          );
+          const shape = frame?.shape ?? [];
+          const spot = frame?.data
+            ? brightestSpot({
+                data: new Uint8Array(frame.data),
+                width: shape[1] ?? 0,
+                height: shape[0] ?? 0,
+                channels: frame.channels,
+              })
+            : null;
+          if (!spot)
+            return { ok: false, reason: `no bright spot on ${side}`, spots };
+          spots[side] = { x: spot.x, y: spot.y };
+          // The eye's CURRENT gaze + the spot's pinhole offset in ITS fovea
+          // view (same intrinsics the capture snapshot records).
+          const current = t.conv.V2A[side](volts[side]);
+          const { f, c } = deriveFoveaIntrinsics(und, current, 1);
+          const d = spotOffsetAngle({ x: spot.x, y: spot.y }, c, f);
+          angles[side] = { x: current.x + d.x, y: current.y + d.y };
+        }
+      } finally {
+        await captureHelper.discard();
+      }
+      const solved = solveAlignment(angles.L, angles.R, s.state.baseline);
+      // Apply: the gaze ray becomes the scan center, the crossing distance the
+      // verge, and the vertical difference the shift.
+      targetAngle = solved.angle;
+      target = und.position([solved.angle], false)[0];
+      const verge = Number.isFinite(solved.distanceMm)
+        ? distanceToVerge(solved.distanceMm, s.state.baseline)
+        : 0;
+      s.setState("verge", Math.min(1, Math.max(0, verge)));
+      s.setState(
+        "shift",
+        Math.min(
+          SHIFT_RANGE_DEG.max,
+          Math.max(SHIFT_RANGE_DEG.min, deg(solved.shiftRad)),
+        ),
+      );
+      s.telemetry({ target, target_angle: targetAngle });
+      publishScanGeometry();
+      return {
+        ok: true,
+        spots: { L: spots.L!, R: spots.R! },
+        applied: {
+          angle: solved.angle,
+          distance_mm: Number.isFinite(solved.distanceMm)
+            ? solved.distanceMm
+            : null,
+          shift_deg: s.state.shift,
         },
       };
     }
@@ -650,6 +744,10 @@ export default function mirrorLinkSession(
     let lastVoltEmit = 0;
     let lastActuateMs = 0;
     const actuateMsStats = new RollingStats(0.9, 2, "ms");
+    /** Pacer tick INTERVAL: the 1 ms loop is the mirror's clock, so any stall on
+     *  the orchestrator loop (an allocation, a synchronous native call) is a
+     *  straight chord across the scanned ring. Metered so the rig can see it. */
+    const tickGapMsStats = new RollingStats(0.9, 2, "ms");
 
     async function activateSession(scope: ResourceScope): Promise<void> {
       const monitor = s.progressMonitor([
@@ -739,9 +837,27 @@ export default function mirrorLinkSession(
       scope.defer(() => disposeRingNode());
       monitor.done("pipes");
 
-      // Capture node (spec §capture): idle until a shot is asked for; the raw
-      // L/R producers are advertised/connected per shot. The center undistort
-      // pipe stays connected so its producer is live for the one-shot read.
+      // Capture node (spec §capture). The raw L/R producers are PRE-ACQUIRED
+      // here, not per shot: `rawPipes.acquire` on a 0→1 transition advertises
+      // the pipe (allocating a CAPTURE_RING_DEPTH × full-depth-frame SHM ring)
+      // and runs the native attach, both SYNCHRONOUS on the orchestrator loop
+      // that also runs the 1 ms pacer — tens of ms of stall mid-scan, which the
+      // mirror draws as a straight chord across the ring. Pre-acquired, the
+      // shot path only bumps a refcount + opens the consumer gate. The
+      // producers stay PARKED until that gate opens, so this costs nothing
+      // while idle and touches no camera setting (attach subscribes to the
+      // existing Arv::Stream).
+      for (const side of SIDES) {
+        const camera = t.leases[side].camera;
+        const pipeId = `camera/${camera.serial}/raw`;
+        const held = rawPipes.acquire({
+          kind: "raw",
+          camera,
+          pipeId,
+          spec: rawPipeSpec(camera, pipeId, CAPTURE_RING_DEPTH),
+        });
+        scope.defer(() => held.release());
+      }
       {
         const capCenterId = undistortC ?? nodeId.convert(t.leases.C.camera.serial);
         const capCenter = broker.connect(capCenterId);
@@ -809,6 +925,7 @@ export default function mirrorLinkSession(
       stopActuation = startPacer(1, () => {
         const tick = now();
         const dt = lastPaceAt > 0 ? tick - lastPaceAt : 1;
+        if (lastPaceAt > 0) tickGapMsStats.push(dt);
         lastPaceAt = tick;
         if (scanActive) {
           // Phase from the WALL CLOCK — a late tick lands at the right phase.
@@ -833,7 +950,7 @@ export default function mirrorLinkSession(
         actuateMsStats.push(lastActuateMs);
         if (tick - lastVoltEmit >= VOLT_TELEMETRY_INTERVAL_MS) {
           lastVoltEmit = tick;
-          // Per-eye markers come from the CENTER pose (trims included), not the
+          // Per-eye markers come from the CENTER pose (shift included), not the
           // instantaneous scan pose — they show where each fovea is aimed. The
           // published `volt` is that same center pose while scanning: sampling
           // the circle at the telemetry throttle reads as random flicker, and
@@ -847,9 +964,14 @@ export default function mirrorLinkSession(
             R_PX: projectPx("R", c.r),
             perf: {
               actuateMs: { mean: actuateMsStats.mean, max: actuateMsStats.max },
+              tickGapMs: {
+                mean: tickGapMsStats.mean,
+                max: tickGapMsStats.max,
+              },
             },
           });
           actuateMsStats.resetMax();
+          tickGapMsStats.resetMax();
         }
       });
 
@@ -890,9 +1012,11 @@ export default function mirrorLinkSession(
         volts.L = { ...ORIGIN_POS };
         volts.R = { ...ORIGIN_POS };
         activeScan = null;
+        lastAlign = null;
         gainRange = { min: 0, max: 0 };
         ring.L = ring.R = null;
         s.resetTelemetry([
+          "align",
           "ring",
           "scan",
           "scan_blocked",
@@ -906,12 +1030,16 @@ export default function mirrorLinkSession(
       watch: {
         // Everything that moves or reshapes the commanded ring republishes the
         // drawn geometry (the pacer never does — spec §views).
-        verge: publishScanGeometry,
+        // A manual verge/shift write supersedes a solved alignment.
+        verge() {
+          clearAlign();
+          publishScanGeometry();
+        },
+        shift() {
+          clearAlign();
+          publishScanGeometry();
+        },
         baseline: publishScanGeometry,
-        trim_lx: publishScanGeometry,
-        trim_ly: publishScanGeometry,
-        trim_rx: publishScanGeometry,
-        trim_ry: publishScanGeometry,
         // Amplitude is live on the next tick; only the drawn ring needs a push.
         scan_amp() {
           publishScanGeometry();
@@ -941,6 +1069,23 @@ export default function mirrorLinkSession(
       commands: {
         async steer(px) {
           setTargetFromPixel(px);
+        },
+        async autoAlign() {
+          // On the SAME FIFO chain as the scan ops: a start/stop must never
+          // interleave with the align shot (spec §targeting).
+          let result: AlignResult = { ok: false, reason: "not ready" };
+          await queueScanOp(async () => {
+            try {
+              result = await autoAlignNow();
+            } catch (e) {
+              result = { ok: false, reason: errorLine(e) };
+            }
+          });
+          if (!result.ok)
+            report("mirror-link", `auto align: ${result.reason}`, "warning");
+          lastAlign = result;
+          s.telemetry({ align: result });
+          return result;
         },
         async startScan() {
           if (scanActive) return true;

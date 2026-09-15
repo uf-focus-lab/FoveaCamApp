@@ -18,8 +18,8 @@ export const SCAN_HZ_RANGE = { min: 1, max: 100 } as const;
 /** Scan amplitude (ring RADIUS) slider range, in degrees. */
 export const SCAN_AMP_RANGE = { min: 0, max: 2 } as const;
 
-/** Per-eye fine-trim slider range, in degrees (symmetric about 0). */
-export const TRIM_RANGE_DEG = { min: -0.5, max: 0.5 } as const;
+/** Vertical-shift slider range, in degrees (symmetric about 0). */
+export const SHIFT_RANGE_DEG = { min: -0.5, max: 0.5 } as const;
 
 const DEG = Math.PI / 180;
 
@@ -36,37 +36,28 @@ export function scanOffset(tMs: number, hz: number, ampDeg: number): Point2d {
   return { x: amp * Math.cos(phi), y: amp * Math.sin(phi) };
 }
 
-/** Per-eye fine trims, in RADIANS (the session converts the degree state). */
-export interface ScanTrims {
-  l: Point2d;
-  r: Point2d;
-}
-
 /**
  * Compose the per-eye pointing angles for one scan sample: the offset rides the
  * wide angular frame BEFORE `inverseTriangulate`, so both eyes trace the same
- * circle around the same scene point; the trims are added per eye AFTER, so
- * they move the ring's center and never its shape. A zero offset + zero trims
- * reduce to `inverseTriangulate(A0, baseline, distanceMm)` — the same function
+ * circle around the same scene point. The vertical SHIFT is the same toe
+ * adjustment manual-control applies (`+s` raises L and lowers R) and rides
+ * `inverseTriangulate` itself, so a zero offset reduces to
+ * `inverseTriangulate(A0, baseline, distanceMm, shiftRad)` — the same function
  * serves the idle pose.
  *
  * @param A0 Scan center in wide angular coordinates (rad).
  * @param offset Scan offset from {@link scanOffset} (rad).
  * @param baseline Inter-fovea baseline (mm).
  * @param distanceMm Verge distance (mm); `Infinity` ⇒ parallel gaze.
- * @param trims Per-eye fine alignment (rad).
+ * @param shiftRad Vertical half-shift between the foveas (rad).
  */
 export function scanAngles(
   A0: Point2d,
   offset: Point2d,
   baseline: number,
   distanceMm: number,
-  trims: ScanTrims,
+  shiftRad = 0,
 ): { l: Point2d; r: Point2d } {
   const center: Point2d = { x: A0.x + offset.x, y: A0.y + offset.y };
-  const a = inverseTriangulate(center, baseline, distanceMm);
-  return {
-    l: { x: a.l.x + trims.l.x, y: a.l.y + trims.l.y },
-    r: { x: a.r.x + trims.r.x, y: a.r.y + trims.r.y },
-  };
+  return inverseTriangulate(center, baseline, distanceMm, shiftRad);
 }

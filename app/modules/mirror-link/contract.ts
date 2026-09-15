@@ -36,6 +36,30 @@ export type ScanTelemetry = {
   mismatch: boolean;
 };
 
+/** What one auto-align attempt did (spec §targeting) — the last result is
+ *  telemetry so the UI tooltip can show the spots and the applied delta; a
+ *  wrong pixel→angle sign is then visible on the rig (the spot moves AWAY).
+ *  A type alias, NOT an interface (telemetry values must be `Serializable`). */
+export type AlignResult =
+  | {
+      ok: true;
+      reason?: undefined;
+      /** Where the emitter was found in each fovea frame (fovea px). */
+      spots: { L: Point2d; R: Point2d };
+      applied: {
+        angle: Point2d;
+        /** Solved verge distance (mm); null = parallel gaze. */
+        distance_mm: number | null;
+        shift_deg: number;
+      };
+    }
+  | {
+      ok: false;
+      reason: string;
+      spots?: { L: Point2d | null; R: Point2d | null };
+      applied?: undefined;
+    };
+
 export const mirrorLink = defineContract({
   state: {
     /** Leased camera serials per role — the L/R views bind the RAW
@@ -48,10 +72,7 @@ export const mirrorLink = defineContract({
     // Alignment parameters (spec §targeting).
     baseline: 200, // stereo baseline (mm)
     verge: 0, // verge slider (0 → ∞ distance)
-    trim_lx: 0, // per-eye fine alignment (deg, ±0.5)
-    trim_ly: 0,
-    trim_rx: 0,
-    trim_ry: 0,
+    shift: 0, // vertical toe shift (deg, ±0.5) — +s raises L, lowers R
     /** Session-wide fovea gain override (dB, BOTH eyes; spec §gain). Null =
      *  never set — the session seeds it from the leased cameras instead of
      *  writing one. */
@@ -80,7 +101,7 @@ export const mirrorLink = defineContract({
      *  Empty uncalibrated; republished on every geometry change, never per
      *  tick (spec §views). */
     scan_path: { L: [], R: [] } as { L: Pos[]; R: Pos[] },
-    // Per-eye wide-px projection of the offset-free CENTER pose (trims
+    // Per-eye wide-px projection of the offset-free CENTER pose (shift
     // included) — where each fovea is aimed; {0,0} uncalibrated (spec §views).
     L_PX: { x: 0, y: 0 } as Point2d,
     R_PX: { x: 0, y: 0 } as Point2d,
@@ -104,8 +125,16 @@ export const mirrorLink = defineContract({
     /** Human-readable reason the last `startScan` was refused (or why the
      *  override could not be applied); null while active or never refused. */
     scan_blocked: null as string | null,
-    // Control-path latency — `c.actuate()` round-trip, throttled like `volt`.
-    perf: { actuateMs: { mean: 0, max: 0 } as Stat },
+    /** Last auto-align attempt (spec §targeting); null until one runs. */
+    align: null as AlignResult | null,
+    // Control-path latency — `c.actuate()` round-trip — and the pacer's own
+    // tick interval: a stall on the orchestrator loop (an allocation, a
+    // synchronous native call) shows up as a `tickGapMs.max` spike, which on
+    // the rig is a straight chord across the scanned ring.
+    perf: {
+      actuateMs: { mean: 0, max: 0 } as Stat,
+      tickGapMs: { mean: 0, max: 0 } as Stat,
+    },
     // Capture manifest telemetry (spec §capture); image data pulled via
     // `getCapturePreview`.
     ...captureTelemetry(),
@@ -121,6 +150,9 @@ export const mirrorLink = defineContract({
   commands: {
     /** Move the scan CENTER to a wide-view pixel (spec §targeting). */
     steer: cmd<Point2d>(),
+    /** Re-aim both foveas at the emitter from ONE frame per eye, rewriting the
+     *  verge distance and the vertical shift (spec §targeting). */
+    autoAlign: cmd<void, AlignResult>(),
     /** Start the circular scan + the per-fovea exposure override. Resolves
      *  `false` when refused, with the reason on `telemetry.scan_blocked`. */
     startScan: cmd<void, boolean>(),

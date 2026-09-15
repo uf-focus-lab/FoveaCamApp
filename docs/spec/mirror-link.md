@@ -15,14 +15,40 @@ server-side via `undistort.angular` into the wide angular frame (`A0`, radians).
 Uncalibrated → `A0 = {0,0}` and origin volts. There is no tracker, no set-points, no
 programmatic angle mode.
 
-`centerAngles()` solves the per-eye angles from the ONE center: `inverseTriangulate(A0,
-baseline, distance)` where `distance = vergeToDistance(verge, baseline)` (∞ at `verge = 0`,
-the same Verge Distance control as manual-control), then adds the per-eye FINE TRIMS —
-`trim_lx/trim_ly/trim_rx/trim_ry` (degrees, ±0.5°, persisted state) — as radians on that
-eye only. Trims are the fine-alignment control: after the coarse drag, the operator nudges
-each fovea until the source sits at its frame center. `A2V` per eye turns angles into
-volts. Trims apply identically whether or not the scan is active (they move the ring's
-center, never its shape).
+`centerAngles()` solves the per-eye angles from the ONE center:
+`inverseTriangulate(A0, baseline, distance, radians(shift))` where
+`distance = vergeToDistance(verge, baseline)` (∞ at `verge = 0`) — manual-control's own
+pair of mirror controls, with the same meaning: Verge Distance sets the depth both eyes
+converge on, Vertical Shift (degrees, ±0.5°, persisted) is the toe that raises L and lowers
+R by `s`. `A2V` per eye turns angles into volts. Both apply identically whether or not the
+scan is active — they move the ring's center, never its shape.
+
+### Auto align {#auto-align}
+
+Source: `align.ts` (pure, unit-tested). `autoAlign` re-aims both foveas at the emitter
+from ONE frame per eye: it runs a single observe-only capture shot (stack 1 regardless of
+`cap_stack`), pulls the two UNWARPED fovea previews, takes each frame's
+`brightestSpot` (centroid of pixels ≥ 90 % of the peak; refused below an 8-bit peak of 32
+or under 3 lit pixels), converts the spot to an angular offset against that eye's fovea
+intrinsics at its CURRENT gaze (`deriveFoveaIntrinsics(und, a_eye, 1)`, pinhole
+`atan((s − c)/f)`), and adds it to the eye's current angle. `solveAlignment` then inverts
+the fixation model in closed form — `z = 2b / (tan aL.x − tan aR.x)`,
+`x = z·tan aL.x − b`,
+`angle.y = mean`, `shift = (aL.y − aR.y)/2`, diverging/parallel ⇒ ∞ — and the result is
+APPLIED: the gaze ray becomes the scan center (`target`/`target_angle`), the crossing
+distance becomes `verge` (via `distanceToVerge`, clamped 0–1; ∞ ⇒ 0) and the vertical
+difference becomes `shift` (clamped to the slider range).
+
+Refused with a reason on `telemetry.align` (and the title-bar tray) when there is no
+leased/calibrated triple or capture helper (`not ready`), while the scan is ACTIVE
+(`scan active` — the emitter must read as a point, not a ring), or when either eye shows
+no spot (`no bright spot on L|R`). The last result stays on `telemetry.align` (reset on
+idle) so the UI tooltip can show both spots and the applied delta.
+
+RIG-GATED: the pixel→angle SIGN is `SPOT_TO_ANGLE_SIGN` in `align.ts`, defaulting to
+`{+1, +1}` — the same pinhole convention split-tracking's `eyeJInv` uses. A mounting flip
+shows up on the rig as the spot moving AWAY from the fovea center after an align; flipping
+the axis there is the whole fix.
 
 ## Circular scan {#scan}
 
@@ -32,8 +58,9 @@ At time `t` (ms since scan start) the scan OFFSET is
 `o(t) = amp · (cos φ, sin φ)`, `φ = 2π · hz · t / 1000`, `amp = radians(scan_amp)`. The
 offset is added to `A0` in the WIDE angular frame BEFORE `inverseTriangulate`, so both
 eyes trace the same circle around the same scene point (the L/R convergence solution
-follows the moving center; trims are added after). `scanOffset(tMs, hz, ampDeg)` is the
-one geometry function; `scanAngles(A0, offset, baseline, distance, trims)` composes the
+follows the moving center; the vertical shift rides `inverseTriangulate` itself).
+`scanOffset(tMs, hz, ampDeg)` is the one geometry function;
+`scanAngles(A0, offset, baseline, distance, shiftRad)` composes the
 per-eye angles (the same function serves the idle pose with a zero offset).
 
 Phase is derived from the pacer's WALL CLOCK (`performance.now() − t0`), never from a
@@ -133,16 +160,18 @@ not.
 The L/R main views bind the RAW convert pipes (`nodeId.convert(serial)`) directly, at pipe
 rate — deliberately NOT the homography-undistort bricks: a frame that integrates a full
 revolution has no single mirror pose to warp against, and the un-warped ring is the
-readout. While `ring_reader` is on AND the scan is running (and ONLY then — an off feature leaves no
-phantom row, and an annotation asserts a decode of the CURRENT frame) each carries the
-§reader annotations in FRAME px: the fitted circle (solid on a decode, dim + dashed when
-only the fit succeeded), the LEADER arc in `--warn` (distinct from both eye colors), and
-radial ticks at every field (long) and byte (short) boundary. The arc + ticks stay mounted
-and fade rather than remount — a marginal emitter flips ok↔fail at frame rate. Under it a
-fixed-height, START-aligned mono row reads the decoded text + `px/chip` (emphasized), or
-`off` / `idle` / `reading…` / the failure reason (with the last decode, muted); the full
-text, the hex and the reading direction ride its `title`. The center view binds the intrinsic `undistort:<serial>` pipe (raw convert
-fallback uncalibrated) and is the ONLY steering surface; no display worker, no
+readout. While `ring_reader` is on AND the scan is running (and ONLY then — an off
+feature leaves no phantom row, and an annotation asserts a decode of the CURRENT frame)
+each carries the §reader annotations in FRAME px: the fitted circle (solid on a decode,
+dim + dashed when only the fit succeeded), the LEADER arc in `--warn` (distinct from both
+eye colors), and radial ticks at every field (long) and byte (short) boundary. The arc +
+ticks stay mounted and fade rather than remount — a marginal emitter flips ok↔fail at
+frame rate. Under it a fixed-height, START-aligned mono row reads the decoded text +
+`px/chip` (emphasized), or `off` / `idle` / `reading…` / the failure reason (with the
+last decode, muted); the full text, the hex and the reading direction ride its `title`.
+
+The center view binds the intrinsic `undistort:<serial>` pipe (raw convert fallback
+uncalibrated) and is the ONLY steering surface; no display worker, no
 stereo/composite/heatmap bricks. Overlays on the center view, all in wide px:
 
 - the target dot at `telemetry.target` (center theme color),
@@ -150,17 +179,17 @@ stereo/composite/heatmap bricks. Overlays on the center view, all in wide px:
   0 uncalibrated) — dashed and faint while idle (a preview of the path), solid while
   active,
 - per-eye markers at `L_PX`/`R_PX`, projected from the CENTER pose (`A2P.C ∘ V2A` of the
-  offset-free volts, trims included), not the instantaneous scan pose — they show where
-  each fovea is aimed, and separate as trims diverge. Hidden uncalibrated ({0,0}).
+  offset-free volts, shift included), not the instantaneous scan pose — they show where
+  each fovea is aimed, and separate with the verge/shift. Hidden uncalibrated ({0,0}).
 
 The PosViews draw the scan as a STATIC path with a stable crosshair: `telemetry.volt` is
 the commanded pose while idle and the ring's CENTER while scanning (sampling the circle at
 the 30 Hz telemetry throttle reads as random flicker, not motion), and
 `telemetry.scan_path = { L, R }` carries the commanded circle in VOLT space —
 `SCAN_PATH_SAMPLES` (48) points per eye through the pacer's own chain (offset →
-`inverseTriangulate` + trims → `A2V`), which the renderer closes into a loop and draws with
+`inverseTriangulate` + shift → `A2V`), which the renderer closes into a loop and draws with
 `Line2D` (faint idle, solid while active). It is republished on every input that moves or
-reshapes the ring (steer, `scan_amp`, `verge`, `baseline`, the four trims, activation) and
+reshapes the ring (steer, `scan_amp`, `verge`, `baseline`, `shift`, auto align, activation) and
 NEVER per tick; empty without a leased triple. PosViews are read-only here (no split).
 
 Below the center tile: ONE button whose label swaps Start Scan / Stop Scan (the row is a
@@ -173,10 +202,10 @@ a compact status span — the applied `hz · period · per-eye exposure` while a
 detail (and the blocked reason) in its `title` hover. The row is a PLAIN div, never a
 `<label>`/ConfigEntry: a label would forward a status-span click to the button and
 toggle the hardware override; the button's own explanation rides the ROW's `title`
-(a disabled button suppresses hover). The drawer carries the alignment sliders (Verge
-Distance + the four trims) left and Gain, the scan sliders (frequency, amplitude), the
-Ring Reader toggle, and a Status row right — Gain leads the column because it is
-session-wide, not scan-scoped.
+(a disabled button suppresses hover). The drawer carries the mirror controls (Verge
+Distance, Vertical Shift, the Auto Align button) left and Gain, the scan sliders
+(frequency, amplitude), the Ring Reader toggle, and a Status row right — Gain leads the
+column because it is session-wide, not scan-scoped.
 Every slider carries a one-sentence `title`. Gain alone declares NO `neutral` — a stray
 right-click must never slam a live camera to range-min, and its `title` says so — and it
 is disabled (readout `—`) until `ready` with a non-degenerate `gain_range`; its `v-model`
@@ -212,9 +241,21 @@ The homographies are IDENTITY and the rect is the whole center frame: a frame th
 integrated a revolution has no single mirror pose to warp against, and the UNWARPED ring is
 exactly what the analyzer reads. Every resource's metadata carries a `mirror_link` block —
 `scan` (the applied timing, null when idle), `ring` (the last per-eye readout: fitted
-circle, chip arc, reason), the trims, `verge`, `baseline`, `target_angle`, and the
+circle, chip arc, reason), `shift`, `verge`, `baseline`, `target_angle`, and the
 center-pose volts/angles/`A2H` matrices for reference — so a saved frame explains itself.
 `scripts/ring-debug.py <image>` reads both.
+
+OBSERVE-ONLY — no camera write, no allocation on the shot path. Nothing in a shot calls
+`lease.reconfigure` or any camera setter (the native `attachRawPipe` subscribes to the
+camera's EXISTING `Arv::Stream`), so the exposure override is untouched. The raw L/R pipes
+are PRE-ACQUIRED at activation with `CAPTURE_RING_DEPTH`: `rawPipes.acquire` on a 0→1
+transition advertises the pipe — allocating a depth × full-depth-frame SHM ring — and runs
+the native attach, both synchronous on the orchestrator loop that also runs the 1 ms pacer.
+Per shot that cost would stall the pacer for tens of ms and the mirror would draw a
+straight CHORD across the ring; pre-acquired, a shot only bumps the refcount and opens the
+consumer gate. The producers stay parked until then, so this costs nothing while idle.
+`telemetry.perf.tickGapMs` meters the pacer's own tick interval, so any remaining stall is
+visible on the rig instead of inferred from the ring.
 
 Exclusivity, as everywhere: a capture in flight refuses `startRecording`, a recording
 refuses a shot, and `busy()` names either. The drain awaits an in-flight capture before the
@@ -224,10 +265,11 @@ recording drain and the lease release.
 
 Resource-scope defers, registered in REVERSE of the drain (LIFO): stop the pacer FIRST →
 `stopScan` (exposure restore on the live leases) + the gain restore → `triple = null` /
-`ready: false` → await the recording drain → dispose the ring node if one exists (worker →
-wiring → its L/R pipes) → retire the C undistort producer + drop the serial taps → release
-the leases LAST. The ring node's pipes are the session's ONLY pipe connections (the
-renderer binds every view, the recorder node connects its own raw pipes).
+`ready: false` → await the recording drain → dispose the ring node if one exists
+(worker → wiring → its L/R pipes) → retire the C undistort producer + drop the serial
+taps → release the leases LAST. The ring node's pipes are the session's ONLY pipe
+connections (the renderer binds every view, the recorder node connects its own raw
+pipes).
 
 ## Rig pass {#rig}
 

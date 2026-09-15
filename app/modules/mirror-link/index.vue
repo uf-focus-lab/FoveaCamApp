@@ -5,7 +5,7 @@ You may find the full license in project root directory.
 --------------------------------------------------- -->
 <!--
   MirrorLink — a thin client over the `mirror-link` session: drag the wide view
-  to place the scan center, fine-align each fovea with the trim sliders, and run
+  to place the scan center, fine-align with verge/shift (or Auto Align), and run
   a circular scan whose per-frame exposure spans one revolution. Renders frames,
   overlays telemetry, drives state; no core / camera / calibration access.
   Behavior spec: docs/spec/mirror-link.md.
@@ -34,7 +34,7 @@ import { vergeToDistance } from "@lib/stereo";
 import RingOverlay from "./RingOverlay.vue";
 import { ringGeometry, strokeFor } from "./overlay";
 import { mirrorLink } from "./contract";
-import { SCAN_AMP_RANGE, SCAN_HZ_RANGE, TRIM_RANGE_DEG } from "./scan";
+import { SCAN_AMP_RANGE, SCAN_HZ_RANGE, SHIFT_RANGE_DEG } from "./scan";
 
 const session = useSession(mirrorLink, "mirror-link");
 const { state, telemetry } = session;
@@ -171,6 +171,55 @@ const scanHint = computed(() => {
     ? "Stop the scan and restore both fovea cameras' exposure settings."
     : "Start the circular scan and override both fovea cameras so one frame spans one revolution.";
 });
+// --- auto align (spec §targeting) -------------------------------------------
+// One shot per eye re-aims both foveas at the emitter and rewrites Verge
+// Distance + Vertical Shift from the solved geometry.
+const aligning = ref(false);
+async function runAutoAlign(): Promise<void> {
+  if (aligning.value) return;
+  aligning.value = true;
+  try {
+    await session.call("autoAlign", undefined);
+  } finally {
+    aligning.value = false;
+  }
+}
+const alignHint = computed(() => {
+  if (!telemetry.ready) return "Waiting for the camera triple to be leased.";
+  if (scanning.value)
+    return "Stop the scan first — auto align needs the emitter as a point, not a ring.";
+  return (
+    "Take one frame per fovea, find the emitter in each, and re-aim both mirrors " +
+    "at it — rewriting Verge Distance and Vertical Shift."
+  );
+});
+/** Metres, exactly as the Verge Distance readout writes them. */
+const metres = (mm: number | null): string =>
+  mm !== null && Number.isFinite(mm) ? `${(mm / 1000).toFixed(4)}m` : "∞";
+
+const alignStatus = computed<{ text: string; tone: string; title: string }>(() => {
+  const a = telemetry.align;
+  if (!a) return { text: "", tone: "", title: alignHint.value };
+  if (!a.ok)
+    return {
+      text: a.reason ?? "failed",
+      tone: "warn",
+      title: `Auto align failed: ${a.reason ?? "unknown"}`,
+    };
+  const d = a.applied;
+  const dist = metres(d?.distance_mm ?? null);
+  return {
+    text: `aligned · ${dist}`,
+    tone: "ok",
+    title:
+      `Spots L ${fmtSpot(a.spots?.L)} · R ${fmtSpot(a.spots?.R)} — ` +
+      `applied ${dist}, shift ${plusSign((d?.shift_deg ?? 0).toFixed(2))}°. ` +
+      "If the spot moved AWAY from center, the pixel→angle sign is inverted for this rig.",
+  };
+});
+const fmtSpot = (p?: { x: number; y: number } | null) =>
+  p ? `(${p.x.toFixed(0)}, ${p.y.toFixed(0)})` : "—";
+
 // --- ring reader (spec §reader) ---------------------------------------------
 // An OPTIONAL node, default off — the session builds/disposes it on this state.
 // SingleSelect over a string proxy is the house idiom for a boolean drawer
@@ -332,7 +381,7 @@ const statusR = computed(() => ringStatus("R"));
           :stroke-dasharray="scanning ? undefined : stroke * 4"
           :opacity="scanning ? 1 : 0.4"
         />
-        <!-- Where each fovea is AIMED (the offset-free center pose, trims
+        <!-- Where each fovea is AIMED (the offset-free center pose, shift
              included) — hidden uncalibrated. -->
         <template v-if="state.undistortPipe">
           <circle
@@ -370,7 +419,7 @@ const statusR = computed(() => ringStatus("R"));
         <button
           class="scan-button"
           :class="{ on: scanning, busy }"
-          :disabled="!telemetry.ready || busy"
+          :disabled="!telemetry.ready || busy || aligning"
           @click="toggleScan"
         >
           {{ scanning ? "Stop Scan" : "Start Scan" }}
@@ -449,49 +498,35 @@ const statusR = computed(() => ringStatus("R"));
             </span>
           </RangeSlider>
           <RangeSlider
-            v-model="state.trim_lx"
-            title="Fine LEFT-eye horizontal offset — nudges that fovea's ring center without changing the ring. Right-click resets to neutral."
-            :min="TRIM_RANGE_DEG.min"
-            :max="TRIM_RANGE_DEG.max"
+            v-model="state.shift"
+            title="Vertical toe between the foveas: raises the LEFT eye and lowers the RIGHT by this much. Right-click resets to neutral."
+            :min="SHIFT_RANGE_DEG.min"
+            :max="SHIFT_RANGE_DEG.max"
             :neutral="0"
-            :step="0.005"
+            :step="0.01"
           >
-            <span>Left Trim H</span>
-            <span>{{ plusSign(state.trim_lx.toFixed(3)) }}&deg;</span>
+            <span>Vertical Shift</span>
+            <span>{{ plusSign(state.shift.toFixed(2)) }}&deg;</span>
           </RangeSlider>
-          <RangeSlider
-            v-model="state.trim_ly"
-            title="Fine LEFT-eye vertical offset — nudges that fovea's ring center without changing the ring. Right-click resets to neutral."
-            :min="TRIM_RANGE_DEG.min"
-            :max="TRIM_RANGE_DEG.max"
-            :neutral="0"
-            :step="0.005"
-          >
-            <span>Left Trim V</span>
-            <span>{{ plusSign(state.trim_ly.toFixed(3)) }}&deg;</span>
-          </RangeSlider>
-          <RangeSlider
-            v-model="state.trim_rx"
-            title="Fine RIGHT-eye horizontal offset — nudges that fovea's ring center without changing the ring. Right-click resets to neutral."
-            :min="TRIM_RANGE_DEG.min"
-            :max="TRIM_RANGE_DEG.max"
-            :neutral="0"
-            :step="0.005"
-          >
-            <span>Right Trim H</span>
-            <span>{{ plusSign(state.trim_rx.toFixed(3)) }}&deg;</span>
-          </RangeSlider>
-          <RangeSlider
-            v-model="state.trim_ry"
-            title="Fine RIGHT-eye vertical offset — nudges that fovea's ring center without changing the ring. Right-click resets to neutral."
-            :min="TRIM_RANGE_DEG.min"
-            :max="TRIM_RANGE_DEG.max"
-            :neutral="0"
-            :step="0.005"
-          >
-            <span>Right Trim V</span>
-            <span>{{ plusSign(state.trim_ry.toFixed(3)) }}&deg;</span>
-          </RangeSlider>
+          <!-- Auto Align: one frame per eye re-aims both foveas at the emitter
+               (spec §targeting). Ordinary control — no solid fill; the scan
+               must be stopped, so the emitter reads as a point, not a ring. -->
+          <div class="align-row" :title="alignHint">
+            <button
+              class="align-button"
+              :disabled="!telemetry.ready || scanning || busy || aligning"
+              @click="runAutoAlign"
+            >
+              {{ aligning ? "Aligning…" : "Auto Align" }}
+            </button>
+            <span
+              class="align-status"
+              :class="alignStatus.tone"
+              :title="alignStatus.title"
+            >
+              {{ alignStatus.text }}
+            </span>
+          </div>
         </div>
       </template>
       <template #right>
@@ -700,6 +735,61 @@ const statusR = computed(() => ringStatus("R"));
   overflow-y: scroll;
   & > * {
     height: 2em;
+  }
+}
+
+// Auto Align: an ORDINARY control (Principles §5) — no solid fill, that is
+// reserved for the primary/destructive scan action. Fixed track so the
+// "Aligning…" label swap never moves anything.
+.align-row {
+  display: grid;
+  grid-template-columns: 9em minmax(0, 1fr);
+  align-items: center;
+  gap: 1ch;
+  font-size: 0.9em;
+
+  .align-button {
+    width: 100%;
+    min-height: 2em;
+    padding: 0.25em 1em;
+    border: none;
+    border-radius: 4px;
+    background: var(--tint-2);
+    color: var(--text);
+    font: inherit;
+    white-space: nowrap;
+    cursor: pointer;
+
+    &:hover:not(:disabled) {
+      background: var(--tint-3);
+    }
+    &:active:not(:disabled) {
+      background: var(--tint-4);
+    }
+    &:focus-visible {
+      outline: 2px solid var(--accent-bright);
+      outline-offset: 2px;
+    }
+    &:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+  }
+
+  .align-status {
+    font-family: var(--font-mono);
+    min-width: 0;
+    text-align: end;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-muted);
+    &.ok {
+      color: var(--text-bright);
+    }
+    &.warn {
+      color: var(--warn);
+    }
   }
 }
 
