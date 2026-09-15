@@ -384,6 +384,8 @@ const mirrorLink = hub.add(
     undistortSeam,
     rawPipes,
     orbitSeam,
+    sliceSeam,
+    scaleSeam,
     compressSeam,
   ),
 );

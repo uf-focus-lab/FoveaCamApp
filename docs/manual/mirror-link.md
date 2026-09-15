@@ -33,7 +33,7 @@ Three live columns sit across the top:
 - **Right Fovea** (greenyellow) — the mirror image of the left column.
 
 A pull-up **drawer** along the bottom holds three columns: the mirror controls
-(**Verge Distance**, **Vertical Shift**) on the left; the **Auto Align** servo with
+(**Verge Distance**, **Vertical Shift**) on the left; the **Auto Vergence** loop with
 its PID sliders in the middle; and the **Gain** slider, the scan sliders, the
 **Ring Reader** switch and a **Status** row repeating the scan readout on the
 right. Click the tab at the bottom edge to open it — `Ctrl-\`` toggles it from
@@ -54,7 +54,7 @@ pixel into a mirror angle.
 Aiming works the same whether or not the scan is running: the ring simply moves
 to the new center.
 
-### To fine-align the foveas
+### To converge the foveas by hand
 
 The drag is coarse. Two controls in the drawer's left column finish the job — the
 same pair Manual Control uses, but stepped finer here: the emitter has to land in the
@@ -62,7 +62,7 @@ middle of a fovea frame, not just somewhere in it.
 
 - **Verge Distance** — the depth the two eyes converge on. Too near or too far
   and the source sits off-center in opposite directions in the two fovea views.
-- **Vertical Shift** — the vertical toe between the eyes (±0.5°): it raises the
+- **Vertical Shift** — the vertical toe between the eyes (±2°): it raises the
   left fovea and lowers the right by the same amount, for when the source sits
   high in one view and low in the other.
 
@@ -70,33 +70,46 @@ Both move the ring's center without changing its size or shape, so you can use
 them while the scan runs. The two small circles on the Center Wide view show
 where each fovea is aimed.
 
-### To align automatically
+### To converge automatically
 
-**Auto Align** (the drawer's middle column) is a *servo*, not a one-shot: switch it on and
-the mirrors keep hunting the emitter for as long as it is on.
+**Auto Vergence** (the drawer's middle column) is the same loop Disparity Scope uses:
+it finds each fovea's view inside the wide view and drives the mirrors until the two
+agree on whatever you steered at. It is a *loop*, not a one-shot — leave it on and it
+keeps up as the rig drifts.
 
-1. Press **Auto Align**. It turns green and the line beside it starts reporting the
-   residual error for each eye, in degrees.
-2. Watch those numbers fall. When they settle near zero the emitter is centered in both
-   fovea views, and **Verge Distance** / **Vertical Shift** have been rewritten to match.
-3. Press **Stop Align** to hand control back; the mirrors stay where the servo left them.
+1. Steer the wide view at what you want both foveas on.
+2. Press **Auto Vergence**. The line beside it reads `tracking` and **Verge Distance** /
+   **Vertical Shift** start moving on their own — those two sliders *are* what the loop
+   drives.
+3. Press **Stop Vergence** to hand control back; the mirrors hold exactly where the loop
+   left them, and the sliders hold the values it reached.
 
-It works while the scan is running too — a ring's bright pixels average to its center — so
-you can leave it on and watch the ring stay put as the rig drifts.
+While the **scan** is running the loop pauses (the status reads `paused: scanning`): a
+scanned fovea frame is a ring, not the patch the match needs. It picks up again the moment
+you stop the scan, from the values it had. So the usual order is converge first, then scan.
 
-If the readout says *no emitter in either fovea* the source is out of view or too dim:
-steer closer and raise **Gain**. If only one eye sees it, that eye keeps servoing and the
-other holds.
+Other things the status line can say: `hold: match low score` — neither view is confident
+enough to steer on; `hold: match stale` — one fovea's frames stopped arriving.
 
-**The PID sliders** above the button tune the loop (↺ in the heading puts them back):
-**Kp** how hard it corrects, **Ki** how it removes the last bit of standing error,
-**Kd** damping if it overshoots, and **Max Step** the largest angle it may move per
-measurement. The defaults are a slow, safe loop; raise Kp
-first if it crawls.
+Moving **Verge Distance** or **Vertical Shift** yourself while the loop runs is allowed:
+the loop takes your value as its new starting point and carries on from there. Steering
+somewhere new re-aims it at the new spot.
 
-One caveat while the rig is new: if the error numbers GROW instead of shrinking, the
-pixel-to-angle sign is inverted for this mounting. Stop the servo, say so — it is a
-one-line change — and use the sliders meanwhile.
+**The PID sliders** above the button are the same three groups Disparity Scope has —
+**Pan** (how the pair is centred on the target), **Depth** (the convergence distance) and
+**Vertical** (the toe between the eyes) — each with **Kp** how hard it corrects, **Ki** how
+it removes the last bit of standing error and **Kd** damping if it overshoots. **Min Match
+Score** is the confidence below which the loop refuses to steer. The reset button in each
+heading puts that group back. The defaults are a slow, safe loop; raise Kp first if it
+crawls.
+
+While the loop runs, a small dashed circle in each fovea's colour marks where that fovea
+was found in the wide view. If the status sits at `hold: match low score`, look at those
+two marks: on the right thing, the scene is simply low-contrast — lower **Min Match
+Score** or raise **Gain**; somewhere else entirely, a fovea has locked onto a repeating
+pattern, so steer at something more distinctive. `no calibration` means the wide camera has
+no undistort calibration and the loop has no map to steer with — calibrate it first. A
+refused engage leaves the status at `off — refused` with the reason in its hover.
 
 ### To scan
 

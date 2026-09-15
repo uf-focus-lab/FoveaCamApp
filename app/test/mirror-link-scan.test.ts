@@ -17,6 +17,7 @@ import {
   SCAN_HZ_RANGE,
   SHIFT_RANGE_DEG,
 } from "@modules/mirror-link/scan";
+import { VSHIFT_LIMIT_DEG } from "@lib/vergence/tuning";
 import { inverseTriangulate } from "@lib/stereo";
 import type { Point2d } from "core/Geometry";
 
@@ -118,6 +119,11 @@ describe("shared ranges", () => {
   it("pin the UI/session/test contract", () => {
     expect(SCAN_HZ_RANGE).toEqual({ min: 1, max: 100 });
     expect(SCAN_AMP_RANGE).toEqual({ min: 0, max: 2 });
-    expect(SHIFT_RANGE_DEG).toEqual({ min: -0.5, max: 0.5 });
+    // The shift slider IS the vergence loop's `v_shift` DOF — its range is
+    // that controller's saturation limit.
+    expect(SHIFT_RANGE_DEG).toEqual({
+      min: -VSHIFT_LIMIT_DEG,
+      max: VSHIFT_LIMIT_DEG,
+    });
   });
 });

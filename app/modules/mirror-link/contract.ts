@@ -14,7 +14,8 @@ import {
   captureCommands,
   captureTelemetry,
 } from "@lib/orchestrator/contracts";
-import type { Point2d } from "core/Geometry";
+import type { Point2d, Rect } from "core/Geometry";
+import { DEFAULT_VERGENCE_TUNING } from "@lib/vergence/tuning";
 import type { Pos } from "@lib/controller-codec";
 import type { Stat } from "@lib/orchestrator/contracts";
 import type { RingReadout } from "@lib/ring-code";
@@ -36,25 +37,10 @@ export type ScanTelemetry = {
   mismatch: boolean;
 };
 
-/** The auto-align SERVO's live readout (spec §targeting) — non-null exactly
- *  while engaged. `error_deg` is the per-eye angular error the PID nodes are
- *  driving to zero; a wrong `SPOT_TO_ANGLE_SIGN` shows up as it GROWING.
+/** Matched fovea footprint + confidence, lifted into wide-frame pixels — the
+ *  disparity-scope `MatchInfo` shape (the loop is the same loop).
  *  A type alias, NOT an interface (telemetry values must be `Serializable`). */
-export type AlignTelemetry = {
-  engaged: boolean;
-  /** Where the emitter was last seen in each fovea frame (fovea px). */
-  spots: { L: Point2d | null; R: Point2d | null };
-  /** Residual angular error per eye (degrees); null while that eye has no spot. */
-  error_deg: { L: Point2d | null; R: Point2d | null };
-  /** What the last step applied. */
-  applied: {
-    angle: Point2d;
-    distance_mm: number | null;
-    shift_deg: number;
-  } | null;
-  /** Why the servo is not converging, when it is not (both eyes blind). */
-  reason?: string;
-};
+export type MatchInfo = { rect: Rect; score: number };
 
 export const mirrorLink = defineContract({
   state: {
@@ -82,15 +68,14 @@ export const mirrorLink = defineContract({
     /** Which histogram stage the drawer shows (spec §ring-views). "off" stops
      *  the worker building strips at all. */
     ring_view: "off" as "off" | "polar" | "binary" | "segments",
-    // Auto-align servo gains, shared by all four controllers (spec §targeting)
-    // — angle-out per angle-in, dt in seconds. FLAT keys: the session client
-    // only emits `setState` from a top-level key's ref, so a nested object's
-    // fields would never reach the orchestrator.
-    pid_kp: 0.5,
-    pid_ki: 0.05,
-    pid_kd: 0,
-    /** Per-step clamp on each controller's angle increment (degrees). */
-    pid_max_step_deg: 0.2,
+    /** Auto-vergence ON/OFF (spec §targeting). Session-local intent, like the
+     *  scan: the loop's nodes exist only while this is set. */
+    auto_vergence: false as boolean,
+    /** The vergence loop's tuning — the SHARED surface (@lib/vergence/tuning),
+     *  identical keys/defaults to Disparity Scope so the two drawers read the
+     *  same. Written as a WHOLE object (the session client only emits
+     *  `setState` from a top-level key's ref). */
+    tuning: DEFAULT_VERGENCE_TUNING,
     // Scan parameters (spec §scan) — LIVE while active.
     scan_hz: 10, // 100 ms revolution
 
@@ -138,9 +123,17 @@ export const mirrorLink = defineContract({
     /** Human-readable reason the last `startScan` was refused (or why the
      *  override could not be applied); null while active or never refused. */
     scan_blocked: null as string | null,
-    /** The auto-align servo's readout — non-null exactly while engaged
-     *  (spec §targeting). */
-    align: null as AlignTelemetry | null,
+    /** The vergence loop's status: `off` / `tracking` / `paused: scanning` /
+     *  `hold: match low score` / `hold: match stale` / `no calibration`. */
+    vergence_status: "off" as string,
+    /** Why the last `startVergence` was refused; null while engaged or never
+     *  refused — the `scan_blocked` shape (spec §targeting). */
+    vergence_blocked: null as string | null,
+    /** Per-eye match footprint + confidence in ABSOLUTE wide px (spec
+     *  §targeting) — the wide view draws their centers while engaged, so a
+     *  `hold: match low score` shows WHAT was matched. */
+    match_left: null as MatchInfo | null,
+    match_right: null as MatchInfo | null,
     // Control-path latency — `c.actuate()` round-trip — and the pacer's own
     // tick interval: a stall on the orchestrator loop (an allocation, a
     // synchronous native call) shows up as a `tickGapMs.max` spike, which on
@@ -183,12 +176,16 @@ export const mirrorLink = defineContract({
   commands: {
     /** Move the scan CENTER to a wide-view pixel (spec §targeting). */
     steer: cmd<Point2d>(),
-    /** Engage the auto-align servo: it drives both foveas onto the emitter and
-     *  keeps them there, rewriting verge + shift every step (spec §targeting).
-     *  Resolves `false` when refused. */
-    startAlign: cmd<void, boolean>(),
-    /** Disengage the servo (the mirrors hold their last commanded pose). */
-    stopAlign: cmd(),
+    /** Engage auto vergence — the fovea-into-wide template-match loop
+     *  (spec §targeting). Resolves `false` when refused. */
+    startVergence: cmd<void, boolean>(),
+    /** Disengage (the mirrors hold the last integrated verge/shift). */
+    stopVergence: cmd(),
+    /** A Verge/Shift slider is under the pointer: suspend the loop's write-back
+     *  so a fully-controlled slider cannot be yanked mid-drag (spec §targeting).
+     *  Released with `false`, which re-seeds both controllers from the final
+     *  slider values. */
+    holdDof: cmd<boolean>(),
     /** Start the circular scan + the per-fovea exposure override. Resolves
      *  `false` when refused, with the reason on `telemetry.scan_blocked`. */
     startScan: cmd<void, boolean>(),

@@ -80,18 +80,37 @@ import {
   outputOf,
   type PidNodeHandle,
 } from "@orchestrator/pid-node";
-import type { SpotValue } from "@orchestrator/spot-kernel";
-import { PID2D, type PidParams } from "@lib/pid";
+import { createSlicePipe, type SliceHandle, type SlicePipeSeam } from "@orchestrator/slice-pipe";
+import { createScalePipe, type ScaleHandle, type ScalePipeSeam } from "@orchestrator/scale-pipe";
+import {
+  foveaTileSize,
+  matchMagnification,
+  recordTarget,
+  seedVergence,
+  stepVergence,
+  targetAtEpoch,
+  type ScopeProjection,
+  type TargetSample,
+  type VergenceControllers,
+  type VergenceSeed,
+} from "@lib/vergence/vergence";
+import { matchPartnerStale } from "@lib/vergence/match-join";
+import {
+  SHIFT_LIMIT_DEG,
+  VERGE_MIN_DISTANCE_MM,
+  VSHIFT_LIMIT_DEG,
+  type VergenceTuning,
+} from "@lib/vergence/tuning";
+import { RECT, VEC } from "@lib/util/geometry";
+import type { TemplateMatchValues } from "@orchestrator/template-match-kernel";
+import { hostNowNs } from "@orchestrator/time-align";
+import { PID, PID2D } from "@lib/pid";
 import { deg } from "@lib/util/math";
 import { RollingStats } from "@lib/util/rolling";
-import type { Point2d } from "core/Geometry";
+import type { Point2d, Rect, Size } from "core/Geometry";
 import type { Pos } from "@lib/controller-codec";
-import {
-  mirrorLink,
-  type AlignTelemetry,
-  type ScanTelemetry,
-} from "./contract";
-import { solveAlignment, spotOffsetAngle } from "./align";
+import { mirrorLink, type ScanTelemetry } from "./contract";
+
 import { SCAN_HZ_RANGE, SHIFT_RANGE_DEG, scanAngles, scanOffset } from "./scan";
 import {
   applyScanTiming,
@@ -138,6 +157,21 @@ const PID_STREAM: StreamType = { kind: "analysis", schema: "pid" };
  *  exists to keep free. */
 const ORBIT_PROBE_INTERVAL_MS = 1000;
 
+/** Physical saturation limits for the vergence DOF, in radians (the shared
+ *  degree constants). The drawer's Verge/Shift sliders ARE these DOF, so their
+ *  ranges are the controllers' limits (spec §targeting). */
+const SHIFT_LIMIT = radians(SHIFT_LIMIT_DEG);
+const VSHIFT_LIMIT = radians(VSHIFT_LIMIT_DEG);
+/** Capture-epoch target ring capacity (>1 s of writes) + the control-dt cap in
+ *  frame-units — disparity-scope's values (spec §control-law). */
+const TARGET_RING_CAP = 256;
+const DT_MAX_FRAMES = 4;
+/** `seedVergence`'s parallel-ray guard (spec §seed-space). */
+const SEED_PARALLEL_EPS = 1e-9;
+/** Below this a `verge`/`shift` state write is the loop's own mirror, not a
+ *  manual slider move — no re-seed. */
+const DOF_EPS = 1e-9;
+
 /** Orbit-sink GOVERNOR policy (spec §actuation). The compose path's AIMD
  *  defaults suit a latency-sensitive tracker: halve on ANY pressure signal,
  *  floor 60 Hz. A free-running orbit is different — 60 poses/s at a 10 Hz scan
@@ -155,6 +189,8 @@ export default function mirrorLinkSession(
   undistortSeam: UndistortPipeSeam,
   rawPipes: RawPipeRegistry,
   orbitSeam: OrbitSeam,
+  sliceSeam: SlicePipeSeam,
+  scaleSeam: ScalePipeSeam,
   compressSeam?: CompressPipeSeam,
 ): ServerSession<typeof mirrorLink> {
   return defineResourceSession("mirror-link", mirrorLink, (s) => {
@@ -177,16 +213,48 @@ export default function mirrorLinkSession(
       R: { ...ORIGIN_POS },
     };
 
+    // --- the vergence DOF (spec §targeting) --------------------------------
+    // The loop's three constrained DOF, all in MEASUREMENT-derivative mode
+    // (spec disparity-scope §control-law). They are the SINGLE authority for
+    // the commanded pose while engaged; the drawer sliders are while off.
+
+    const MEAS_D = { derivativeOn: "measurement" } as const;
+    const pan = new PID2D({ x: MEAS_D, y: MEAS_D });
+    const verge = new PID({
+      limits: [0, distanceToVerge(VERGE_MIN_DISTANCE_MM, s.state.baseline)],
+      ...MEAS_D,
+    });
+    const v_shift = new PID({ limits: [-VSHIFT_LIMIT, VSHIFT_LIMIT], ...MEAS_D });
+    const vergenceControllers: VergenceControllers = { pan, verge, v_shift };
+    let vergenceEngaged = false;
+
+    /** The DOF the pose chain reads. Engaged: the loop's integrators (the
+     *  sliders mirror them at the write-back throttle). Off: the sliders, with
+     *  no `pan` — a disengage folds the correction into the target ray, so the
+     *  two branches agree across the transition. */
+    function heldDof(): VergenceSeed {
+      return vergenceEngaged
+        ? { pan: pan.value, verge: verge.value, v_shift: v_shift.value }
+        : {
+            pan: { x: 0, y: 0 },
+            verge: s.state.verge,
+            v_shift: radians(s.state.shift),
+          };
+    }
+
     // --- targeting ---------------------------------------------------------
 
-    /** Per-eye angles for a scan offset (zero offset = the idle/center pose). */
+    /** Per-eye angles for a scan offset (zero offset = the idle/center pose).
+     *  At zero offset this IS `followTarget`'s forward map (@lib/vergence) —
+     *  the vergence loop's output and the scan ride ONE chain. */
     function anglesAt(offset: Point2d): { l: Point2d; r: Point2d } {
+      const h = heldDof();
       return scanAngles(
-        targetAngle,
+        { x: targetAngle.x + h.pan.x, y: targetAngle.y + h.pan.y },
         offset,
         s.state.baseline,
-        vergeToDistance(s.state.verge, s.state.baseline),
-        radians(s.state.shift),
+        vergeToDistance(h.verge, s.state.baseline),
+        h.v_shift,
       );
     }
 
@@ -306,6 +374,14 @@ export default function mirrorLinkSession(
       targetAngle = triple?.undistort
         ? triple.undistort.angular([px], false)[0]
         : { x: 0, y: 0 };
+      // Every target write feeds the capture-epoch ring (spec §control-law) —
+      // the join pairs each matched frame with the target as of ITS capture.
+      recordTarget(targetRing, { t: Number(hostNowNs()), target }, TARGET_RING_CAP);
+      // A steer RE-REFERENCES the loop: the new ray is the new intent, so the
+      // accumulated common-mode correction is dropped (the drag re-affirm
+      // semantics) and the match strip follows the new center.
+      pan.value = { x: 0, y: 0 };
+      steerStrip();
       s.telemetry({ target, target_angle: targetAngle });
       publishScanGeometry();
     }
@@ -724,219 +800,497 @@ export default function mirrorLinkSession(
       };
     }
 
-    // --- auto-align servo (spec §targeting) ---------------------------------
-    // A closed loop, not a one-shot: the `spot` kernel measures the emitter in
-    // each fovea frame and FOUR PID controllers (two PID2D, one per eye) drive
-    // the per-eye DESIRED angles until the spot sits at the frame center. Every
-    // step re-solves the fixation model and applies the pair COLLECTIVELY —
-    // gaze ray, verge distance and vertical shift together — so the two eyes can
-    // never walk apart. Session-local intent, like the scan.
+    // --- auto vergence (spec §targeting) ------------------------------------
+    // The SAME fovea-into-wide template-match loop Disparity Scope runs (spec
+    // disparity-scope §topology, §match-join, §control-law), with this app's
+    // targeting: a target-centered strip sliced out of the C undistort and each
+    // RAW fovea scaled to the same px-per-wide-px, matched per eye, joined at
+    // ONE pid node that integrates {pan, verge, v_shift}. Its reconstruction IS
+    // the scan CENTER — the orbit brick rides on top of it. Session-local
+    // intent, like the scan: the nodes exist only while engaged.
 
-    let spotWorker: VisionWorkerHandle | null = null;
-    let spotNode: { dispose(): void } | null = null;
-    /** Per-eye PID node (each holds one PID2D = the eye's x and y controllers). */
-    const alignPid: Partial<Record<Side, PidNodeHandle<Point2d>>> = {};
-    const alignCtl: Partial<Record<Side, PID2D>> = {};
-    /** The angles the servo is driving toward (seeded from the live pose). */
-    const desired: Record<Side, Point2d> = {
-      L: { x: 0, y: 0 },
-      R: { x: 0, y: 0 },
+    /** One side's latest match, lifted to absolute undistorted-wide px. */
+    type SideMatch = {
+      center: Point2d;
+      score: number;
+      seq: number;
+      at: number;
+      epoch: number;
     };
-    const misses: Record<Side, number> = { L: 0, R: 0 };
-    let alignEngaged = false;
-    let lastSpotAt = 0;
-    let lastSeenAt = 0;
-    let alignTele: AlignTelemetry | null = null;
 
-    /** Integrator resets after this many consecutive blind frames on an eye. */
-    const MISS_RESET = 10;
-    /** Both eyes blind this long ⇒ say so (the servo stays engaged). */
-    const BLIND_MS = 2000;
+    let stripSlice: SliceHandle | null = null;
+    let stripScale: ScaleHandle | null = null;
+    const needleScales: Partial<Record<Side, ScaleHandle>> = {};
+    let vergeNode: PidNodeHandle<SlewPair> | null = null;
+    let vergenceNode: { dispose(): void } | null = null;
+    let vergenceStatus = "off";
+    /** Wide/fovea source dims — the loop's crop space + needle base, read once
+     *  per activation (spec disparity-scope §needle-geometry). */
+    let wide: Size = { width: 0, height: 0 };
+    let foveaDims: Size = { width: 0, height: 0 };
+    let stripScaleFactor = 1;
+    let lastVergeStep = 0;
+    let lastSteppedSeq = -1;
+    let lastDofWrite = 0;
+    /** A Verge/Shift slider is under the pointer — the write-back would yank a
+     *  fully-controlled knob mid-drag (spec §targeting). */
+    let dofHeld = false;
+    const latestMatch: Partial<Record<Side, SideMatch>> = {};
+    /** Capture-epoch target ring (spec disparity-scope §capture-epoch-target). */
+    const targetRing: TargetSample[] = [];
 
-    function pidParams(): PidParams {
-      const { pid_kp: kp, pid_ki: ki, pid_kd: kd } = s.state;
-      const lim = radians(Math.max(0, s.state.pid_max_step_deg));
-      return { kp, ki, kd, limits: [-lim, lim] };
+    const MATCH_IDS = {
+      L: nodeId.win("mirror-link", "match", "L"),
+      R: nodeId.win("mirror-link", "match", "R"),
+    } as const;
+
+    function vergeLimit(): number {
+      return distanceToVerge(VERGE_MIN_DISTANCE_MM, s.state.baseline);
     }
 
-    function publishAlign(patch?: Partial<AlignTelemetry>): void {
-      if (!alignEngaged) return;
-      alignTele = { ...(alignTele as AlignTelemetry), ...patch };
-      s.telemetry({ align: alignTele });
-    }
-
-    /** One servo step per spot result (spec §targeting): angle error per eye →
-     *  PID → desired angles → one collective solve. */
-    function onSpotResult(r: VisionResult): void {
-      if (!alignEngaged) return;
-      const t = triple;
-      const und = t?.undistort;
-      if (!t || !und) return;
-      const now = performance.now();
-      const dt = lastSpotAt > 0 ? Math.min(0.5, (now - lastSpotAt) / 1000) : 0;
-      lastSpotAt = now;
-      const spots: AlignTelemetry["spots"] = { L: null, R: null };
-      const errors: AlignTelemetry["error_deg"] = { L: null, R: null };
-      let sawAny = false;
-      for (const side of SIDES) {
-        const spot = r.values[side] as SpotValue | undefined;
-        const node = alignPid[side];
-        const ctl = alignCtl[side];
-        if (!node || !ctl) continue;
-        node.ingest("spot");
-        if (!spot) {
-          // Blind on this eye: HOLD its angle. A long blackout would otherwise
-          // wind the integrator up against a measurement that never comes.
-          if (++misses[side] === MISS_RESET) ctl.reset();
-          continue;
-        }
-        sawAny = true;
-        misses[side] = 0;
-        spots[side] = { x: spot.x, y: spot.y };
-        // The error IS the spot's offset from the fovea center, in angle.
-        const { f, c } = deriveFoveaIntrinsics(und, desired[side], 1);
-        const err = spotOffsetAngle({ x: spot.x, y: spot.y }, c, f);
-        errors[side] = { x: deg(err.x), y: deg(err.y) };
-        ctl.setParams({ x: pidParams(), y: pidParams() });
-        const step = node.step(() => ctl.step(err, dt || 1 / 30));
-        const delta = outputOf(step);
-        desired[side] = {
-          x: desired[side].x + delta.x,
-          y: desired[side].y + delta.y,
-        };
-      }
-      if (sawAny) lastSeenAt = now;
-      // COLLECTIVE apply: one gaze ray, one distance, one shift.
-      const solved = solveAlignment(desired.L, desired.R, s.state.baseline);
-      targetAngle = solved.angle;
-      target = und.position([solved.angle], false)[0];
-      const verge = Number.isFinite(solved.distanceMm)
-        ? distanceToVerge(solved.distanceMm, s.state.baseline)
-        : 0;
-      s.setState("verge", Math.min(1, Math.max(0, verge)));
-      s.setState(
-        "shift",
-        Math.min(
-          SHIFT_RANGE_DEG.max,
-          Math.max(SHIFT_RANGE_DEG.min, deg(solved.shiftRad)),
-        ),
-      );
-      s.telemetry({ target, target_angle: targetAngle });
-      publishScanGeometry();
-      const blind =
-        !sawAny && lastSeenAt > 0 && now - lastSeenAt > BLIND_MS
-          ? "no emitter in either fovea"
-          : undefined;
-      publishAlign({
-        spots,
-        error_deg: errors,
-        applied: {
-          angle: solved.angle,
-          distance_mm: Number.isFinite(solved.distanceMm)
-            ? solved.distanceMm
-            : null,
-          shift_deg: s.state.shift,
-        },
-        ...(blind ? { reason: blind } : { reason: undefined }),
+    function syncGains(t: VergenceTuning): void {
+      const panLim: [number, number] = [-SHIFT_LIMIT, SHIFT_LIMIT];
+      const p = { kp: t.pan[0], ki: t.pan[1], kd: t.pan[2], limits: panLim };
+      pan.setParams({ x: p, y: p });
+      verge.setParams({ kp: t.depth[0], ki: t.depth[1], kd: t.depth[2] });
+      v_shift.setParams({
+        kp: t.v_shift[0],
+        ki: t.v_shift[1],
+        kd: t.v_shift[2],
+        limits: [-VSHIFT_LIMIT, VSHIFT_LIMIT],
       });
     }
 
-    /** Build the measurement node + the two PID nodes, and engage. */
-    function startAlignNow(): boolean {
+    function publishVergenceStatus(): void {
+      s.telemetry({ vergence_status: vergenceStatus });
+    }
+
+    /** Re-seed both DOF controllers from the sliders — the release half of
+     *  `holdDof`, and the same assignment the per-DOF watches make. */
+    function seedDofFromState(): void {
+      if (!vergenceEngaged) return;
+      verge.value = s.state.verge;
+      v_shift.value = radians(s.state.shift);
+      lastDofWrite = now(); // resume the mirror from THIS value, not the old one
+    }
+
+    /** Mirror the integrators into the drawer sliders (spec §targeting): while
+     *  engaged the loop OWNS `verge`/`shift`, so the sliders show the result and
+     *  HOLD it on disengage. Throttled — a per-step `setState` would flood the
+     *  channel; the writes re-publish the drawn ring through their watches. */
+    const DOF_WRITE_INTERVAL_MS = 100;
+    function writeBackDof(force = false): void {
+      if (!vergenceEngaged) return;
+      if (dofHeld && !force) return; // a pointer owns the slider
+      const t = now();
+      if (!force && t - lastDofWrite < DOF_WRITE_INTERVAL_MS) return;
+      lastDofWrite = t;
+      s.setState("verge", verge.value);
+      s.setState("shift", deg(v_shift.value));
+      publishScanGeometry(); // `pan` moves the ring without touching state
+    }
+
+    // --- magnification + crop geometry (spec disparity-scope §magnification) --
+    // MirrorLink has no zoom knob: the resolution order starts at the triple's
+    // stored override, then the calibration-measured ratio, then 1.
+
+    function measuredMatchZoom(): number | null {
+      if (!triple) return null;
+      const { L, R } = triple.magnification;
+      if (L !== null && R !== null) return (L + R) / 2;
+      return L ?? R;
+    }
+
+    function matchZoom(): number {
+      return matchMagnification(measuredMatchZoom(), 0, triple?.zoomOverride ?? null);
+    }
+
+    /** The needle scaler's zoom + BASE DIMS, paired by the zoom's units —
+     *  measured → fovea dims, nominal → center dims (spec §needle-geometry). */
+    function needleGeometry(): { zoom: number; base: Size } {
+      const override = triple?.zoomOverride ?? null;
+      const measured = measuredMatchZoom();
+      const overrideWins =
+        override != null && Number.isFinite(override) && override > 0;
+      const measuredWins =
+        !overrideWins &&
+        measured != null &&
+        Number.isFinite(measured) &&
+        measured > 0;
+      return {
+        zoom: matchMagnification(measured, 0, override),
+        base: measuredWins ? foveaDims : wide,
+      };
+    }
+
+    function effectiveScale(): number {
+      const ratio = Math.max(0, Math.min(1, s.state.tuning.scale));
+      return 1 + (matchZoom() - 1) * ratio;
+    }
+
+    function clampToWide(r: Rect): Rect {
+      const x = Math.max(0, Math.min(r.x, wide.width));
+      const y = Math.max(0, Math.min(r.y, wide.height));
+      return {
+        x,
+        y,
+        width: Math.max(1, Math.min(r.width, wide.width - x)),
+        height: Math.max(1, Math.min(r.height, wide.height - y)),
+      };
+    }
+
+    /** The match strip: the center tile expanded by `expand_x`/`expand_y`,
+     *  centered on the RAW dragged target (where we look for the fovea). */
+    function stripRect(): Rect {
+      const z = Math.max(1, matchZoom());
+      const t = s.state.tuning;
+      return clampToWide(
+        RECT.fromCenter(target, {
+          width: (wide.width / z) * t.expand_x,
+          height: (wide.height / z) * t.expand_y,
+        }),
+      );
+    }
+
+    function steerStrip(): void {
+      if (wide.width) stripSlice?.steer(stripRect());
+    }
+
+    /** Retune the strip ratio + both needles — every side must land at the same
+     *  px-per-wide-px (CCOEFF matching is not scale-invariant). */
+    function retuneScalers(): void {
+      if (!wide.width) return;
+      stripScaleFactor = effectiveScale();
+      stripScale?.retune({ ratio: stripScaleFactor });
+      const g = needleGeometry();
+      const size = foveaTileSize({
+        width: g.base.width,
+        height: g.base.height,
+        zoom: g.zoom,
+        scale: stripScaleFactor,
+      });
+      const dsize = {
+        width: Math.max(1, Math.round(size.width)),
+        height: Math.max(1, Math.round(size.height)),
+      };
+      needleScales.L?.retune({ dsize });
+      needleScales.R?.retune({ dsize });
+    }
+
+    // --- the join + the control step (spec disparity-scope §match-join) ------
+
+    function onMatch(side: Side, r: VisionResult): void {
+      if (!vergenceEngaged) return;
+      const v = r.values as unknown as TemplateMatchValues;
+      vergeNode?.ingest(side === "L" ? "l" : "r");
+      // Lift out of scaled-strip space (/s → full-res strip-local px) + the
+      // frame's crop origin → absolute undistorted-wide px.
+      const sF = stripScaleFactor > 0 ? stripScaleFactor : 1;
+      const rectFull = VEC.mul(v.rect, 1 / sF);
+      const c = RECT.getCenter(rectFull);
+      const m: SideMatch = {
+        center: { x: v.origin.x + c.x, y: v.origin.y + c.y },
+        score: v.score,
+        seq: v.seq ?? 0,
+        at: now(),
+        epoch: v.deviceTimestamp ?? 0,
+      };
+      latestMatch[side] = m;
+      // ABSOLUTE wide px, not strip-local: the wide view draws these directly.
+      const abs = {
+        rect: { ...rectFull, x: v.origin.x + rectFull.x, y: v.origin.y + rectFull.y },
+        score: v.score,
+      };
+      s.telemetry(side === "L" ? { match_left: abs } : { match_right: abs });
+      const other = latestMatch[side === "L" ? "R" : "L"];
+      if (!other || m.seq < other.seq) return; // pair incomplete — wait
+      if (
+        matchPartnerStale({
+          ageMs: now() - other.at,
+          seqGap: m.seq - other.seq,
+        })
+      ) {
+        vergenceStatus = "hold: match stale";
+        publishVergenceStatus();
+        return;
+      }
+      // One control step per PAIR (kd explosion; spec §match-join).
+      const pairSeq = Math.min(m.seq, other.seq);
+      if (pairSeq <= lastSteppedSeq) return;
+      lastSteppedSeq = pairSeq;
+      runVergence({
+        l: (side === "L" ? m : other).center,
+        r: (side === "R" ? m : other).center,
+        target: targetAtEpoch(targetRing, v.deviceTimestamp, target),
+        scores: {
+          l: (side === "L" ? m : other).score,
+          r: (side === "R" ? m : other).score,
+        },
+        overridden: false, // no drag override in this app — steer re-seeds instead
+      });
+    }
+
+    /** The control law, run inside the pid node's step. Returns the commanded
+     *  CENTER volts; on any hold it returns the held pose so the mirrors freeze
+     *  rather than wind down. */
+    function vergenceStep(projection: ScopeProjection): SlewPair {
+      const held = centerVolts();
+      if (!triple || !triple.undistort) {
+        vergenceStatus = "no calibration";
+        return held;
+      }
+      if (scanActive) {
+        // The needle is a RING, not the dot the match was cut from — a step now
+        // would servo on noise. Hold; the integrators keep their values.
+        vergenceStatus = "paused: scanning";
+        return held;
+      }
+      const t = now();
+      const dt = Math.min(
+        (t - lastVergeStep) * s.state.tuning.sensitivity,
+        DT_MAX_FRAMES,
+      );
+      const out = stepVergence(
+        projection,
+        vergenceControllers,
+        { P2A: triple.conv.P2A, A2V: triple.conv.A2V },
+        { baseline: s.state.baseline, minScore: s.state.tuning.min_score },
+        dt,
+      );
+      if (!out) {
+        vergenceStatus = "hold: match low score";
+        return held;
+      }
+      lastVergeStep = t;
+      vergenceStatus = "tracking";
+      // The step moved the integrators and `heldDof` reads them, so the pose
+      // chain IS the reconstruction — evaluated against the LIVE target (only
+      // the PID ERROR uses the capture-epoch one; spec §capture-epoch-target).
+      return centerVolts();
+    }
+
+    function runVergence(projection: ScopeProjection): void {
+      if (!vergeNode) return;
+      outputOf(vergeNode.step(() => vergenceStep(projection)));
+      publishVergenceStatus();
+      pushOrbitPose(); // the loop's output IS the orbit brick's center
+      writeBackDof();
+    }
+
+    /** Seed the integrators from the CURRENT commanded pose — ANGLES, never a
+     *  volts round-trip (spec disparity-scope §seed-space). */
+    function seedVergenceFromPose(): void {
+      if (!triple || !triple.undistort) return;
+      const A = centerAngles();
+      const seed = seedVergence(
+        A.l,
+        A.r,
+        targetAngle,
+        s.state.baseline,
+        SEED_PARALLEL_EPS,
+      );
+      pan.value = seed.pan;
+      verge.value = seed.verge;
+      v_shift.value = seed.v_shift;
+    }
+
+    /** Build the strip/needle/match/pid chain and engage. Idempotent. */
+    /** Local mirror of the published refusal — the runtime hands no telemetry
+     *  back, and the `startVergence` command reports the reason it just set. */
+    let vergenceBlocked: string | null = null;
+    function publishVergenceBlocked(reason: string | null): void {
+      vergenceBlocked = reason;
+      s.telemetry({ vergence_blocked: reason });
+    }
+
+    function startVergenceNow(): boolean {
       const t = triple;
-      if (!t || !t.undistort || alignEngaged) return alignEngaged;
-      const node = nodeId.win("mirror-link", "spot");
+      if (vergenceEngaged) return true;
+      if (!t) {
+        publishVergenceBlocked("no camera triple leased");
+        return false;
+      }
+      if (!t.undistort) {
+        publishVergenceBlocked("the wide camera has no undistort calibration");
+        return false;
+      }
+      if (!wide.width) {
+        publishVergenceBlocked("wide frame size unknown");
+        return false;
+      }
+      const serialC = t.leases.C.camera.serial;
+      const cSourceId = s.state.undistortPipe ?? nodeId.convert(serialC);
       const pipeIds: string[] = [];
-      const pipes: PipeInput[] = SIDES.map((side) => {
-        const pipeId = nodeId.convert(t.leases[side].camera.serial);
+      const connect = (role: string, pipeId: string): PipeInput => {
         const handle = broker.connect(pipeId);
         pipeIds.push(pipeId);
         const { width, height, channels, bytesPerFrame, maxBytes } = handle.spec;
         return {
-          role: side,
+          role,
           shmName: handle.shmName,
           width,
           height,
           channels,
           bytesPerFrame: maxBytes ?? bytesPerFrame,
         };
-      });
-      const unregister = registerGraphWiring({
-        nodes: [
-          {
-            id: node,
-            kind: "spot",
-            owner: "win/mirror-link",
-            output: { kind: "analysis", schema: "spot" },
-            transport: "worker",
-          },
-        ],
-        edges: pipes.map((pipe, i) => ({
-          from: pipeIds[i],
-          to: node,
-          port: pipe.role,
-          type: { kind: "frame", pixelFormat: "RGBA8", dtype: "U8" } as const,
-        })),
-      });
-      // One PID node per eye: spot → pid → controller, exactly the marker
-      // servo's shape. Each holds a PID2D, so the four DOFs are the two nodes'
-      // x/y controllers.
-      for (const side of SIDES) {
-        desired[side] = t.conv.V2A[side](volts[side]);
-        misses[side] = 0;
-        const ctl = new PID2D({ x: pidParams(), y: pidParams() });
-        alignCtl[side] = ctl;
-        alignPid[side] = createPidNode<Point2d>({
-          id: nodeId.win("mirror-link", "pid", side),
-          kind: "pid",
-          owner: "win/mirror-link",
-          inputs: [{ from: node, port: "spot" }],
-          outputs: [{ to: nodeId.controller(), port: `align/${side}` }],
-          controllers: { angle: ctl },
-        });
-      }
-      spotWorker = createVisionWorker(
-        {
-          pipes,
-          params: { kind: "spot", enabled: true },
-          meterName: node,
-        },
-        onSpotResult,
+      };
+
+      // Seed BEFORE engaging: `heldDof` still reads the sliders here, so the
+      // reconstruction reproduces exactly the pose the mirrors hold.
+      seedVergenceFromPose();
+
+      stripScaleFactor = effectiveScale();
+      stripSlice = createSlicePipe(
+        sliceSeam,
+        cSourceId,
+        nodeId.slice(serialC, "vergence-strip"),
+        { rect: stripRect(), maxWidth: wide.width, maxHeight: wide.height },
       );
-      spotNode = {
+      stripScale = createScalePipe(
+        scaleSeam,
+        stripSlice.pipeId,
+        nodeId.scale(stripSlice.pipeId, "match"),
+        {
+          params: { ratio: stripScaleFactor },
+          maxWidth: wide.width * 2,
+          maxHeight: wide.height * 2,
+        },
+      );
+      const g0 = needleGeometry();
+      const tile0 = foveaTileSize({
+        width: g0.base.width,
+        height: g0.base.height,
+        zoom: g0.zoom,
+        scale: stripScaleFactor,
+      });
+      const dsize0 = {
+        width: Math.max(1, Math.round(tile0.width)),
+        height: Math.max(1, Math.round(tile0.height)),
+      };
+      // The needle source is the RAW fovea CONVERT pipe (spec §needle-geometry):
+      // a homography-warped fovea has already divided by the magnification once,
+      // and the needle scaler's dsize divides again.
+      const workers: Partial<Record<Side, VisionWorkerHandle>> = {};
+      for (const side of SIDES) {
+        const cam = t.leases[side].camera;
+        const src = nodeId.convert(cam.serial);
+        needleScales[side] = createScalePipe(
+          scaleSeam,
+          src,
+          nodeId.scale(src, "vergence-needle"),
+          {
+            params: { dsize: dsize0 },
+            maxWidth: cam.getFeatureInt("Width"),
+            maxHeight: cam.getFeatureInt("Height"),
+          },
+        );
+      }
+      const rgba = { kind: "frame", pixelFormat: "RGBA8", dtype: "U8" } as const;
+      const analysis = { kind: "analysis", schema: "template-match" } as const;
+      const unregister = registerGraphWiring({
+        nodes: SIDES.map((side) => ({
+          id: MATCH_IDS[side],
+          kind: "template-match",
+          owner: "win/mirror-link",
+          output: analysis,
+          transport: "worker" as const,
+        })),
+        edges: SIDES.flatMap((side) => [
+          {
+            from: needleScales[side]!.pipeId,
+            to: MATCH_IDS[side],
+            port: "needle",
+            type: rgba,
+          },
+          {
+            from: stripScale!.pipeId,
+            to: MATCH_IDS[side],
+            port: "haystack",
+            type: rgba,
+          },
+        ]),
+      });
+      for (const side of SIDES)
+        workers[side] = createVisionWorker(
+          {
+            pipes: [
+              connect("needle", needleScales[side]!.pipeId),
+              connect("haystack", stripScale.pipeId),
+            ],
+            // No debugger window in this app — the correlation heatmap is never
+            // consumed, so it is never computed.
+            params: { kind: "template-match", emitHeatmap: false },
+            meterName: MATCH_IDS[side],
+          },
+          (r) => onMatch(side, r),
+        );
+      vergeNode = createPidNode<SlewPair>({
+        id: nodeId.win("mirror-link", "pid"),
+        kind: "pid",
+        owner: "win/mirror-link",
+        inputs: [
+          { from: MATCH_IDS.L, port: "l" },
+          { from: MATCH_IDS.R, port: "r" },
+        ],
+        outputs: [{ to: nodeId.win("mirror-link", "orbit"), port: "center" }],
+        controllers: { pan, verge, v_shift },
+      });
+
+      vergenceNode = {
         dispose() {
-          spotWorker?.terminate();
-          spotWorker = null;
+          // Stop reading BEFORE the consumer gate drops (FIFO teardown).
           for (const side of SIDES) {
-            alignPid[side]?.dispose();
-            delete alignPid[side];
-            delete alignCtl[side];
+            workers[side]?.terminate();
+            delete latestMatch[side];
           }
+          vergeNode?.dispose();
+          vergeNode = null;
           unregister();
           for (const id of pipeIds) broker.disconnect(id);
+          for (const side of SIDES) {
+            needleScales[side]?.retire();
+            delete needleScales[side];
+          }
+          stripScale?.retire();
+          stripScale = null;
+          stripSlice?.retire();
+          stripSlice = null;
         },
       };
-      alignEngaged = true;
-      lastSpotAt = 0;
-      lastSeenAt = performance.now();
-      alignTele = {
-        engaged: true,
-        spots: { L: null, R: null },
-        error_deg: { L: null, R: null },
-        applied: null,
-      };
-      s.telemetry({ align: alignTele });
+      vergenceEngaged = true;
+      lastVergeStep = now();
+      lastSteppedSeq = -1;
+      vergenceStatus = scanActive ? "paused: scanning" : "tracking";
+      s.setState("auto_vergence", true);
+      publishVergenceBlocked(null);
+      publishVergenceStatus();
       return true;
     }
 
-    function stopAlignNow(): void {
-      if (!alignEngaged && !spotNode) return;
-      alignEngaged = false;
-      const node = spotNode;
-      spotNode = null;
+    function stopVergenceNow(): void {
+      if (!vergenceEngaged && !vergenceNode) return;
+      // FLUSH before disengaging: `heldDof` falls back to the sliders, which
+      // must already carry the loop's values or the pose would jump. `pan` has
+      // no slider — it folds into the target ray, which IS where the foveas are
+      // now aimed (the same collective apply the old servo did).
+      if (vergenceEngaged && triple?.undistort) {
+        writeBackDof(true);
+        targetAngle = { x: targetAngle.x + pan.value.x, y: targetAngle.y + pan.value.y };
+        target = triple.conv.A2P.C(targetAngle, false);
+        recordTarget(targetRing, { t: Number(hostNowNs()), target }, TARGET_RING_CAP);
+        s.telemetry({ target, target_angle: targetAngle });
+        pan.value = { x: 0, y: 0 };
+      }
+      vergenceEngaged = false;
+      const node = vergenceNode;
+      vergenceNode = null;
       node?.dispose();
-      alignTele = null;
-      s.telemetry({ align: null });
+      vergenceStatus = "off";
+      s.setState("auto_vergence", false);
+      publishVergenceBlocked(null);
+      publishVergenceStatus();
+      s.telemetry({ match_left: null, match_right: null });
+      publishScanGeometry();
     }
 
     // --- recording (spec §recording) ---------------------------------------
@@ -1120,6 +1474,23 @@ export default function mirrorLinkSession(
       // its pipes before the undistort retire and the lease release.
       if (s.state.ring_reader) buildRingNode();
       scope.defer(() => disposeRingNode());
+
+      // The vergence loop's crop space (spec §targeting): the wide frame it
+      // slices, and the fovea dims the needle scaler's base pairs with a
+      // MEASURED magnification (spec disparity-scope §needle-geometry).
+      wide = {
+        width: t.leases.C.camera.getFeatureInt("Width"),
+        height: t.leases.C.camera.getFeatureInt("Height"),
+      };
+      foveaDims = {
+        width: t.leases.L.camera.getFeatureInt("Width"),
+        height: t.leases.L.camera.getFeatureInt("Height"),
+      };
+      verge.setLimits([0, vergeLimit()]);
+      syncGains(s.state.tuning);
+      // OPTIONAL, default OFF — the same on-demand shape as the ring reader.
+      if (s.state.auto_vergence) startVergenceNow();
+      scope.defer(() => stopVergenceNow());
       monitor.done("pipes");
 
       // Capture node (spec §capture). The raw L/R producers are PRE-ACQUIRED
@@ -1329,7 +1700,7 @@ export default function mirrorLinkSession(
       scope.defer(async () => {
         scanAllowed = false;
         await queueScanOp(async () => {
-          stopAlignNow(); // the servo's worker + PID nodes go first
+          stopVergenceNow(); // the loop's workers + pid node go first
           await stopScanNow();
           await restoreGainNow();
         });
@@ -1373,7 +1744,10 @@ export default function mirrorLinkSession(
         gainRange = { min: 0, max: 0 };
         ring.L = ring.R = null;
         s.resetTelemetry([
-          "align",
+          "vergence_status",
+          "vergence_blocked",
+          "match_left",
+          "match_right",
           "ring",
           "scan",
           "scan_blocked",
@@ -1386,10 +1760,37 @@ export default function mirrorLinkSession(
       },
       watch: {
         // Everything that moves or reshapes the commanded ring republishes the
-        // drawn geometry (the pacer never does — spec §views).
-        verge: publishScanGeometry,
-        shift: publishScanGeometry,
-        baseline: publishScanGeometry,
+        // drawn geometry (the pacer never does — spec §views). Verge and Shift
+        // ARE the loop's DOF: while engaged a MANUAL write re-seeds that
+        // controller (the write-back's own values compare equal and no-op).
+        verge() {
+          if (vergenceEngaged && Math.abs(s.state.verge - verge.value) > DOF_EPS)
+            verge.value = s.state.verge;
+          publishScanGeometry();
+        },
+        shift() {
+          if (
+            vergenceEngaged &&
+            Math.abs(radians(s.state.shift) - v_shift.value) > DOF_EPS
+          )
+            v_shift.value = radians(s.state.shift);
+          publishScanGeometry();
+        },
+        baseline(mm) {
+          if (typeof mm === "number") verge.setLimits([0, vergeLimit()]);
+          publishScanGeometry();
+        },
+        tuning() {
+          syncGains(s.state.tuning);
+          retuneScalers();
+          steerStrip();
+        },
+        auto_vergence(on) {
+          void queueScanOp(async () => {
+            if (on) startVergenceNow();
+            else stopVergenceNow();
+          });
+        },
         // Amplitude rides the brick's live params; the drawn ring follows.
         scan_amp() {
           pushOrbitParams();
@@ -1434,18 +1835,27 @@ export default function mirrorLinkSession(
         async steer(px) {
           setTargetFromPixel(px);
         },
-        async startAlign() {
+        async startVergence() {
           // On the scan ops' FIFO chain: engaging must not interleave with a
           // start/stop that is re-arming the same leases.
           let ok = false;
           await queueScanOp(async () => {
-            ok = startAlignNow();
-            if (!ok) report("mirror-link", "auto align: not ready", "warning");
+            ok = startVergenceNow();
+            if (!ok)
+              report(
+                "mirror-link",
+                `auto vergence refused: ${vergenceBlocked ?? "not ready"}`,
+                "warning",
+              );
           });
           return ok;
         },
-        async stopAlign() {
-          await queueScanOp(async () => stopAlignNow());
+        async stopVergence() {
+          await queueScanOp(async () => stopVergenceNow());
+        },
+        async holdDof(held) {
+          dofHeld = held;
+          if (!held) seedDofFromState();
         },
         async startScan() {
           if (scanActive) return true;

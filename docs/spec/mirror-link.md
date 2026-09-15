@@ -11,56 +11,86 @@ the user manual. Code carries tight one-line pointers to these anchors.
 ## Targeting {#targeting}
 
 The scan CENTER is always whatever `steer` last set: a wide-view drag pixel, converted
-server-side via `undistort.angular` into the wide angular frame (`A0`, radians).
-Uncalibrated → `A0 = {0,0}` and origin volts. There is no tracker, no set-points, no
-programmatic angle mode.
+server-side via `undistort.angular` (= `conv.P2A.C(px, false)`) into the wide angular
+frame (`A0`, radians). Uncalibrated → `A0 = {0,0}` and origin volts. There is no tracker
+and no programmatic angle mode.
 
-`centerAngles()` solves the per-eye angles from the ONE center:
-`inverseTriangulate(A0, baseline, distance, radians(shift))` where
-`distance = vergeToDistance(verge, baseline)` (∞ at `verge = 0`) — manual-control's own
-pair of mirror controls, with the same meaning: Verge Distance sets the depth both eyes
-converge on, Vertical Shift (degrees, ±0.5°, persisted) is the toe that raises L and lowers
-R by `s`. `A2V` per eye turns angles into volts. Both apply identically whether or not the
-scan is active — they move the ring's center, never its shape.
+**One pose chain.** `anglesAt(offset)` solves the per-eye angles from the ONE center:
 
-### Auto align {#auto-align}
+    ray   = A0 + pan + offset
+    angles = inverseTriangulate(ray, baseline, vergeToDistance(verge, baseline), v_shift)
 
-A SERVO, not a one-shot (the marker-servo idiom: measurement node → PID nodes → applied
-command, stepped at the MEASUREMENT rate, never per tick). `startAlign`/`stopAlign` are
-COMMANDS — session-local intent like the scan — and `telemetry.align` is non-null exactly
-while engaged.
+`A2V` per eye turns them into volts. At `offset = 0` this IS `followTarget`'s forward map
+(`@lib/vergence`) — the auto-vergence loop's output and the scan ride the SAME chain, which
+is why `scan_path` stays the exact commanded ring and why the orbit brick's Jacobian is a
+finite difference of this one function (§actuation). `mirror-link-vergence.test.ts` pins
+both facts.
 
-**Measurement.** A `spot` vision kernel (`spot-kernel.ts`, node `win/mirror-link/spot`)
-over the two RAW convert pipes: per frame per eye it runs `findSpot` — `brightestSpot` on
-a 2× decimated scan, then a refine in a 32 px window (full-resolution fallback for a dot
-the decimation brackets) — and emits `{x, y, peak} | null`. Built and disposed exactly like
-the ring node (pipes → wiring → worker, LIFO), existing only while the servo is engaged.
+**Where the DOF live.** `{pan, verge, v_shift}` come from the loop's integrators while
+auto vergence is ENGAGED and from the drawer sliders while it is off (`pan` is 0 there).
+Verge Distance sets the depth both eyes converge on (∞ at `verge = 0`); Vertical Shift is
+the toe that raises L and lowers R. Both slider ranges ARE the corresponding controller's
+saturation limits (`VERGE_MIN_DISTANCE_MM`, `VSHIFT_LIMIT_DEG` from `@lib/vergence/tuning`)
+so the two authorities can never disagree. They move the ring's centre, never its shape,
+scanning or not.
 
-**Control.** Two PID nodes (`win/mirror-link/pid/L`, `…/R`), each holding a `PID2D` — the
-four controllers (L.x, L.y, R.x, R.y) share `state.pid_kp`/`pid_ki`/`pid_kd` and clamp
-each step to `state.pid_max_step_deg`. The gains are FLAT top-level state keys: the
-session client only emits `setState` from a top-level key's ref, so a nested object's
-fields would never reach the orchestrator. Per spot result: the eye's angular error is
-`spotOffsetAngle(spot, c, f)` against `deriveFoveaIntrinsics(und, desiredAngle, 1)`; the
-controller's velocity-form output is added to that eye's DESIRED angle. `dt` comes from the
-result arrival times (clamped to 0.5 s).
+### Auto vergence {#auto-vergence}
 
-**Application is COLLECTIVE by construction**: every step runs
-`solveAlignment(desiredL, desiredR, baseline)` and writes the gaze ray (`target`,
-`target_angle`), `verge` (clamped 0–1; ∞ ⇒ 0) and `shift` (clamped to the slider range)
-TOGETHER — the two eyes cannot walk apart.
+The SAME fovea-into-wide template-match loop Disparity Scope runs — one control law, one
+tuning surface, one set of hold semantics, hoisted to `@lib/vergence/` so neither app
+imports across module boundaries. Read
+[disparity-scope §match-join](./disparity-scope.md#match-join) and
+[§control-law](./disparity-scope.md#control-law) (with
+[§capture-epoch-target](./disparity-scope.md#capture-epoch-target),
+[§derivative-on-measurement](./disparity-scope.md#derivative-on-measurement) and
+[§seed-space](./disparity-scope.md#seed-space)) for the law itself; only the differences
+are spelled out here.
 
-A blind eye HOLDS (no step); its integrator resets after 10 consecutive misses, so a
-blackout cannot wind it up. Both eyes blind for 2 s sets `align.reason` and the servo stays
-engaged. The servo works WHILE SCANNING (a ring's bright-pixel centroid is its center), so
-there is no scan gating; it only reads pipes, so capture and recording are independent of
-it. Engage needs `ready`; both commands ride the scan op chain so they cannot interleave
-with a start/stop. Idle disengages.
+**Nodes** (all under `win/mirror-link`, built on ENGAGE and disposed on disengage — the
+ring-reader's on-demand shape, not disparity-scope's always-on one):
 
-RIG-GATED: the pixel→angle SIGN is `SPOT_TO_ANGLE_SIGN` in `align.ts`, defaulting to
-`{+1, +1}` — the same pinhole convention split-tracking's `eyeJInv` uses. Inverted for this
-mounting, the loop DIVERGES and `align.error_deg` grows; flipping the axis there is the
-whole fix.
+| node | what |
+| --- | --- |
+| `camera/<C>/undistort/slice/vergence-strip` | target-centred match strip off the C undistort, re-steered on every `steer` |
+| `…/slice/vergence-strip/scale/match` | the strip at the match scale `s` |
+| `camera/<L\|R>/convert/scale/vergence-needle` | each RAW fovea at `foveaTileSize` |
+| `win/mirror-link/match/L`, `…/R` | the two template-match workers |
+| `win/mirror-link/pid` | the join + the three DOF controllers |
+
+The needle source is the RAW convert pipe, never a homography-undistorted one
+([§needle-geometry](./disparity-scope.md#needle-geometry)) — which is why this app needs no
+homography pipes at all (disparity-scope's exist for its stereo/composite views, not for
+the match).
+
+**Magnification.** No zoom knob here, so the resolution order starts one tier down: the
+triple's stored `zoom_override`, then the calibration-measured fovea↔wide ratio, then 1
+([§magnification](./disparity-scope.md#magnification)).
+
+**Holds.** `hold: match low score` and `hold: match stale` are the shared ones. The one
+app-specific hold is `paused: scanning`: while the scan runs each fovea frame is a RING,
+not the dot the needle was cut from, so a step would servo on noise — the integrators keep
+their values and the loop resumes the moment the scan stops. Engagement is allowed at any
+time, scanning or not.
+
+**Seams with the sliders.** On ENGAGE the controllers are seeded with `seedVergence` from
+the current commanded ANGLES (never a volts round-trip —
+[§seed-space](./disparity-scope.md#seed-space)); with `pan = 0` and the sliders as the only
+authority, that reconstruction reproduces the held pose exactly. While engaged the
+integrated `verge`/`v_shift` are mirrored into `state.verge`/`state.shift` at ~10 Hz so the
+sliders show the result. A MANUAL slider write (one that differs from the mirror) re-seeds
+that one controller; a `steer` re-references the loop by resetting `pan` to 0 (the new ray
+is the new intent) and re-steering the strip. On DISENGAGE the mirror is flushed and `pan`
+— which has no slider — folds into `target`/`target_angle`, so the disengaged chain
+reproduces the engaged pose bit-for-bit and the mirrors hold.
+
+**Telemetry.** `vergence_status` (`off` / `tracking` / `paused: scanning` / `hold: …` /
+`no calibration`), `vergence_blocked` (the refusal reason, the `scan_blocked` shape — the
+status reads `off — refused` with it in the hover, not only a tray toast), and
+`match_left`/`match_right` as `{rect, score}` in ABSOLUTE wide px, which the wide view draws
+as hollow per-eye markers while engaged: a `hold: match low score` then SHOWS what was
+matched instead of leaving it inferred. The per-side correlation HEATMAPS are not emitted —
+this app has no debugger window, so computing them would be wasted work — and no frame size
+is published: the wide pipe payload already carries it.
 
 ## Ring views {#ring-views}
 
@@ -229,7 +259,8 @@ the 30 Hz telemetry throttle reads as random flicker, not motion), and
 `SCAN_PATH_SAMPLES` (48) points per eye through the pacer's own chain (offset →
 `inverseTriangulate` + shift → `A2V`), which the renderer closes into a loop and draws with
 `Line2D` (faint idle, solid while active). It is republished on every input that moves or
-reshapes the ring (steer, `scan_amp`, `verge`, `baseline`, `shift`, auto align, activation) and
+reshapes the ring (steer, `scan_amp`, `verge`, `baseline`, `shift`, a vergence step's
+write-back, activation) and
 NEVER per tick; empty without a leased triple. PosViews are read-only here (no split).
 
 Below the center tile: ONE button whose label swaps Start Scan / Stop Scan (the row is a
@@ -243,13 +274,29 @@ detail (and the blocked reason) in its `title` hover. The row is a PLAIN div, ne
 `<label>`/ConfigEntry: a label would forward a status-span click to the button and
 toggle the hardware override; the button's own explanation rides the ROW's `title`
 (a disabled button suppresses hover). The drawer carries THREE columns (a nested
-`HorizontalDivision`, ≈ 0.26 / 0.31 / 0.43 — the right column holds the most rows and the
-longest strings): the mirror controls (Verge Distance, Vertical Shift) left; the servo in
-the middle — the Align PID group (one range/step across Kp/Ki/Kd, a reset in its heading)
-and the Auto Align toggle with its error readout; and Gain, the scan sliders (frequency,
+`HorizontalDivision`, ≈ 0.26 / 0.31 / 0.43 — the MIDDLE and RIGHT columns carry the most
+rows, the right the longest strings): the mirror controls (Verge Distance, Vertical Shift)
+left; the vergence loop in the middle — the Auto Vergence toggle with its status FIRST
+(the thing you press and the thing you read, above the knobs that tune them), then the
+SHARED tuning block (Pan / Depth / Vertical PID groups, each with a one-line hover on its
+heading and a `faArrowRotateLeft` reset, plus Min Match Score) — the SAME groups, keys,
+defaults, ranges, per-term hovers and reset glyph as Disparity Scope's, out of
+`@lib/vergence/tuning`; and Gain, the scan sliders (frequency,
 amplitude), the Ring Reader toggle and a Status row right, Gain leading because it is
 session-wide, not scan-scoped. The §ring-views strips are NOT in the drawer — they live
 under the center tile.
+
+One STATUS vocabulary across the drawer, scan and vergence alike: `muted` = nothing
+running, `ok` = healthy, `warn` = the operator must look, with a `dim` modifier on `ok` for
+a deliberate, expected pause (`paused: scanning`). The Verge/Shift sliders are never
+DISABLED while the loop drives them — they read as loop-owned (`--accent-bright`) and a
+drag hands the loop a new starting point; `holdDof` suspends the write-back for the length
+of the drag so a fully-controlled slider cannot be yanked out from under the pointer, and
+the release re-seeds both controllers from the final values. The release is caught on
+WINDOW `pointerup`/`pointercancel`, not on the wrapper: RangeSlider tracks its drag through
+a window listener and never captures the pointer, so a release outside the slider would
+otherwise leave the hold latched. The disengage flush forces the write-back past the hold,
+so a stuck hold can never make the pose jump.
 Every slider carries a one-sentence `title`. Gain alone declares NO `neutral` — a stray
 right-click must never slam a live camera to range-min, and its `title` says so — and it
 is disabled (readout `—`) until `ready` with a non-degenerate `gain_range`; its `v-model`
@@ -275,12 +322,12 @@ node badge through `registerNativeProbe`.
 **What JS pushes.** Only the LINEARIZATION, never a per-tick pose:
 
 - `setPose({ centerL, centerR, jL, jR })` on every input that moves or reshapes the ring
-  (steer, verge, shift, baseline, an auto-align servo step, activation) — it rides
+  (steer, verge, shift, baseline, a vergence step, activation) — it rides
   `publishScanGeometry()`, which those inputs already call. `centerL`/`centerR` are
   `centerVolts()`; `jL`/`jR` are the row-major 2×2 finite difference of
   `voltsFor(anglesAt(offset))` around offset 0 (±1e-3 rad), i.e. volts per radian.
-- `setOrbit({ ampRad, hz, enabled })` on scan start/stop and on a live `scan_amp`/`scan_hz`
-  change.
+- `setOrbit({ ampRad, hz, paceHz, enabled })` on scan start/stop and on a live
+  `scan_amp`/`scan_hz`/`orbit_pace_hz` change.
 
 **What the brick commands.** `v = slew(center) + J · amp · (cos φ, sin φ)` per eye at
 1 kHz. The emitted circle is therefore the LINEARIZED chain — exact to first order in the
@@ -377,11 +424,15 @@ recording drain and the lease release.
 Resource-scope defers, registered in REVERSE of the drain (LIFO): stop the pacer FIRST →
 release the volt link → close the native position input → release the orbit brick →
 `stopScan` (exposure restore on the live leases) + the gain restore → `triple = null` /
-`ready: false` → await the recording drain → dispose the ring node if one exists
-(worker → wiring → its L/R pipes) → retire the C undistort producer + drop the serial
-taps → release the leases LAST. The ring node's pipes are the session's ONLY pipe
-connections (the renderer binds every view, the recorder node connects its own raw
-pipes).
+`ready: false` → await the recording drain → dispose the vergence loop if engaged (both
+match workers → the pid node → wiring → its pipe connections → the needle/strip scale and
+slice producers) → dispose the ring node if one exists (worker → wiring → its L/R pipes) →
+retire the C undistort producer + drop the serial taps → release the leases LAST. The ring
+node's and the vergence loop's pipes are the session's ONLY pipe connections (the renderer
+binds every view, the recorder node connects its own raw pipes). Disengaging the loop
+FLUSHES its integrated `verge`/`v_shift` into the sliders and folds `pan` into the target
+ray first, so the pose the mirrors hold is bit-identical across the transition
+(§auto-vergence).
 
 ## Rig pass {#rig}
 

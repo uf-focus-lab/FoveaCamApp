@@ -10,6 +10,7 @@
 
 import type { Point2d } from "core/Geometry";
 import { inverseTriangulate } from "@lib/stereo";
+import { VSHIFT_LIMIT_DEG } from "@lib/vergence/tuning";
 
 /** Scan frequency slider range (Hz) — the UI, the contract default, and the
  *  exposure override all read this one pair. */
@@ -18,8 +19,13 @@ export const SCAN_HZ_RANGE = { min: 1, max: 100 } as const;
 /** Scan amplitude (ring RADIUS) slider range, in degrees. */
 export const SCAN_AMP_RANGE = { min: 0, max: 2 } as const;
 
-/** Vertical-shift slider range, in degrees (symmetric about 0). */
-export const SHIFT_RANGE_DEG = { min: -0.5, max: 0.5 } as const;
+/** Vertical-shift slider range, in degrees (symmetric about 0). The slider IS
+ *  the vergence loop's `v_shift` DOF, so its range is that controller's
+ *  saturation limit (spec §targeting). */
+export const SHIFT_RANGE_DEG = {
+  min: -VSHIFT_LIMIT_DEG,
+  max: VSHIFT_LIMIT_DEG,
+} as const;
 
 const DEG = Math.PI / 180;
 

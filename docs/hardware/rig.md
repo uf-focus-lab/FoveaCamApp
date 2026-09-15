@@ -74,12 +74,14 @@ Hardware-gated checks for the `mirror-link` app (spec
 - **Dashed-ring readout.** Point at a blinker of KNOWN frequency and confirm the
   on/off pattern along the ring matches it (count the dashes per revolution
   against `blink_hz / scan_hz`).
-- **Auto-align sign + convergence.** With the emitter in both fovea views, press
-  Auto Align and watch the per-eye error readout: it must FALL to ~0 within a
-  second or two. If it grows, `SPOT_TO_ANGLE_SIGN` in
-  `app/modules/mirror-link/align.ts` is inverted for this mounting (flip the
-  axis that diverges). Then nudge the emitter and confirm the servo re-centers
-  it, and that the ring stays put with the servo left on while scanning.
+- **Auto vergence convergence.** With the scan STOPPED and a textured target in
+  both fovea views, press Auto Vergence: the status must reach `tracking` and
+  Verge Distance / Vertical Shift must settle within a second or two (the same
+  loop and the same gains as Disparity Scope — compare them side by side if it
+  misbehaves). Then start the scan and confirm the status reads
+  `paused: scanning`, the ring stays put, and stopping the scan resumes
+  `tracking` from the same values. Finally press Stop Vergence and confirm the
+  mirrors do NOT move and the two sliders hold what the loop reached.
 - **Capture a ring frame.** With the emitter running, press the capture button and
   save. Confirm both fovea images show the un-straightened ring, and that the
   `.json` beside them carries a `mirror_link` block with the scan timing and the

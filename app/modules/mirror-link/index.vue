@@ -5,13 +5,13 @@ You may find the full license in project root directory.
 --------------------------------------------------- -->
 <!--
   MirrorLink — a thin client over the `mirror-link` session: drag the wide view
-  to place the scan center, fine-align with verge/shift (or Auto Align), and run
+  to place the scan center, converge with verge/shift (or Auto Vergence), and run
   a circular scan whose per-frame exposure spans one revolution. Renders frames,
   overlays telemetry, drives state; no core / camera / calibration access.
   Behavior spec: docs/spec/mirror-link.md.
 -->
 <script setup lang="ts">
-import { computed, ref, shallowRef, watch } from "vue";
+import { computed, onUnmounted, ref, shallowRef, watch } from "vue";
 import type { Rect } from "core/Geometry";
 import type { Pos } from "@lib/controller-codec";
 import { ROLE, THEME } from "@lib/camera-config";
@@ -25,12 +25,20 @@ import PosView from "@src/components/PosView.vue";
 import Line2D from "@src/components/Line2D.vue";
 import FrameCursor from "@src/components/FrameCursor.vue";
 import RangeSlider from "@src/inputs/range-slider.vue";
+import { FontAwesomeIcon as Icon } from "@fortawesome/vue-fontawesome";
+import { faArrowRotateLeft } from "@fortawesome/free-solid-svg-icons";
 import SingleSelect, {
   type SingleSelectOption,
 } from "@src/inputs/single-select.vue";
 import Drawer from "@src/components/Drawer.vue";
 import HorizontalDivision from "@src/layouts/HorizontalDivision.vue";
-import { vergeToDistance } from "@lib/stereo";
+import { distanceToVerge, vergeToDistance } from "@lib/stereo";
+import {
+  DEFAULT_VERGENCE_TUNING,
+  VERGE_MIN_DISTANCE_MM,
+  type Gains,
+  type VergenceTuning,
+} from "@lib/vergence/tuning";
 import RingOverlay from "./RingOverlay.vue";
 import RingHistogram from "./RingHistogram.vue";
 import { ringGeometry, strokeFor } from "./overlay";
@@ -61,7 +69,8 @@ const frameC = usePipeFrame(
     (state.serials?.C ? nodeId.convert(state.serials.C) : null),
 );
 
-// Overlay geometry comes from the wide payload itself (no telemetry.size).
+// Overlay geometry comes from the wide payload itself — the session never
+// publishes a frame size, the pipe already carries it.
 const size = computed(() => ({
   width: frameC.value?.shape[1] ?? 0,
   height: frameC.value?.shape[0] ?? 0,
@@ -162,7 +171,7 @@ const scanStatus = computed<{ text: string; tone: string; title: string }>(
         };
       return {
         text,
-        tone: "",
+        tone: "ok",
         title:
           `Each fovea frame integrates one full ${ms(t.period_us)} ms revolution` +
           (rate.sinkHz > 0
@@ -214,91 +223,176 @@ const scanHint = computed(() => {
     ? "Stop the scan and restore both fovea cameras' exposure settings."
     : "Start the circular scan and override both fovea cameras so one frame spans one revolution.";
 });
-// --- auto-align servo (spec §targeting) -------------------------------------
-// A closed loop, not a one-shot: engage it and the mirrors keep the emitter at
-// both fovea centers, rewriting Verge Distance + Vertical Shift every step.
-const engaged = computed(() => telemetry.align?.engaged === true);
-const aligning = ref(false);
-async function toggleAlign(): Promise<void> {
-  if (aligning.value) return;
-  aligning.value = true;
+// --- auto vergence (spec §targeting) ----------------------------------------
+// The SAME fovea-into-wide template-match loop Disparity Scope runs: engage it
+// and the two foveas converge on whatever the wide view is aimed at, driving
+// Verge Distance + Vertical Shift as they go.
+const engaged = computed(() => state.auto_vergence);
+const verging = ref(false);
+async function toggleVergence(): Promise<void> {
+  if (verging.value) return;
+  verging.value = true;
   try {
-    if (engaged.value) await session.call("stopAlign", undefined);
-    else await session.call("startAlign", undefined);
+    if (engaged.value) await session.call("stopVergence", undefined);
+    else await session.call("startVergence", undefined);
   } finally {
-    aligning.value = false;
+    verging.value = false;
   }
 }
-const alignHint = computed(() =>
+// A Verge/Shift slider is under the pointer: the loop's 10 Hz write-back must
+// not yank a fully-controlled knob mid-drag (spec §targeting). RangeSlider
+// tracks the drag on a WINDOW listener and never captures the pointer, so the
+// release can land anywhere on screen — listen for it where it will arrive.
+let dofHeld = false;
+function releaseDof(): void {
+  if (!dofHeld) return;
+  dofHeld = false;
+  window.removeEventListener("pointerup", releaseDof);
+  window.removeEventListener("pointercancel", releaseDof);
+  void session.call("holdDof", false);
+}
+function holdDof(): void {
+  if (dofHeld) return;
+  dofHeld = true;
+  window.addEventListener("pointerup", releaseDof);
+  window.addEventListener("pointercancel", releaseDof);
+  void session.call("holdDof", true);
+}
+onUnmounted(releaseDof);
+/** While the loop drives them, the two DOF sliders read as loop-owned — never
+ *  disabled: a drag hands the loop a new starting point. */
+const dofSliderColor = computed(() =>
+  engaged.value ? "var(--accent-bright)" : "currentColor",
+);
+const DOF_SLIDER_TITLE =
+  "Auto Vergence drives this; drag to hand it a new starting point — " +
+  "the loop carries on from there.";
+
+const vergenceHint = computed(() =>
   !telemetry.ready
     ? "Waiting for the camera triple to be leased."
     : engaged.value
-      ? "Stop the servo — the mirrors hold where they are."
-      : "Track the emitter: both foveas are driven onto it and kept there, " +
-        "rewriting Verge Distance and Vertical Shift as they go.",
+      ? "Stop the loop — the mirrors hold the verge and shift it reached."
+      : "Converge both foveas on the wide view's target by matching each fovea " +
+        "into the wide frame, driving Verge Distance and Vertical Shift.",
 );
-/** Metres, exactly as the Verge Distance readout writes them. */
-const metres = (mm: number | null): string =>
-  mm !== null && Number.isFinite(mm) ? `${(mm / 1000).toFixed(4)}m` : "∞";
-const fmtErr = (e: { x: number; y: number } | null) =>
-  e ? `${e.x.toFixed(2)},${e.y.toFixed(2)}°` : "—";
 
-const alignStatus = computed<{ text: string; tone: string; title: string }>(
+const vergenceStatus = computed<{ text: string; tone: string; title: string }>(
   () => {
-    const a = telemetry.align;
-    if (!a) return { text: "off", tone: "", title: alignHint.value };
-    if (a.reason)
+    const text = telemetry.vergence_status;
+    const reason = telemetry.vergence_blocked;
+    if (!engaged.value)
+      return reason
+        ? { text: "off — refused", tone: "warn", title: reason }
+        : { text: "off", tone: "muted", title: vergenceHint.value };
+    const score = (m: { score: number } | null): string =>
+      m ? m.score.toFixed(2) : "—";
+    const scores = `L ${score(telemetry.match_left)} · R ${score(telemetry.match_right)}`;
+    const min = `(min ${state.tuning.min_score.toFixed(2)})`;
+    if (text === "tracking")
+      return { text, tone: "ok", title: `Match confidence ${scores} ${min}.` };
+    if (text === "paused: scanning")
       return {
-        text: a.reason,
-        tone: "warn",
-        title: `${a.reason} — the servo is engaged but blind; steer closer or raise Gain.`,
+        text,
+        // Its own tone: a deliberate, expected pause — not a fault, not "off".
+        tone: "ok dim",
+        title:
+          "Held while the scan runs: each fovea frame is a RING, not the patch the " +
+          "match needs. Stop the scan to converge, then start it again.",
       };
-    const text = `L ${fmtErr(a.error_deg.L)} · R ${fmtErr(a.error_deg.R)}`;
-    return {
-      text,
-      tone: "ok",
-      title:
-        `${text} residual per eye. Applied ${metres(a.applied?.distance_mm ?? null)}, ` +
-        `shift ${plusSign((a.applied?.shift_deg ?? 0).toFixed(2))}°. ` +
-        "If the error GROWS, the pixel→angle sign is inverted for this rig.",
-    };
+    if (text === "no calibration")
+      return {
+        text,
+        tone: "warn",
+        title:
+          "The wide camera has no undistort calibration, so the loop has no " +
+          "pixel→angle map to steer with. Calibrate it first.",
+      };
+    return { text, tone: "warn", title: `${text} — match confidence ${scores} ${min}.` };
   },
 );
 
-/** The three gain terms, one range/step/precision across them (the
- *  disparity-scope PID block's shape). */
-const PID_DEFAULTS = { kp: 0.5, ki: 0.05, kd: 0 } as const;
-const pidTerms = computed(() => [
-  {
-    label: "Kp",
-    value: state.pid_kp,
-    neutral: PID_DEFAULTS.kp,
-    set: (v: number) => (state.pid_kp = v),
-    title:
-      "Proportional gain: how much of the measured angular error the servo corrects each step.",
-  },
-  {
-    label: "Ki",
-    value: state.pid_ki,
-    neutral: PID_DEFAULTS.ki,
-    set: (v: number) => (state.pid_ki = v),
-    title:
-      "Integral gain: removes the steady-state offset the proportional term leaves behind.",
-  },
-  {
-    label: "Kd",
-    value: state.pid_kd,
-    neutral: PID_DEFAULTS.kd,
-    set: (v: number) => (state.pid_kd = v),
-    title: "Derivative gain: damps overshoot; leave at 0 unless the servo rings.",
-  },
-]);
-function resetPid(): void {
-  state.pid_kp = PID_DEFAULTS.kp;
-  state.pid_ki = PID_DEFAULTS.ki;
-  state.pid_kd = PID_DEFAULTS.kd;
-  state.pid_max_step_deg = 0.2;
+// --- the shared vergence tuning block (identical to Disparity Scope) ---------
+type GainKey = "pan" | "depth" | "v_shift";
+function setTuning<K extends keyof VergenceTuning>(
+  key: K,
+  value: VergenceTuning[K],
+): void {
+  state.tuning = { ...state.tuning, [key]: value };
 }
+function gainRef(key: GainKey, idx: 0 | 1 | 2) {
+  return computed<number>({
+    get: () => state.tuning[key][idx],
+    set: (v) => {
+      const next = [...state.tuning[key]] as Gains;
+      next[idx] = v;
+      setTuning(key, next);
+    },
+  });
+}
+function resetGain(key: GainKey): void {
+  setTuning(key, [...DEFAULT_VERGENCE_TUNING[key]] as Gains);
+}
+const gainGroups = [
+  {
+    key: "pan" as const,
+    title: "Pan PID",
+    hint: "Common-mode aim: how the PAIR is centred on the wide-view target.",
+    range: [0, 1] as const,
+    step: 0.01,
+  },
+  {
+    key: "depth" as const,
+    title: "Depth PID",
+    hint: "Convergence distance: nulls the horizontal disparity between the foveas.",
+    range: [0, 10] as const,
+    step: 0.02,
+  },
+  {
+    key: "v_shift" as const,
+    title: "Vertical PID",
+    hint: "Vertical toe: nulls the residual vertical disparity between the foveas.",
+    range: [0, 1] as const,
+    step: 0.01,
+  },
+].map((g) => ({
+  ...g,
+  terms: [gainRef(g.key, 0), gainRef(g.key, 1), gainRef(g.key, 2)] as const,
+}));
+/** kp / ki / kd, in order — one label + hover per term, across all three
+ *  groups (the Disparity Scope block's shape). */
+const GAIN_LABELS = ["Kp", "Ki", "Kd"] as const;
+const GAIN_TITLES = [
+  "Proportional gain: how much of the measured error this DOF corrects each step.",
+  "Integral gain: removes the steady-state offset the proportional term leaves behind.",
+  "Derivative gain: damps overshoot; leave at 0 unless the loop rings.",
+] as const;
+const minScore = computed<number>({
+  get: () => state.tuning.min_score,
+  set: (v) => setTuning("min_score", v),
+});
+/** The matched fovea centres in ABSOLUTE wide px, one marker per side that
+ *  reported a match this activation. */
+const matchMarkers = computed(() =>
+  (
+    [
+      { side: "L" as const, m: telemetry.match_left, color: THEME.L },
+      { side: "R" as const, m: telemetry.match_right, color: THEME.R },
+    ] as const
+  )
+    .filter((e) => e.m !== null)
+    .map((e) => ({
+      side: e.side,
+      color: e.color,
+      x: e.m!.rect.x + e.m!.rect.width / 2,
+      y: e.m!.rect.y + e.m!.rect.height / 2,
+    })),
+);
+
+/** The verge slider's near end IS the controller's saturation limit. */
+const vergeLimit = computed(() =>
+  distanceToVerge(VERGE_MIN_DISTANCE_MM, state.baseline),
+);
 
 // --- ring histogram views (spec §ring-views) --------------------------------
 const RING_VIEW_OPTIONS: readonly SingleSelectOption<
@@ -507,6 +601,22 @@ const statusR = computed(() => ringStatus("R"));
             :stroke-width="stroke"
           />
         </template>
+        <!-- Where each fovea was MATCHED into the wide view while the loop runs
+             (spec §targeting): a `hold: match low score` still shows what it
+             found, so a wrong lock is visible instead of inferred. -->
+        <template v-if="engaged">
+          <circle
+            v-for="m in matchMarkers"
+            :key="m.side"
+            :cx="m.x"
+            :cy="m.y"
+            :r="stroke * 1.5"
+            fill="none"
+            :stroke="m.color"
+            :stroke-width="stroke"
+            :stroke-dasharray="stroke * 2"
+          />
+        </template>
         <FrameCursor
           :cursor="{
             ...telemetry.target,
@@ -525,7 +635,7 @@ const statusR = computed(() => ringStatus("R"));
         <button
           class="scan-button"
           :class="{ on: scanning, busy }"
-          :disabled="!telemetry.ready || busy || aligning"
+          :disabled="!telemetry.ready || busy || verging"
           @click="toggleScan"
         >
           {{ scanning ? "Stop Scan" : "Start Scan" }}
@@ -615,8 +725,10 @@ const statusR = computed(() => ringStatus("R"));
     </div>
   </div>
   <Drawer v-model="drawer_height">
-    <!-- THREE columns (spec §views): mirror controls · servo + ring views ·
-         scan. A nested split rather than a new layout component. -->
+    <!-- THREE columns (spec §views): mirror controls · the vergence loop (its
+         toggle + status, then the shared tuning block) · scan. The ring views
+         live under the center tile, not here. A nested split rather than a new
+         layout component. -->
     <HorizontalDivision
       :division="0.26"
       class="fill"
@@ -625,37 +737,44 @@ const statusR = computed(() => ringStatus("R"));
     >
       <template #left>
         <div class="options fill">
-          <RangeSlider
-            v-model="state.verge"
-            title="Depth both foveas converge on — far end is ∞ (parallel gaze). Right-click resets to neutral."
-            :min="1"
-            :max="0"
-            :neutral="0"
-            :step="0.01"
-          >
-            <span>Verge Distance</span>
-            <span>
-              <template v-if="distance !== Infinity">
-                {{ (distance / 1000).toFixed(4) }}m
-              </template>
-              <template v-else> &#x221E; </template>
-            </span>
-          </RangeSlider>
-          <RangeSlider
-            v-model="state.shift"
-            title="Vertical toe between the foveas: raises the LEFT eye and lowers the RIGHT by this much. Right-click resets to neutral."
-            :min="SHIFT_RANGE_DEG.min"
-            :max="SHIFT_RANGE_DEG.max"
-            :neutral="0"
-            :step="0.01"
-          >
-            <span>Vertical Shift</span>
-            <span>{{ plusSign(state.shift.toFixed(2)) }}&deg;</span>
-          </RangeSlider>
+          <!-- Both DOF sliders belong to the vergence loop while it runs: the
+               pointer takes the write-back offline for the length of the drag
+               (`holdDof`) and hands the loop the final value on release. -->
+          <div @pointerdown="holdDof">
+            <RangeSlider
+              v-model="state.verge"
+              :title="`Depth both foveas converge on — far end is ∞ (parallel gaze). ${DOF_SLIDER_TITLE} Right-click resets to neutral.`"
+              :min="vergeLimit"
+              :max="0"
+              :neutral="0"
+              :step="0.01"
+              :color="dofSliderColor"
+            >
+              <span>Verge Distance</span>
+              <span>
+                <template v-if="distance !== Infinity">
+                  {{ (distance / 1000).toFixed(4) }}m
+                </template>
+                <template v-else> &#x221E; </template>
+              </span>
+            </RangeSlider>
+            <RangeSlider
+              v-model="state.shift"
+              :title="`Vertical toe between the foveas: raises the LEFT eye and lowers the RIGHT by this much. ${DOF_SLIDER_TITLE} Right-click resets to neutral.`"
+              :min="SHIFT_RANGE_DEG.min"
+              :max="SHIFT_RANGE_DEG.max"
+              :neutral="0"
+              :step="0.01"
+              :color="dofSliderColor"
+            >
+              <span>Vertical Shift</span>
+              <span>{{ plusSign(state.shift.toFixed(2)) }}&deg;</span>
+            </RangeSlider>
+          </div>
         </div>
       </template>
       <template #right>
-        <!-- Nested split: the PID/servo column, then the scan column. -->
+        <!-- Nested split: the vergence column, then the scan column. -->
         <HorizontalDivision
           :division="0.42"
           class="fill"
@@ -664,56 +783,63 @@ const statusR = computed(() => ringStatus("R"));
         >
           <template #left>
             <div class="options fill">
-              <h4>
-                <span>Align PID</span>
-                <button class="reset" title="Reset to defaults" @click="resetPid">
-                  ↺
-                </button>
-              </h4>
-              <RangeSlider
-                v-for="term in pidTerms"
-                :key="term.label"
-                :model-value="term.value"
-                @update:model-value="term.set($event)"
-                :title="term.title"
-                :min="0"
-                :max="1"
-                :neutral="term.neutral"
-                :step="0.01"
-              >
-                <span>{{ term.label }}</span>
-                <span>{{ term.value.toFixed(2) }}</span>
-              </RangeSlider>
-              <RangeSlider
-                v-model="state.pid_max_step_deg"
-                title="Largest angle each controller may add per measurement — the servo's slew limit."
-                :min="0.01"
-                :max="1"
-                :neutral="0.2"
-                :step="0.01"
-              >
-                <span>Max Step</span>
-                <span>{{ state.pid_max_step_deg.toFixed(2) }}&deg;</span>
-              </RangeSlider>
-              <!-- The servo toggle: one button whose label swaps, styled like
-                   Start/Stop Scan (spec §targeting). -->
-              <div class="align-row" :title="alignHint">
+              <!-- The loop toggle + its status FIRST: the thing you press and
+                   the thing you read, above the knobs that tune them. -->
+              <div class="vergence-row" :title="vergenceHint">
                 <button
-                  class="align-button"
-                  :class="{ on: engaged, busy: aligning }"
-                  :disabled="!telemetry.ready || aligning"
-                  @click="toggleAlign"
+                  class="vergence-button"
+                  :class="{ on: engaged, busy: verging }"
+                  :disabled="!telemetry.ready || verging"
+                  @click="toggleVergence"
                 >
-                  {{ engaged ? "Stop Align" : "Auto Align" }}
+                  {{ engaged ? "Stop Vergence" : "Auto Vergence" }}
                 </button>
                 <span
-                  class="align-status"
-                  :class="alignStatus.tone"
-                  :title="alignStatus.title"
+                  class="vergence-status"
+                  :class="vergenceStatus.tone"
+                  :title="vergenceStatus.title"
                 >
-                  {{ alignStatus.text }}
+                  {{ vergenceStatus.text }}
                 </span>
               </div>
+              <!-- The shared vergence tuning block — the same groups, keys,
+                   defaults, ranges and hovers as Disparity Scope's. -->
+              <template v-for="g in gainGroups" :key="g.key">
+                <h4 :title="g.hint">
+                  <span>{{ g.title }}</span>
+                  <button
+                    class="reset"
+                    title="Reset to defaults"
+                    @click="resetGain(g.key)"
+                  >
+                    <Icon :icon="faArrowRotateLeft" />
+                  </button>
+                </h4>
+                <RangeSlider
+                  v-for="(term, i) in g.terms"
+                  :key="i"
+                  v-model="term.value"
+                  :title="GAIN_TITLES[i]"
+                  :min="g.range[0]"
+                  :max="g.range[1]"
+                  :neutral="DEFAULT_VERGENCE_TUNING[g.key][i]"
+                  :step="g.step"
+                >
+                  <span>{{ GAIN_LABELS[i] }}</span>
+                  <span>{{ term.value.toFixed(2) }}</span>
+                </RangeSlider>
+              </template>
+              <RangeSlider
+                v-model="minScore"
+                title="Minimum match confidence the loop will steer on — below it the mirrors hold."
+                :min="0"
+                :max="1"
+                :neutral="DEFAULT_VERGENCE_TUNING.min_score"
+                :step="0.01"
+              >
+                <span>Min Match Score</span>
+                <span>{{ minScore.toFixed(2) }}</span>
+              </RangeSlider>
             </div>
           </template>
           <template #right>
@@ -930,7 +1056,11 @@ const statusR = computed(() => ringStatus("R"));
   }
 }
 
-.scan-status {
+// ONE status vocabulary across the drawer (scan + vergence): `muted` = nothing
+// running, `ok` = healthy, `warn` = the operator must look; `dim` rides `ok`
+// for a deliberate, expected pause.
+.scan-status,
+.vergence-status {
   font-family: var(--font-mono);
   // Confined to its grid cell so the declared ellipsis engages instead of
   // widening the row (and with it, the button's column).
@@ -939,8 +1069,12 @@ const statusR = computed(() => ringStatus("R"));
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  &.muted {
-    color: var(--text-muted);
+  color: var(--text-muted);
+  &.ok {
+    color: var(--text-bright);
+  }
+  &.dim {
+    opacity: 0.65;
   }
   &.warn {
     color: var(--warn);
@@ -993,19 +1127,20 @@ const statusR = computed(() => ringStatus("R"));
   }
 }
 
-// Auto Align: an ORDINARY control (Principles §5) — no solid fill, that is
+// Auto Vergence: an ORDINARY control (Principles §5) — no solid fill, that is
 // reserved for the primary/destructive scan action. Fixed track so the
-// "Aligning…" label swap never moves anything.
-.align-row {
+// label swap never moves anything.
+.vergence-row {
   display: grid;
-  grid-template-columns: 9em minmax(0, 1fr);
+  // 10.5em: "Stop Vergence" is 13 characters — a narrower track spills it.
+  grid-template-columns: 10.5em minmax(0, 1fr);
   align-items: center;
   gap: 1ch;
   font-size: 0.9em;
 
   // ONE running-toggle vocabulary app-wide: the same fills as Start/Stop Scan
   // — `--accent` idle, `--danger` while it runs.
-  .align-button {
+  .vergence-button {
     width: 100%;
     min-height: 2em;
     padding: 0.25em 1em;
@@ -1045,21 +1180,6 @@ const statusR = computed(() => ringStatus("R"));
     }
   }
 
-  .align-status {
-    font-family: var(--font-mono);
-    min-width: 0;
-    text-align: end;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    color: var(--text-muted);
-    &.ok {
-      color: var(--text-bright);
-    }
-    &.warn {
-      color: var(--warn);
-    }
-  }
 }
 
 .status-row {
