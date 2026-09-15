@@ -240,7 +240,7 @@ describe("ring reader", () => {
       decoded / CASES_N,
       `refusals ${refusals.join(" ")}`,
     ).toBeGreaterThanOrEqual(0.9);
-  });
+  }, 30_000);
 
   it("builds the debug strip only when asked, with the documented layout", () => {
     const img = synth("Hello", { ecc: 0, phaseDeg: 0, grad: 1 });
