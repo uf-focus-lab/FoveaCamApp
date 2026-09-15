@@ -143,6 +143,10 @@ export const mirrorLink = defineContract({
     perf: {
       actuateMs: { mean: 0, max: 0 } as Stat,
       tickGapMs: { mean: 0, max: 0 } as Stat,
+      // The native scan generator: whether it owns the wire, and its measured
+      // emit rate (~1 kHz). A rate that holds while `tickGapMs.max` spikes is
+      // the whole point of the brick.
+      orbit: { native: false as boolean, rateHz: 0 },
     },
     // Capture manifest telemetry (spec §capture); image data pulled via
     // `getCapturePreview`.

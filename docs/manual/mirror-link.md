@@ -215,6 +215,10 @@ frequency) first when you can.
 Note that the slider has no right-click reset: that would slam a live camera to
 its minimum gain mid-alignment.
 
+Dragging Gain — or changing the scan frequency, which rewrites both foveas'
+exposure — no longer disturbs a running scan: the circle is generated on its own
+thread, so the mirrors keep turning while the cameras are being written.
+
 ## Capturing a ring frame
 
 The title-bar camera button (or `Cmd/Ctrl-S`) grabs ONE full-depth shot — the left and

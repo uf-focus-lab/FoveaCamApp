@@ -3,7 +3,7 @@
 // This source code is licensed under the MIT license.
 // You may find the full license in project root directory.
 // -------------------------------------------------------
-import type { CoreObject, Stream } from "../types";
+import type { CoreObject, MirrorVolts, OutPort, Stream } from "../types";
 import type { CameraCalibration, Mat } from "core/Vision";
 import type { Rect } from "core/Geometry";
 import type { ProbeSnapshot } from "core/Pipe";
@@ -874,4 +874,53 @@ declare module "core/Aravis" {
     rightId: string,
     options?: PairStreamOptions,
   ): PairStreamHandle;
+
+  /** Orbit brick POSE: the linearization of the angle→volt chain around the
+   *  scan center. `jL`/`jR` are row-major 2×2 volts-per-radian
+   *  ([dVx/dox, dVx/doy, dVy/dox, dVy/doy]) — JS owns the calibration, so the
+   *  brick only ever adds `J · offset` to the (slewed) center. */
+  export interface OrbitPose {
+    centerL: { x: number; y: number };
+    centerR: { x: number; y: number };
+    jL: number[];
+    jR: number[];
+  }
+
+  /** Orbit brick PARAMETERS. Phase restarts at 0 on each disabled→enabled
+   *  transition and otherwise accumulates with the measured tick dt, so a live
+   *  `hz`/`ampRad` change never steps the ring. */
+  export interface OrbitParams {
+    /** Ring RADIUS in the wide angular frame (radians). */
+    ampRad: number;
+    /** Revolutions per second. */
+    hz: number;
+    enabled: boolean;
+  }
+
+  /**
+   * The NATIVE circular-scan generator: a 1 kHz paced thread emitting
+   * `v = slew(center) + J · amp · (cos φ, sin φ)` per eye, so a synchronous
+   * camera write on the JS event loop can no longer stall the scan. The center
+   * follows the latest `setPose` through the shared @lib/slew first-order
+   * approach (τ = 8 ms, ε-snap 5 mV) — the orbit offset itself is exact.
+   * While disabled the brick emits only while the slew still moves the pose,
+   * then goes quiet. `volt_out` pipes into the controller's native `pos_in`;
+   * the asyncIterator is the JS FALLBACK consumer.
+   */
+  export interface Orbit extends CoreObject<Orbit>, AsyncIterable<MirrorVolts> {
+    /** Push the center + Jacobian (steer, verge, shift, baseline, servo step).
+     *  The FIRST pose lands on the center directly — no swoop from the origin. */
+    setPose(pose: OrbitPose): void;
+    /** Push the orbit parameters (scan start/stop, live amplitude/frequency). */
+    setOrbit(params: OrbitParams): void;
+    /** Snapshot the brick's thread meter (inputs pose/orbit, output volt). */
+    probe(): ProbeSnapshot;
+    /** Typed final-volts OUT port — runtime tag `"volts"`. */
+    readonly volt_out: OutPort<MirrorVolts>;
+    /** Stop the paced thread and eject the subscribers. Idempotent. */
+    release(): void;
+  }
+
+  /** Create the orbit brick. `name` is the graph node id AND the meter name. */
+  export function createOrbitStream(name: string): Orbit;
 }

@@ -367,9 +367,25 @@ const manualControl = hub.add(
 // --- mirror-link: circular fovea scan with a one-revolution exposure --------
 // A stripped manual-control: owns the triple, steers from the center view, and
 // records the raw L/C/R streams — the same broker / undistort seam / raw-pipe
-// registry / compress seam its template receives.
+// registry / compress seam its template receives, plus the native circular-scan
+// brick (a paced volts producer for the controller's native pos_in, so a camera
+// write on this loop cannot stall the scan).
+const orbitSeam: import("./orbit-pipe.js").OrbitSeam = {
+  create: (name) =>
+    (
+      Aravis as unknown as {
+        createOrbitStream(n: string): import("./orbit-pipe.js").OrbitHandle;
+      }
+    ).createOrbitStream(name),
+};
 const mirrorLink = hub.add(
-  mirrorLinkSession(asBroker(Pipe), undistortSeam, rawPipes, compressSeam),
+  mirrorLinkSession(
+    asBroker(Pipe),
+    undistortSeam,
+    rawPipes,
+    orbitSeam,
+    compressSeam,
+  ),
 );
 
 // --- multi-fovea: protocol-v2 multi-target logic skeleton ------------------

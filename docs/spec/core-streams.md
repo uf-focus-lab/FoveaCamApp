@@ -108,3 +108,47 @@ a `noexcept ~Subscriber` → `std::terminate`). Closed by pairing with
 `~Stream` aborts if the producer thread is still joinable: the thread may call
 into derived-class virtuals, so derived destructors MUST call `shutdown()` before
 their own members are destroyed. Checked at the base to avoid hard-to-debug UAF.
+
+## OrbitStream {#orbit-stream}
+
+Source: `core/src/OrbitStream.cpp`, exported as `Aravis.createOrbitStream(name)`. The
+mirror-link circular scan as a native brick: a `Stream<VoltPair::Ptr>` producer on its own
+PACED thread, so no stall on the orchestrator's JS event loop (a synchronous camera write,
+an allocation) can hold the mirrors mid-revolution.
+
+Per eye, per tick:
+
+```
+v = slew(center) + J · amp · (cos φ, sin φ)
+φ += 2π · hz · dt
+```
+
+- **Pacing.** 1 kHz, `condition_variable::wait_until` on the steady clock (never a busy
+  spin; `close()` wakes it, so teardown never waits out a period). `dt` is MEASURED, so a
+  late tick lands at the correct phase rather than accumulating drift — the JS pacer's
+  wall-clock rule, natively. The 1 kHz is NOMINAL: wake latency puts the realized rate
+  around 900 Hz, which is deliberately left alone — the phase accumulates with the measured
+  `dt`, so the GEOMETRY does not depend on the rate, and the wire's own stream-update gate
+  is 1 ms anyway.
+- **Guarded state.** The NAPI thread writes the pose (`setPose`: per-eye center volts +
+  `jL`/`jR`, row-major 2×2 volts-per-radian) and the orbit params (`setOrbit`: `ampRad`,
+  `hz`, `enabled`) under a `Threading::Guard`; the brick thread advances the slewed center
+  and the phase under the same guard.
+- **Phase.** Accumulates with the measured `dt` and is continuous across live `hz`/`amp`
+  changes; it restarts at 0 only on a disabled→enabled transition.
+- **Center slew.** First-order toward the latest pushed center, τ = 8 ms with a 5 mV
+  epsilon snap — the `@lib/slew` constants, ported so idle behavior is unchanged. The orbit
+  OFFSET is never slewed: a smoothed offset would lag the phase and shrink the ring. The
+  FIRST pose after `setPose` lands on the center directly (no swoop from the origin).
+- **Going quiet.** While enabled the brick emits every tick. While disabled it emits only
+  while the slew still moves the pose — the epsilon snap makes a settled center
+  bit-identical tick over tick — then `iterate()` returns `nullptr` and the brick is
+  silent. It has already slept out the tick by then, so the base loop's `yield()` path is
+  not a spin.
+- **Ports.** `volt_out` (tag `"volts"`, payload `VoltPair::Ptr`) pipes into the
+  controller's native `pos_in`; `[Symbol.asyncIterator]` is the JS fallback consumer.
+  `probe()` returns the thread meter (inputs `pose`/`orbit`, output `volt`).
+- **Teardown.** `release()` → `close()`: idempotent, wakes the pacer and JOINS the thread
+  BEFORE the stream ejects its subscribers ([eject-and-drain](#eject-and-drain)), which
+  also runs from the CoreObject `destruct` hook so a live port link pinning the brick
+  cannot leave the thread running. Guarded by `core/test/51-orbit-stream.ts`.

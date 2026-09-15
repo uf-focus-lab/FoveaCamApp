@@ -101,10 +101,16 @@ tick counter — a late or coalesced tick lands at the correct phase instead of
 accumulating drift. Zero amplitude degenerates to the idle pose.
 
 Parameters (`scan_hz` 1–100 Hz, default 10 — a 100 ms revolution; `scan_amp` 0–2°) are
-LIVE: a change while active takes effect on the next tick (amplitude) or re-applies the
-exposure override (frequency, §exposure). The mirror's own low-pass response attenuates
-the realized radius at higher frequencies — the commanded circle is exact, the physical
-one is a rig measurement.
+LIVE: a change while active is pushed straight to the native generator (its phase
+ACCUMULATES across the change, so the ring never steps) and, for frequency, re-applies the
+exposure override (§exposure). The mirror's own low-pass response attenuates the realized
+radius at higher frequencies — the commanded circle is exact, the physical one is a rig
+measurement.
+
+The commanded circle above is what `scan_path` draws and what the JS fallback pacer pushes.
+The native generator emits the same circle LINEARIZED — `center + J · o` with `J` the
+finite difference of this chain around offset 0 (§actuation) — exact to first order in the
+offset.
 
 ## Scan lifecycle {#lifecycle}
 
@@ -252,13 +258,49 @@ hover tooltips only.
 
 ## Actuation {#actuation}
 
-Push model: the SESSION owns the 1 ms pacer (`startPacer`) on one `openPosition`
-input. Idle: each tick slews the commanded pose toward `centerVolts()` with the shared
+The scan runs on a NATIVE brick, not the JS event loop. Any synchronous camera write (the
+gain slider, an exposure re-apply) or allocation on the orchestrator loop stalls a JS pacer
+for tens of ms, the mirrors hold, and the rig draws a straight chord across the ring. The
+generator therefore lives on its own paced C++ thread — the compose brick's shape, applied
+to a circle.
+
+**The brick.** `orbitSeam.create(nodeId.win("mirror-link", "orbit"))` builds an
+`OrbitStream` (docs/spec/core-streams.md#orbit-stream) at activation; its `volt_out` pipes
+into the controller's native `pos_in` through `openNativePosition("mirror-link", …)`
+(`onAttach` pipes, `onDetach` releases the link — the sink comes and goes with the v2
+controller). Registered wiring carries the NODE row only; the volt link reports its own
+`→ controller` edge (the compose brick's precedent). The brick's own meter folds onto the
+node badge through `registerNativeProbe`.
+
+**What JS pushes.** Only the LINEARIZATION, never a per-tick pose:
+
+- `setPose({ centerL, centerR, jL, jR })` on every input that moves or reshapes the ring
+  (steer, verge, shift, baseline, an auto-align servo step, activation) — it rides
+  `publishScanGeometry()`, which those inputs already call. `centerL`/`centerR` are
+  `centerVolts()`; `jL`/`jR` are the row-major 2×2 finite difference of
+  `voltsFor(anglesAt(offset))` around offset 0 (±1e-3 rad), i.e. volts per radian.
+- `setOrbit({ ampRad, hz, enabled })` on scan start/stop and on a live `scan_amp`/`scan_hz`
+  change.
+
+**What the brick commands.** `v = slew(center) + J · amp · (cos φ, sin φ)` per eye at
+1 kHz. The emitted circle is therefore the LINEARIZED chain — exact to first order in the
+offset, which at a 2° maximum radius is well inside the mirror's own response. `scan_path`
+telemetry stays the exact chain (offset → `inverseTriangulate` + shift → `A2V` → clamp), so
+the drawn ring remains the ground truth for the geometry.
+
+**Fallback.** The JS `openPosition` input + 1 ms pacer remain for a v1 controller / no
+controller at all: idle slews the commanded pose toward `centerVolts()` with the shared
 first-order smoother (`@lib/slew` — manual-control's `slew.ts` HOISTED, same constants;
-disparity-scope's `drag-slew.ts` stays a parallel copy for now). Active: each tick
-commands the scan pose DIRECTLY (no slew — a smoother would lag and shrink the circle);
-on stop the slew resumes from the last scan pose, so the return to center is smooth.
-Volt/pose telemetry is throttled to `VOLT_TELEMETRY_INTERVAL_MS`.
+disparity-scope's `drag-slew.ts` stays a parallel copy for now), active commands the scan
+pose DIRECTLY (no slew — a smoother would lag and shrink the circle), and on stop the slew
+resumes from the last scan pose. While the brick owns the wire (`nativeEngaged()`) this
+path pushes only the CENTER pose and only every 10 ms — the pacer itself keeps ticking at
+1 ms because its gap IS the stall meter.
+
+`telemetry.perf.orbit` reports `{ native, rateHz }` — `rateHz` differenced across telemetry
+windows off the brick's own meter (its snapshot rate is a lifetime average). A rate that
+holds at ~1 kHz while `tickGapMs.max` spikes is the brick doing its job. Volt/pose
+telemetry is throttled to `VOLT_TELEMETRY_INTERVAL_MS`.
 
 ## Recording {#recording}
 
@@ -302,6 +344,7 @@ recording drain and the lease release.
 ## Teardown ordering {#teardown}
 
 Resource-scope defers, registered in REVERSE of the drain (LIFO): stop the pacer FIRST →
+release the volt link → close the native position input → release the orbit brick →
 `stopScan` (exposure restore on the live leases) + the gain restore → `triple = null` /
 `ready: false` → await the recording drain → dispose the ring node if one exists
 (worker → wiring → its L/R pipes) → retire the C undistort producer + drop the serial
@@ -313,5 +356,6 @@ pipes).
 
 Hardware-gated checks (`docs/hardware/rig.md`): the realized ring radius vs. `scan_amp`
 across 5/20/50/100 Hz (mirror LPF roll-off), exposure readback equals the period on both
-foveas, restore leaves Manage Cameras' values byte-identical, and the dashed-ring readout
-of a known-frequency blinker.
+foveas, restore leaves Manage Cameras' values byte-identical, the dashed-ring readout of a
+known-frequency blinker, and the CHORD test — drag the gain slider (and re-apply the
+exposure) through a whole sweep while scanning: the ring must stay closed.

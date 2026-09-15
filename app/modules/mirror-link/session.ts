@@ -22,6 +22,7 @@ import { registerGraphWiring } from "@orchestrator/graph-topology";
 import {
   controllerNode,
   startPacer,
+  type NativePositionInput,
   type PositionInput,
 } from "@orchestrator/controller-node";
 import {
@@ -58,12 +59,14 @@ import type {
   PipeInput,
   VisionResult,
 } from "@orchestrator/vision-worker-protocol";
-import { nodeId } from "@lib/orchestrator/graph-contract";
+import { nodeId, type StreamType } from "@lib/orchestrator/graph-contract";
 import { makeMat } from "@lib/mat";
 import type { RingReadout } from "@lib/ring-code";
 import type { PipeBroker } from "@orchestrator/pipe-session";
 import { rawPipeSpec, type RawPipeRegistry } from "@orchestrator/raw-pipe";
 import type { CompressPipeSeam } from "@orchestrator/compress-pipe";
+import type { OrbitHandle, OrbitSeam } from "@orchestrator/orbit-pipe";
+import { registerNativeProbe } from "@orchestrator/native-probes";
 import type { CameraLease } from "@orchestrator/registry";
 import { createTriggerOpChain } from "@lib/trigger-sync";
 import { slewStep, type SlewPair } from "@lib/slew";
@@ -122,6 +125,19 @@ const SCAN_PATH_SAMPLES = 48;
 /** Voltage envelope assumed while no controller is bound (controller.dv). */
 const DEFAULT_DV = 170.0;
 
+/** JS fallback push interval while the native brick owns the wire: the pacer
+ *  still ticks at 1 ms (its gap is the stall meter), but the fallback pose only
+ *  tracks the slewed center, which nothing downstream consumes. */
+const FALLBACK_TICK_MS = 10;
+
+/** The orbit node's advertised output. */
+const PID_STREAM: StreamType = { kind: "analysis", schema: "pid" };
+
+/** How often the brick's meter is read for `perf.orbit.rateHz`. Far slower than
+ *  the telemetry throttle: a probe builds an object on the very loop the brick
+ *  exists to keep free. */
+const ORBIT_PROBE_INTERVAL_MS = 1000;
+
 const errorLine = (e: unknown): string =>
   (e instanceof Error ? e.message : String(e)).split("\n", 1)[0];
 
@@ -129,11 +145,15 @@ export default function mirrorLinkSession(
   broker: PipeBroker,
   undistortSeam: UndistortPipeSeam,
   rawPipes: RawPipeRegistry,
+  orbitSeam: OrbitSeam,
   compressSeam?: CompressPipeSeam,
 ): ServerSession<typeof mirrorLink> {
   return defineResourceSession("mirror-link", mirrorLink, (s) => {
     let triple: CalibratedTriple | null = null;
     let posInput: PositionInput | null = null;
+    let nativePos: NativePositionInput | null = null;
+    let orbit: OrbitHandle | null = null;
+    let voltLink: { release(): void } | null = null;
     let stopActuation: (() => void) | null = null;
 
     const now = () => performance.now();
@@ -172,6 +192,47 @@ export default function mirrorLinkSession(
     /** ...and as volts — the slew goal while idle and the L_PX/R_PX source. */
     const centerVolts = (): SlewPair => voltsFor(centerAngles());
 
+    /** Finite-difference half-step for the orbit Jacobian (rad). */
+    const J_EPS_RAD = 1e-3;
+
+    /** The angle→volt chain LINEARIZED around offset 0, per eye: row-major 2×2
+     *  volts per radian `[dVx/dox, dVx/doy, dVy/dox, dVy/doy]`. The native brick
+     *  commands `center + J · offset`, so the emitted circle is exact to first
+     *  order; `scan_path` stays the exact chain (spec §scan). */
+    function orbitJacobians(): { jL: number[]; jR: number[] } {
+      const at = (x: number, y: number): SlewPair =>
+        voltsFor(anglesAt({ x, y }));
+      const px = at(J_EPS_RAD, 0);
+      const mx = at(-J_EPS_RAD, 0);
+      const py = at(0, J_EPS_RAD);
+      const my = at(0, -J_EPS_RAD);
+      const d = 2 * J_EPS_RAD;
+      const eye = (k: "l" | "r"): number[] => [
+        (px[k].x - mx[k].x) / d,
+        (py[k].x - my[k].x) / d,
+        (px[k].y - mx[k].y) / d,
+        (py[k].y - my[k].y) / d,
+      ];
+      return { jL: eye("l"), jR: eye("r") };
+    }
+
+    /** Hand the brick the current center + linearization (spec §actuation). */
+    function pushOrbitPose(): void {
+      if (!orbit || !triple) return;
+      const c = centerVolts();
+      const { jL, jR } = orbitJacobians();
+      orbit.setPose({ centerL: c.l, centerR: c.r, jL, jR });
+    }
+
+    /** Hand the brick the ring shape + whether it is running. */
+    function pushOrbitParams(): void {
+      orbit?.setOrbit({
+        ampRad: radians(s.state.scan_amp),
+        hz: clampHz(s.state.scan_hz),
+        enabled: scanActive,
+      });
+    }
+
     /** Wide-px projection of a commanded volt; {0,0} uncalibrated (A2P.C needs
      *  the center intrinsic). */
     function projectPx(side: Side, v: Pos): Point2d {
@@ -191,12 +252,14 @@ export default function mirrorLinkSession(
 
     /** The scan's DRAWABLE geometry (spec §views): the ring radius in wide px,
      *  and the commanded circle in volt space per eye. Recomputed on every
-     *  input that moves or reshapes the ring — never per pacer tick. */
+     *  input that moves or reshapes the ring — never per pacer tick. The same
+     *  inputs re-linearize the native brick, so the pose push rides here. */
     function publishScanGeometry(): void {
       if (!triple) {
         s.telemetry({ scan_px: 0, scan_path: { L: [], R: [] } });
         return;
       }
+      pushOrbitPose();
       const hz = clampHz(s.state.scan_hz);
       const periodMs = 1000 / hz;
       const L: Pos[] = [];
@@ -344,6 +407,7 @@ export default function mirrorLinkSession(
       }
       scanT0 = now();
       scanActive = true;
+      pushOrbitParams();
       pushRingEnabled();
       publishScanBlocked(null);
       publishScanTelemetry(hz, applied);
@@ -355,6 +419,7 @@ export default function mirrorLinkSession(
     async function stopScanNow(): Promise<void> {
       const wasActive = scanActive;
       scanActive = false;
+      pushOrbitParams();
       pushRingEnabled();
       resetRingTelemetry();
       if (triple) await restoreEyes(triple);
@@ -377,6 +442,7 @@ export default function mirrorLinkSession(
           applied[side] = await applyEye(side, t.leases[side], hz);
       } catch (e) {
         scanActive = false;
+        pushOrbitParams();
         pushRingEnabled();
         resetRingTelemetry();
         await restoreEyes(t);
@@ -893,8 +959,26 @@ export default function mirrorLinkSession(
     const actuateMsStats = new RollingStats(0.9, 2, "ms");
     /** Pacer tick INTERVAL: the 1 ms loop is the mirror's clock, so any stall on
      *  the orchestrator loop (an allocation, a synchronous native call) is a
-     *  straight chord across the scanned ring. Metered so the rig can see it. */
+     *  straight chord across the scanned ring. Metered so the rig can see it —
+     *  under the native brick it only meters THIS loop, never the scan. */
     const tickGapMsStats = new RollingStats(0.9, 2, "ms");
+
+    let lastOrbitCount = 0;
+    let lastOrbitAt = 0;
+    let orbitRate = 0;
+
+    /** The brick's own emit rate, differenced across probe windows (its meter
+     *  reports a LIFETIME average, which would hide a live stall). */
+    function orbitRateHz(tick: number): number {
+      if (!orbit) return 0;
+      if (tick - lastOrbitAt < ORBIT_PROBE_INTERVAL_MS) return orbitRate;
+      const count = orbit.probe().outputs.volt?.count ?? 0;
+      if (lastOrbitAt > 0)
+        orbitRate = ((count - lastOrbitCount) * 1000) / (tick - lastOrbitAt);
+      lastOrbitCount = count;
+      lastOrbitAt = tick;
+      return orbitRate;
+    }
 
     async function activateSession(scope: ResourceScope): Promise<void> {
       const monitor = s.progressMonitor([
@@ -1053,7 +1137,30 @@ export default function mirrorLinkSession(
       monitor.done("recording");
 
       monitor.start("controller");
-      // No `from`: the scan pose is computed in this session, not by a graph
+      // The NATIVE scan generator (spec §actuation): its own paced thread turns
+      // the linearization into volts, so a synchronous camera write on this loop
+      // can no longer stall a revolution. Its NODE row only — the volt link
+      // reports its own `→ controller` edge (the compose brick's precedent).
+      const orbitId = nodeId.win("mirror-link", "orbit");
+      orbit = orbitSeam.create(orbitId);
+      scope.defer(
+        registerGraphWiring({
+          nodes: [
+            {
+              id: orbitId,
+              kind: "orbit",
+              owner: "win/mirror-link",
+              output: PID_STREAM,
+              transport: "native",
+            },
+          ],
+          edges: [],
+        }),
+      );
+      scope.defer(
+        registerNativeProbe(() => (orbit ? { [orbitId]: orbit.probe() } : {})),
+      );
+      // No `from`: the FALLBACK pose is computed in this session, not by a graph
       // node — an edge would synthesize a phantom placeholder in the profiler.
       posInput = controllerNode().openPosition("mirror-link", {
         initial: { left: { ...volts.L }, right: { ...volts.R } },
@@ -1061,40 +1168,58 @@ export default function mirrorLinkSession(
           lastActuateMs = actuateMs;
         },
       });
+      nativePos = controllerNode().openNativePosition("mirror-link", {
+        initial: { left: { ...volts.L }, right: { ...volts.R } },
+        onAttach: (sink) => {
+          voltLink = orbit ? orbit.volt_out.pipe(sink.pos_in) : null;
+        },
+        onDetach: () => {
+          voltLink?.release();
+          voltLink = null;
+        },
+      });
       scanAllowed = true;
-      publishScanGeometry();
-      // Push model (spec §actuation): the SESSION owns the 1 ms cadence. Idle
-      // slews toward the center pose; active commands the scan pose DIRECTLY
-      // (a smoother would lag and shrink the circle), and the slew resumes from
-      // that last pose on stop.
+      publishScanGeometry(); // seeds the brick's first pose (lands, no swoop)
+      pushOrbitParams();
+      // FALLBACK push model (spec §actuation): without a v2 controller the
+      // SESSION still owns the 1 ms cadence — idle slews toward the center pose,
+      // active commands the scan pose DIRECTLY (a smoother would lag and shrink
+      // the circle), and the slew resumes from that last pose on stop. While the
+      // brick owns the wire this path only tracks the CENTER, a tenth as often.
       let commanded: SlewPair | null = null;
       let lastPaceAt = 0;
+      let lastPushAt = 0;
       stopActuation = startPacer(1, () => {
         const tick = now();
         const dt = lastPaceAt > 0 ? tick - lastPaceAt : 1;
         if (lastPaceAt > 0) tickGapMsStats.push(dt);
         lastPaceAt = tick;
-        if (scanActive) {
-          // Phase from the WALL CLOCK — a late tick lands at the right phase.
-          commanded = voltsFor(
-            anglesAt(
-              scanOffset(
-                tick - scanT0,
-                clampHz(s.state.scan_hz),
-                s.state.scan_amp,
+        const native = controllerNode().nativeEngaged();
+        if (!native || tick - lastPushAt >= FALLBACK_TICK_MS) {
+          const pushDt = lastPushAt > 0 ? tick - lastPushAt : dt;
+          lastPushAt = tick;
+          if (scanActive && !native) {
+            // Phase from the WALL CLOCK — a late tick lands at the right phase.
+            commanded = voltsFor(
+              anglesAt(
+                scanOffset(
+                  tick - scanT0,
+                  clampHz(s.state.scan_hz),
+                  s.state.scan_amp,
+                ),
               ),
-            ),
-          );
-        } else {
-          const goal = centerVolts();
-          commanded = commanded
-            ? slewStep(commanded, goal, dt).pose
-            : { l: { ...goal.l }, r: { ...goal.r } };
+            );
+          } else {
+            const goal = centerVolts();
+            commanded = commanded
+              ? slewStep(commanded, goal, pushDt).pose
+              : { l: { ...goal.l }, r: { ...goal.r } };
+          }
+          const p = posInput!.update({ left: commanded.l, right: commanded.r });
+          volts.L = p.left;
+          volts.R = p.right;
+          actuateMsStats.push(lastActuateMs);
         }
-        const p = posInput!.update({ left: commanded.l, right: commanded.r });
-        volts.L = p.left;
-        volts.R = p.right;
-        actuateMsStats.push(lastActuateMs);
         if (tick - lastVoltEmit >= VOLT_TELEMETRY_INTERVAL_MS) {
           lastVoltEmit = tick;
           // Per-eye markers come from the CENTER pose (shift included), not the
@@ -1104,9 +1229,10 @@ export default function mirrorLinkSession(
           // the ring itself is drawn from `scan_path`.
           const c = centerVolts();
           s.telemetry({
-            volt: scanActive
-              ? { L: { ...c.l }, R: { ...c.r } }
-              : { L: p.left, R: p.right },
+            volt:
+              scanActive || native
+                ? { L: { ...c.l }, R: { ...c.r } }
+                : { L: volts.L, R: volts.R },
             L_PX: projectPx("L", c.l),
             R_PX: projectPx("R", c.r),
             perf: {
@@ -1115,6 +1241,10 @@ export default function mirrorLinkSession(
                 mean: tickGapMsStats.mean,
                 max: tickGapMsStats.max,
               },
+              // `native` is the LINK, not `nativeEngaged()`: during the attach
+              // window the JS path is already suppressed and nothing is
+              // driving the mirrors yet.
+              orbit: { native: voltLink !== null, rateHz: orbitRateHz(tick) },
             },
           });
           actuateMsStats.resetMax();
@@ -1137,6 +1267,20 @@ export default function mirrorLinkSession(
           await stopScanNow();
           await restoreGainNow();
         });
+      });
+      // Drained in this order (LIFO — reverse of registration): the pacer, then
+      // the volt link, the native input, and last the brick itself.
+      scope.defer(() => {
+        orbit?.release();
+        orbit = null;
+      });
+      scope.defer(() => {
+        void nativePos?.close(); // detach + TERMINATE + disable-iff-last
+        nativePos = null;
+      });
+      scope.defer(() => {
+        voltLink?.release();
+        voltLink = null;
       });
       scope.defer(() => {
         stopActuation?.(); // drains FIRST — stop pushing immediately
@@ -1180,16 +1324,19 @@ export default function mirrorLinkSession(
         verge: publishScanGeometry,
         shift: publishScanGeometry,
         baseline: publishScanGeometry,
-        // Amplitude is live on the next tick; only the drawn ring needs a push.
+        // Amplitude rides the brick's live params; the drawn ring follows.
         scan_amp() {
+          pushOrbitParams();
           publishScanGeometry();
           if (activeScan) {
             activeScan = { ...activeScan, amp_deg: s.state.scan_amp };
             s.telemetry({ scan: activeScan });
           }
         },
-        // Frequency re-applies the exposure override (spec §exposure).
+        // Frequency is live on the brick (the phase accumulates across the
+        // change) and re-applies the exposure override (spec §exposure).
         scan_hz(hz) {
+          pushOrbitParams();
           if (scanActive)
             void queueScanOp(() => reapplyScanNow(clampHz(hz as number)));
         },

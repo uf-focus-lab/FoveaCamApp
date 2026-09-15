@@ -94,6 +94,10 @@ Napi::Value createPairStream(const Napi::CallbackInfo &info);
 Napi::Value createPairTestSource(const Napi::CallbackInfo &info);
 Napi::Value pushPairTestFrame(const Napi::CallbackInfo &info);
 Napi::Value releasePairTestSource(const Napi::CallbackInfo &info);
+// Circular-scan ORBIT generator: a paced 1 kHz VoltPair producer whose
+// `volt_out` drives the controller's native pos_in (the mirror-link scan off
+// the JS event loop). Defined in core/src/OrbitStream.cpp.
+Napi::Value createOrbitStream(const Napi::CallbackInfo &info);
 }
 // Consolidated NodeReport rows for every live native brick + pipe. Defined in
 // core/src/Topology.cpp.
@@ -303,6 +307,10 @@ static Object init(Env env, Object exports) {
                Function::New<Arv::pushPairTestFrame>(env, "pushPairTestFrame"));
     Aravis.Set("releasePairTestSource", Function::New<Arv::releasePairTestSource>(
                                             env, "releasePairTestSource"));
+    // Circular-scan orbit brick (create-only): paced volts for the controller's
+    // native pos_in, so a camera write on the JS loop cannot stall the scan.
+    Aravis.Set("createOrbitStream",
+               Function::New<Arv::createOrbitStream>(env, "createOrbitStream"));
     exports.Set("Aravis", Aravis);
     // Controller Module
     auto Controller = Object::New(env);

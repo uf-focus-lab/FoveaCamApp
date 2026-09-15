@@ -54,6 +54,13 @@ Hardware-gated checks for the `mirror-link` app (spec
   scanning; stop the scan (and separately, leave the app mid-scan with the Gain
   slider moved) and confirm every value came back unchanged. Gain is
   session-wide, so its restore is only exercised on leaving the app.
+- **Chord test — the scan must survive a camera write.** With the scan running
+  on a point source, drag the **Gain** slider through its whole range and change
+  `scan_hz` (which rewrites both foveas' exposure). The ring must stay CLOSED —
+  a straight chord across it means a camera write is still stalling the
+  generator. `telemetry.perf.orbit.rateHz` must hold at ~1 kHz with
+  `orbit.native` true throughout, even while `perf.tickGapMs.max` spikes (that
+  spike is the JS loop, which no longer drives the mirrors).
 - **Dashed-ring readout.** Point at a blinker of KNOWN frequency and confirm the
   on/off pattern along the ring matches it (count the dashes per revolution
   against `blink_hz / scan_hz`).
