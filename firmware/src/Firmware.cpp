@@ -13,6 +13,7 @@
 #include "Capture.h"
 #include "Global.h"
 #include "Streams.h"
+#include "Trajectory.h"
 
 void setup() {
   Serial.begin(115200);
@@ -31,6 +32,7 @@ void loop() {
   Global::time.update();
   Streams::housekeeping(); // M1 periodic MEMS config re-assertion (~1 Hz)
   Streams::tick();
+  Trajectory::tick(); // v2.2.0: DAC playback + marker triggers
   Capture::tick();
   Protocol::tick();
   for (int available = Serial.available(); available > 0; available--) {
@@ -89,6 +91,8 @@ void handle(const Protocol::RawPacket &&packet) {
     CASE_GET_PAYLOAD(Command::Frame);
     CASE_SET(Command::Actuate);
     CASE_SET(Command::Trigger);
+    CASE_SET(Command::Schedule);   // v2.2.0
+    CASE_SET(Command::Trajectory); // v2.2.0 (op-tagged, variable size)
   case Protocol::INVALID: {
     auto packet = Packet::reject("Bad packet");
     if (COBS::tx.encode(packet))
