@@ -131,15 +131,23 @@ try {
     const version = await withTimeout(device.verifyVersion(), 5000, "verifyVersion");
     assert.deepEqual(
       { major: version.major, minor: version.minor, patch: version.patch },
-      { major: 2, minor: 1, patch: 0 },
-      "firmware reports protocol v2.1.0",
+      {
+        major: Protocol.System.Version.major,
+        minor: Protocol.System.Version.minor,
+        patch: Protocol.System.Version.patch,
+      }, // this build's shared lib/Protocol/Version.h
+      "firmware reports this build's protocol version",
     );
     assert.equal(version.compatible, true, "compatible");
     const v = await device.get(Protocol.System.Version);
     assert.deepEqual(
       { major: v.major, minor: v.minor, patch: v.patch },
-      { major: 2, minor: 1, patch: 0 },
-      "GET System::Version = 2.1.0",
+      {
+        major: Protocol.System.Version.major,
+        minor: Protocol.System.Version.minor,
+        patch: Protocol.System.Version.patch,
+      }, // this build's shared lib/Protocol/Version.h
+      "GET System::Version = this build's version",
     );
     console.log("49-firmware-recovery: §c GET Version 2.1.0 OK.");
   }
