@@ -166,6 +166,14 @@ export class StreamUpdateGate {
     return true;
   }
 
+  /** Record `next` as sent WITHOUT the dedupe / min-interval checks — the
+   *  forced-UPDATE path (`StreamHandle.update(pos, { force: true })`). */
+  force(next: { left: Pos; right: Pos }, now = performance.now()): void {
+    this.lastLeft = clonePos(next.left);
+    this.lastRight = clonePos(next.right);
+    this.lastSentAt = now;
+  }
+
   /** The accepted pose never reached the wire (a latest-wins drop under
    *  back-pressure): forget it for DEDUPE so the next push — even the same
    *  pose — is sent, while the min-interval still paces the retry. */
@@ -183,7 +191,15 @@ export class StreamUpdateGate {
  *  waits behind an awaited request. */
 export interface StreamHandle {
   readonly id: number;
-  update(pos: { left: Pos; right: Pos }): void;
+  /** Returns true when the UPDATE was written to the wire, false when the
+   *  gate deduped/paced it or a latest-wins drop discarded it — the
+   *  controller node uses this to know whether a pending CMD_SCHEDULE ring
+   *  was actually cleared (an UPDATE that never left the host clears
+   *  nothing). Callers that don't care ignore it. `force` bypasses the
+   *  gate's dedupe + min-interval (one-off re-assertions — the controller
+   *  node uses it to take the DAC back after an uploaded trajectory STOPs,
+   *  when the pose may equal the last one sent); never use it per tick. */
+  update(pos: { left: Pos; right: Pos }, opts?: { force?: boolean }): boolean;
   /** v2.2.0 CMD_SCHEDULE: apply `pos` at host-steady time `hostNs` (converted
    *  to the MCU clock through the calibrated offset) instead of on arrival;
    *  with `interpolate` the firmware ramps linearly from the previous
@@ -312,6 +328,13 @@ export interface FrameOutcome {
    *  like `actuate()`. */
   left: Pos;
   right: Pos;
+  /** Present ONLY on an outcome the controller node forwards from a running
+   *  uploaded trajectory (an OK `SYN CMD_TRAJECTORY` push, v2.2.0) rather
+   *  than a `CMD_FRAME` FIN. `stream` then carries the trajectory id (the
+   *  firmware's `result.stream`), so a consumer that keys on stream ids can
+   *  tell the two apart here; FIN consumers that only need the exposure time
+   *  + volts (the anchor node) ignore it. */
+  trajectory?: { id: number; marker: number; cycle: number };
 }
 
 export class Controller {
@@ -633,9 +656,10 @@ export class Controller {
     let closed = false;
     return {
       id,
-      update: (next) => {
+      update: (next, opts) => {
         if (closed) throw new Error(`Stream ${id} is closed`);
-        if (!gate.accept(next)) return;
+        if (opts?.force) gate.force(next);
+        else if (!gate.accept(next)) return false;
         try {
           this.device.fireAndForget(Protocol.Command.MirrorStream, {
             op: "UPDATE",
@@ -649,7 +673,7 @@ export class Controller {
           // throw into the caller's hot path (native-sink parity); re-arm the
           // dedupe so a resting target is re-sent on the next push.
           gate.forgetLast();
-          return;
+          return false;
         }
         // The ~kHz-capable stream hot path — `emit` is an O(1) counter bump,
         // never a gate on the fire-and-forget write.
@@ -660,6 +684,7 @@ export class Controller {
           stats.left = next.left;
           stats.right = next.right;
         }
+        return true;
       },
       scheduleAt: (hostNs, next, opts) => {
         if (closed) throw new Error(`Stream ${id} is closed`);

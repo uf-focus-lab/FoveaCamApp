@@ -7,7 +7,9 @@
 // Short memory of mirror positions vs host time: a small ring of {hostNs, left, right}
 // answering mirrorAt(hostNs) by linear interpolation, so the L/R undistort homography can
 // use the mirror position at a frame's (past) exposure time (commands ~1 kHz, frames
-// ~60 fps). Written ONLY by controller-node.ts (the one trajectory place). Honesty note:
+// ~60 fps). Written ONLY by controller-node.ts (the one trajectory place) — immediate
+// updates at send time, scheduled keyframes (CMD_SCHEDULE) at their apply time, and an
+// uploaded trajectory's OK pushes at their exposure time. Honesty note:
 // these are COMMANDS (physical mirror lags by LPF group delay + settle) — triggered
 // captures should prefer the FIN exposure-averaged voltage when present.
 // spec: docs/spec/controller.md#mirror-history
@@ -64,6 +66,28 @@ export class MirrorHistory {
     };
     this.head = (this.head + 1) % this.capacity;
     if (this.count < this.capacity) this.count++;
+  }
+
+  /** The newest recorded sample (null when empty). A scheduled keyframe
+   *  (controller node `updateAt`) may be NEWER than now — this is then the
+   *  last pending keyframe, not the current position. */
+  newest(): MirrorSample | null {
+    return this.at(-1);
+  }
+
+  /** Drop every sample strictly newer than `hostNs` (from the newest end —
+   *  the ring stays monotonic). The controller node calls this when an
+   *  immediate stream UPDATE supersedes pending CMD_SCHEDULE keyframes (the
+   *  firmware clears the stream's ring, so those future samples never
+   *  happen). Returns how many samples were dropped. */
+  truncateAfter(hostNs: bigint): number {
+    let dropped = 0;
+    while (this.count > 0 && this.at(-1)!.hostNs > hostNs) {
+      this.head = (this.head - 1 + this.capacity) % this.capacity;
+      this.count--;
+      dropped++;
+    }
+    return dropped;
   }
 
   /** i = 0 oldest … count-1 newest (negative = from the end). */
