@@ -9,7 +9,7 @@
 // Capture,Global,MEMS}.cpp compiled into test/build/fovea-fw-sim (HAL shim +
 // pty; build with `cd test && make build`) — the first firmware BEHAVIOR
 // coverage that runs off the rig. Proves:
-//   1. verifyVersion v2.1.0 handshake (v2Capable, two-phase unlocked).
+//   1. verifyVersion handshake (this build's version) (v2Capable, two-phase unlocked).
 //   2. Enable sequence — bias staged while disabled, enable rail pin, the
 //      exact MEMS DAC word train (RESET, INT_REF, DAC_POWER, LDAC, bias);
 //      Config::Bias REJ while enabled.
@@ -179,7 +179,7 @@ try {
     }
   }
 
-  // --- 1: v2.1.0 handshake ---------------------------------------------------
+  // --- 1: version handshake ---------------------------------------------------
   {
     const version = await withTimeout(device.verifyVersion(), 5000, "verifyVersion");
     assert.deepEqual(

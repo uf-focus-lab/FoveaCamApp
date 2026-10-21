@@ -18,7 +18,7 @@
 //   b. M2 targeted DAC recovery — SET System::Reset type=MEMS while enabled
 //      replays the FULL MEMS enable() word train (incl. RESET) on the wire,
 //      ACKs, and re-commits the active stream's target; while DISABLED it REJs.
-//   c. GET System::Version reports 2.1.0.
+//   c. GET System::Version reports this build's protocol version.
 //
 // Run UNSANDBOXED: node core/test/49-firmware-recovery.ts
 
@@ -126,7 +126,7 @@ try {
   console.log("49-firmware-recovery: sim up at", ptyPath);
   device = new Device(ptyPath);
 
-  // --- c: v2.1.0 version ------------------------------------------------------
+  // --- c: protocol version ------------------------------------------------------
   {
     const version = await withTimeout(device.verifyVersion(), 5000, "verifyVersion");
     assert.deepEqual(
@@ -149,7 +149,7 @@ try {
       }, // this build's shared lib/Protocol/Version.h
       "GET System::Version = this build's version",
     );
-    console.log("49-firmware-recovery: §c GET Version 2.1.0 OK.");
+    console.log(`49-firmware-recovery: §c GET Version ${v.major}.${v.minor}.${v.patch} OK.`);
   }
 
   // --- a1: NO refresh words while disabled ------------------------------------

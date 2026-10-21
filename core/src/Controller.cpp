@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <map>
 #include <optional>
 
 #include <napi.h>
@@ -574,6 +575,311 @@ static FN(FrameResultPacket) {
   return inject(info, object, result);
 }
 
+// ---- v2.2.0: CMD_SCHEDULE / CMD_TRAJECTORY ---------------------------------
+// spec: docs/spec/serial-protocol.md#schedule, #trajectory
+
+// Reads `key` off `obj` by value (never a reference into a packed wire
+// struct). Missing/undefined -> `fallback`, or a TypeError when required.
+template <typename T>
+inline T readField(const Napi::Object &obj, const char *key,
+                   std::optional<T> fallback = std::nullopt) {
+  if (obj.Has(key) && !obj.Get(key).IsUndefined())
+    return convert<T>(obj.Get(key));
+  if (fallback)
+    return *fallback;
+  throw JS::TypeError(obj.Env(),
+                      std::string("Missing required property: ") + key);
+}
+
+inline Napi::Object frameResultToObject(
+    Napi::Env env, const Packet::Command::FrameResult &result) {
+  auto object = Napi::Object::New(env);
+  object.Set("stream", Number::New(env, result.stream));
+  object.Set("frame_id", Number::New(env, result.frame_id));
+  object.Set("t_trigger", convert(env, result.t_trigger));
+  object.Set("t_exposure", convert(env, result.t_exposure));
+  object.Set("left", mirrorPositionToArray(env, result.left));
+  object.Set("right", mirrorPositionToArray(env, result.right));
+  return object;
+}
+
+// CMD_SCHEDULE: one timestamped keyframe on an existing stream. Single-phase
+// (the ACK echoes the same shape). `t_apply` is MCU µs — pass a BigInt (a
+// Number is truncated to 32 bits by convert<uint64_t>).
+static FN(SchedulePacket) {
+  EXPECT_EXACTLY_ONE_ARGUMENT("Packet<Schedule>");
+  using Packet::Command::Schedule;
+  Schedule command{};
+  if (isBufferLike(arg)) {
+    bufferView(arg) >> command;
+  } else if (arg.IsObject() && !arg.IsNull()) {
+    const auto &obj = arg.As<Napi::Object>();
+    try {
+      command.stream = readField<uint8_t>(obj, "stream");
+      command.t_apply = readField<Packet::Command::Timestamp>(obj, "t_apply");
+      uint8_t flags = readField<uint8_t>(obj, "flags", uint8_t(0));
+      if (readField<bool>(obj, "interpolate", false))
+        flags |= Schedule::INTERPOLATE;
+      command.flags = flags;
+      assignMirrorPosition(obj.Get("left"), command.left);
+      assignMirrorPosition(obj.Get("right"), command.right);
+    }
+    JS_EXCEPT(env.Undefined())
+  } else {
+    JS_THROW(TypeError, "Argument must be an object or buffer like",
+             env.Undefined());
+  }
+  auto object = Napi::Object::New(env);
+  object.Set("stream", Number::New(env, command.stream));
+  object.Set("flags", Number::New(env, command.flags));
+  object.Set("interpolate", Napi::Boolean::New(
+                                env, command.flags & Schedule::INTERPOLATE));
+  object.Set("t_apply", convert(env, command.t_apply));
+  object.Set("left", mirrorPositionToArray(env, command.left));
+  object.Set("right", mirrorPositionToArray(env, command.right));
+  return inject(info, object, command);
+}
+
+using TrajectoryOp = Packet::Command::Trajectory::Op;
+
+inline const char *trajectoryOpName(uint8_t op) {
+  switch (op) {
+  case TrajectoryOp::BEGIN:
+    return "BEGIN";
+  case TrajectoryOp::DATA:
+    return "DATA";
+  case TrajectoryOp::MARK:
+    return "MARK";
+  case TrajectoryOp::COMMIT:
+    return "COMMIT";
+  case TrajectoryOp::START:
+    return "START";
+  case TrajectoryOp::STOP:
+    return "STOP";
+  case TrajectoryOp::DELETE:
+    return "DELETE";
+  default:
+    return nullptr;
+  }
+}
+
+inline uint8_t parseTrajectoryOp(Napi::Env env, const std::string &name) {
+  for (uint8_t op = TrajectoryOp::BEGIN; op <= TrajectoryOp::DELETE; op++)
+    if (name == trajectoryOpName(op))
+      return op;
+  throw JS::TypeError(env, "Unknown trajectory op: " + name);
+}
+
+template <typename T> inline void appendBytes(std::vector<uint8_t> &out,
+                                              const T &value) {
+  const auto *p = reinterpret_cast<const uint8_t *>(&value);
+  out.insert(out.end(), p, p + sizeof(T));
+}
+
+// CMD_TRAJECTORY SET: op-tagged, variable size (see Packet.h). Encodes
+//   {op:"BEGIN", id, sample_count, period, step?}
+//   {op:"DATA", id, first_index, samples:[{t_offset, left, right}]}  (<= 12)
+//   {op:"MARK", id, marker, t_offset, cameras?, pulse}  (no cameras = clear)
+//   {op:"START", id, t_start? (BigInt MCU µs, 0n = now), cycles? (0 = forever)}
+//   {op:"COMMIT"|"STOP"|"DELETE", id}
+// and decodes the ACK echo (the op's fixed header; DATA without samples).
+static FN(TrajectoryPacket) {
+  EXPECT_EXACTLY_ONE_ARGUMENT("Packet<Trajectory>");
+  namespace C = Packet::Command;
+  std::vector<uint8_t> bytes;
+  if (isBufferLike(arg)) {
+    const auto view = bufferView(arg);
+    bytes.assign(view.data, view.data + view.size);
+    if (bytes.size() < sizeof(C::TrajectoryRef) ||
+        C::Trajectory::headerSize(bytes[0]) == 0 ||
+        bytes.size() < C::Trajectory::headerSize(bytes[0]))
+      JS_THROW(TypeError, "Malformed Trajectory payload", env.Undefined());
+  } else if (arg.IsObject() && !arg.IsNull()) {
+    const auto &obj = arg.As<Napi::Object>();
+    try {
+      const uint8_t op =
+          parseTrajectoryOp(env, readField<std::string>(obj, "op"));
+      const uint8_t id = readField<uint8_t>(obj, "id");
+      switch (op) {
+      case TrajectoryOp::BEGIN: {
+        C::TrajectoryBegin b{};
+        b.op = op;
+        b.id = id;
+        b.sample_count = readField<uint16_t>(obj, "sample_count");
+        b.period = readField<uint32_t>(obj, "period");
+        uint8_t flags = readField<uint8_t>(obj, "flags", uint8_t(0));
+        if (readField<bool>(obj, "step", false))
+          flags |= C::Trajectory::STEP;
+        b.flags = flags;
+        appendBytes(bytes, b);
+        break;
+      }
+      case TrajectoryOp::DATA: {
+        if (!obj.Has("samples") || !obj.Get("samples").IsArray())
+          throw JS::TypeError(env, "DATA requires a samples array");
+        const auto arr = obj.Get("samples").As<Napi::Array>();
+        if (arr.Length() == 0 || arr.Length() > C::Trajectory::CHUNK_SAMPLES)
+          throw JS::TypeError(env, "DATA carries 1..12 samples per chunk");
+        C::TrajectoryData d{};
+        d.op = op;
+        d.id = id;
+        d.first_index = readField<uint16_t>(obj, "first_index");
+        d.count = static_cast<uint8_t>(arr.Length());
+        appendBytes(bytes, d);
+        for (uint32_t i = 0; i < arr.Length(); i++) {
+          const auto s = arr.Get(i);
+          if (!s.IsObject())
+            throw JS::TypeError(env, "DATA samples must be objects");
+          const auto so = s.As<Napi::Object>();
+          C::TrajectorySample sample{};
+          sample.t_offset = readField<uint32_t>(so, "t_offset");
+          assignMirrorPosition(so.Get("left"), sample.left);
+          assignMirrorPosition(so.Get("right"), sample.right);
+          appendBytes(bytes, sample);
+        }
+        break;
+      }
+      case TrajectoryOp::MARK: {
+        C::TrajectoryMark m{};
+        m.op = op;
+        m.id = id;
+        m.marker = readField<uint8_t>(obj, "marker");
+        m.t_offset = readField<uint32_t>(obj, "t_offset", uint32_t(0));
+        m.cameras =
+            obj.Has("cameras") ? parseCameraMask(obj.Get("cameras")) : 0;
+        m.pulse = readField<uint32_t>(obj, "pulse", uint32_t(0));
+        appendBytes(bytes, m);
+        break;
+      }
+      case TrajectoryOp::START: {
+        C::TrajectoryStart st{};
+        st.op = op;
+        st.id = id;
+        st.t_start = readField<C::Timestamp>(obj, "t_start", C::Timestamp(0));
+        st.cycles = readField<uint32_t>(obj, "cycles", uint32_t(0));
+        appendBytes(bytes, st);
+        break;
+      }
+      default: { // COMMIT / STOP / DELETE
+        C::TrajectoryRef r{};
+        r.op = op;
+        r.id = id;
+        appendBytes(bytes, r);
+        break;
+      }
+      }
+    }
+    JS_EXCEPT(env.Undefined())
+  } else {
+    JS_THROW(TypeError, "Argument must be an object or buffer like",
+             env.Undefined());
+  }
+  // Decode `bytes` back into the JS shape (both directions share it).
+  auto object = Napi::Object::New(env);
+  const uint8_t op = bytes[0];
+  object.Set("op", String::New(env, trajectoryOpName(op)));
+  object.Set("id", Number::New(env, bytes[1]));
+  auto read = [&](auto &out) {
+    std::memcpy(&out, bytes.data(), sizeof(out));
+  };
+  switch (op) {
+  case TrajectoryOp::BEGIN: {
+    C::TrajectoryBegin b;
+    read(b);
+    object.Set("sample_count", Number::New(env, b.sample_count));
+    object.Set("period", Number::New(env, b.period));
+    object.Set("flags", Number::New(env, b.flags));
+    object.Set("step",
+               Napi::Boolean::New(env, b.flags & C::Trajectory::STEP));
+    break;
+  }
+  case TrajectoryOp::DATA: {
+    C::TrajectoryData d;
+    read(d);
+    object.Set("first_index", Number::New(env, d.first_index));
+    auto samples = Napi::Array::New(env);
+    const size_t have =
+        (bytes.size() - sizeof(d)) / sizeof(C::TrajectorySample);
+    for (size_t i = 0; i < have && i < d.count; i++) {
+      C::TrajectorySample s;
+      std::memcpy(&s, bytes.data() + sizeof(d) + i * sizeof(s), sizeof(s));
+      auto so = Napi::Object::New(env);
+      so.Set("t_offset", Number::New(env, s.t_offset));
+      so.Set("left", mirrorPositionToArray(env, s.left));
+      so.Set("right", mirrorPositionToArray(env, s.right));
+      samples.Set(static_cast<uint32_t>(i), so);
+    }
+    object.Set("count", Number::New(env, d.count));
+    object.Set("samples", samples);
+    break;
+  }
+  case TrajectoryOp::MARK: {
+    C::TrajectoryMark m;
+    read(m);
+    object.Set("marker", Number::New(env, m.marker));
+    object.Set("t_offset", Number::New(env, m.t_offset));
+    object.Set("cameras", cameraMaskToArray(env, m.cameras));
+    object.Set("pulse", Number::New(env, m.pulse));
+    break;
+  }
+  case TrajectoryOp::START: {
+    C::TrajectoryStart st;
+    read(st);
+    object.Set("t_start", convert(env, st.t_start));
+    object.Set("cycles", Number::New(env, st.cycles));
+    break;
+  }
+  default:
+    break;
+  }
+  return inject(info, object, bytes.data(), bytes.size());
+}
+
+inline const char *trajectoryStatusName(uint8_t status) {
+  using S = Packet::Command::TrajectoryFrame;
+  switch (status) {
+  case S::OK:
+    return "OK";
+  case S::STROBE_TIMEOUT:
+    return "STROBE_TIMEOUT";
+  case S::BUSY:
+    return "BUSY";
+  case S::CANCELLED:
+    return "CANCELLED";
+  case S::ENDED:
+    return "ENDED";
+  default:
+    return "UNKNOWN";
+  }
+}
+
+// SYN CMD_TRAJECTORY push payload (decode-only; register with
+// Device.onPush(Protocol.Command.TrajectoryFrame, cb)). Timestamps are BigInt
+// MCU µs; `marker` is null for the run-level ENDED / CANCELLED pushes.
+static FN(TrajectoryFramePacket) {
+  EXPECT_EXACTLY_ONE_ARGUMENT("Packet<TrajectoryFrame>");
+  Packet::Command::TrajectoryFrame frame{};
+  if (isBufferLike(arg)) {
+    try {
+      bufferView(arg) >> frame;
+    }
+    JS_EXCEPT(env.Undefined())
+  } else {
+    JS_THROW(TypeError, "TrajectoryFrame decodes a buffer like payload only",
+             env.Undefined());
+  }
+  auto object = Napi::Object::New(env);
+  object.Set("id", Number::New(env, frame.id));
+  if (frame.marker == Packet::Command::TrajectoryFrame::NO_MARKER)
+    object.Set("marker", env.Null());
+  else
+    object.Set("marker", Number::New(env, frame.marker));
+  object.Set("cycle", Number::New(env, frame.cycle));
+  object.Set("status", String::New(env, trajectoryStatusName(frame.status)));
+  object.Set("result", frameResultToObject(env, frame.result));
+  return inject(info, object, frame);
+}
+
 static Napi::Object Init(Napi::Env env) {
   auto obj = Napi::Object::New(env);
   obj.Set("Actuate", factory<Property::CMD_ACTUATE, ActuatePacket>(
@@ -591,6 +897,15 @@ static Napi::Object Init(Napi::Env env) {
   obj.Set("Frame", frame);
   obj.Set("FrameAccepted", frameAccepted);
   obj.Set("FrameResult", frameResult);
+  // v2.2.0 (single-phase SETs; TrajectoryFrame is the SYN push decoder for
+  // Device.onPush).
+  obj.Set("Schedule", factory<Property::CMD_SCHEDULE, SchedulePacket>(
+                          env, "Command::Schedule"));
+  obj.Set("Trajectory", factory<Property::CMD_TRAJECTORY, TrajectoryPacket>(
+                            env, "Command::Trajectory"));
+  obj.Set("TrajectoryFrame",
+          factory<Property::CMD_TRAJECTORY, TrajectoryFramePacket>(
+              env, "Command::TrajectoryFrame"));
   // DeviceObject::send substitutes these for CMD_FRAME's ACK/FIN decode,
   // since (unlike Actuate/Trigger/MirrorStream) its response shapes differ
   // from the request shape.
@@ -960,6 +1275,7 @@ public:
                            INSTANCE_METHOD(DeviceObject, set),           //
                            INSTANCE_METHOD(DeviceObject, fireAndForget), //
                            INSTANCE_METHOD(DeviceObject, verifyVersion), //
+                           INSTANCE_METHOD(DeviceObject, onPush),        //
                            INSTANCE_METHOD(DeviceObject, __testPressure), //
                            INSTANCE_METHOD(DeviceObject, release),       //
                        });
@@ -1045,6 +1361,19 @@ private:
   COBS::TX tx;
   COBS::RX rx;
   Threading::Guard<Map<uint16_t, PendingRequest::Ptr>> pending;
+  // v2.2.0: JS callbacks for non-LOG SYN pushes (e.g. CMD_TRAJECTORY
+  // TrajectoryFrame), keyed by property and registered with onPush(). The
+  // handler map is touched ONLY on the JS thread (onPush + the dispatched
+  // delivery task); the rx thread only copies the shared pointer. Declared
+  // before rx_thread so it exists before the first packet can arrive.
+  struct PushRegistry : Shared<PushRegistry> {
+    struct Handler {
+      Napi::Reference<Napi::Function> decode;
+      Napi::Reference<Napi::Function> callback;
+    };
+    std::map<uint8_t, Handler> handlers;
+  };
+  const PushRegistry::Ptr push_ = PushRegistry::create();
   std::thread rx_thread;
   struct {
     std::atomic<uint64_t> txBytes = 0;
@@ -1235,6 +1564,38 @@ private:
         // Unsolicited log packet
         std::string log_msg((char *)packet.data(), packet.dataSize());
         __LOG__("%s", "PORT ", GREEN, "Device", log_msg.c_str());
+      } else if (method == Method::SYN) {
+        // v2.2.0: every other push (CMD_TRAJECTORY TrajectoryFrame, ...) is
+        // delivered to the JS callback registered with onPush(factory, cb),
+        // decoded by that factory on the JS thread. Unregistered pushes are
+        // dropped (VERBOSE). The LOG branch above is unchanged.
+        auto registry = push_;
+        Dispatcher::dispatch(env, [registry, property,
+                                   packet = std::move(packet)](napi_env env) {
+          auto it = registry->handlers.find(static_cast<uint8_t>(property));
+          if (it == registry->handlers.end() ||
+              it->second.callback.IsEmpty()) {
+            VERBOSE("drop unhandled push SYN:%s (%zu bytes)",
+                    convert<std::string>(property).c_str(),
+                    packet.dataSize());
+            return;
+          }
+          try {
+            auto payload = ArrayBuffer::New(env, packet.dataSize());
+            std::memcpy(payload.Data(), packet.data(), packet.dataSize());
+            auto decoded = it->second.decode.IsEmpty()
+                               ? Napi::Value(payload)
+                               : it->second.decode.Value().Call({payload});
+            it->second.callback.Value().Call({decoded});
+          } catch (const Napi::Error &e) {
+            ERROR("push SYN:%s handler failed: %s",
+                  convert<std::string>(property).c_str(),
+                  e.Message().c_str());
+          } catch (const std::exception &e) {
+            ERROR("push SYN:%s handler failed: %s",
+                  convert<std::string>(property).c_str(), e.what());
+          }
+        });
       } else if (sequence != 0) {
         VERBOSE("trace rx seq=%u %s:%s matched=0 retire=0 pending=%s",
                 sequence, convert<std::string>(method).c_str(),
@@ -1545,6 +1906,40 @@ private:
     auto promise = value.As<Napi::Promise>();
     return promise.Get("then").As<Napi::Function>().Call(promise,
                                                           {onFulfilled});
+  }
+
+  // v2.2.0: onPush(factory, callback | null) — subscribe to the MCU's
+  // unsolicited SYN pushes for factory's property (e.g.
+  // Protocol.Command.TrajectoryFrame -> SYN CMD_TRAJECTORY). Each push's
+  // payload is decoded with `factory` and passed to `callback` on the JS
+  // thread. One callback per property (a later call replaces it); null or
+  // undefined unsubscribes. LOG stays native (logged by the rx thread).
+  FN(onPush) {
+    auto env = info.Env();
+    if (info.Length() < 1 || !info[0].IsFunction())
+      JS_THROW(TypeError, "Device::onPush expects (factory, callback | null)",
+               env.Undefined());
+    const auto factory = info[0].As<Napi::Function>();
+    Property property;
+    try {
+      property = getProperty(factory);
+    }
+    JS_EXCEPT(env.Undefined())
+    if (property == Property::LOG)
+      JS_THROW(TypeError, "LOG pushes are handled natively",
+               env.Undefined());
+    const auto key = static_cast<uint8_t>(property);
+    if (info.Length() < 2 || info[1].IsNull() || info[1].IsUndefined()) {
+      push_->handlers.erase(key);
+      return env.Undefined();
+    }
+    if (!info[1].IsFunction())
+      JS_THROW(TypeError, "Device::onPush callback must be a function or null",
+               env.Undefined());
+    auto &handler = push_->handlers[key];
+    handler.decode = Napi::Persistent(factory);
+    handler.callback = Napi::Persistent(info[1].As<Napi::Function>());
+    return env.Undefined();
   }
 
   FN(release) {
