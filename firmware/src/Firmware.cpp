@@ -18,7 +18,7 @@ void setup() {
   Serial.begin(115200);
   SPI.begin();
   Board::init();
-  Board::low_pass_filter.freq(Global::lpf_frequency);
+  Board::fclk.freq(Global::lpf_frequency);
   Capture::init();
 }
 

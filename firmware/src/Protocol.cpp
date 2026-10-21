@@ -190,7 +190,7 @@ HANDLE_SET(System::Enable) {
     Board::enable.write(Board::ENABLE);
     delay(1);
     MEMS::enable();
-    Board::low_pass_filter.tone();
+    Board::fclk.tone();
     Global::system_enabled = true;
     // v1.1: enable does NOT reset Global::time (only System::Timestamp SET does).
     // spec: docs/spec/serial-protocol.md#clock
@@ -205,7 +205,7 @@ HANDLE_SET(System::Enable) {
     MEMS::disable();
     delay(1);
     Board::enable.write(Board::DISABLE);
-    Board::low_pass_filter.noTone();
+    Board::fclk.noTone();
     Global::system_enabled = false;
   } else {
     VERB("System enable state unchanged");
@@ -253,7 +253,7 @@ HANDLE_GET(Config::LPF) {
 HANDLE_SET(Config::LPF) {
   VERB("Setting LPF frequency to %u Hz", payload.frequency);
   Global::lpf_frequency = payload.frequency;
-  Board::low_pass_filter.freq(Global::lpf_frequency);
+  Board::fclk.freq(Global::lpf_frequency);
   GET(seq);
 }
 

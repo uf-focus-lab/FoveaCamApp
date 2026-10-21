@@ -28,20 +28,20 @@ inline void select(uint8_t d) {
   if ((d & Device::LEFT) != 0 && !selected[0]) {
     VERB("MEMS Select LEFT");
     selected[0] = true;
-    Board::mems_cs[0].write(Board::SELECT);
+    Board::dac[0].cs.write(Board::SELECT);
   } else if ((d & Device::LEFT) == 0 && selected[0]) {
     VERB("MEMS Unselect LEFT");
     selected[0] = false;
-    Board::mems_cs[0].write(Board::UNSELECT);
+    Board::dac[0].cs.write(Board::UNSELECT);
   }
   if ((d & Device::RIGHT) != 0 && !selected[1]) {
     VERB("MEMS Select RIGHT");
     selected[1] = true;
-    Board::mems_cs[1].write(Board::SELECT);
+    Board::dac[1].cs.write(Board::SELECT);
   } else if ((d & Device::RIGHT) == 0 && selected[1]) {
     VERB("MEMS Unselect RIGHT");
     selected[1] = false;
-    Board::mems_cs[1].write(Board::UNSELECT);
+    Board::dac[1].cs.write(Board::UNSELECT);
   }
   // AD5664R Requires 5ns CS setup time. Giving 20ns here.
   delayNanoseconds(20);

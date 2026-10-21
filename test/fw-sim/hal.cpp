@@ -25,6 +25,8 @@
 
 #include "sim.h"
 
+#include "Board.h" // Board::dac CS pins (DAC-word capture)
+
 // --- Time ----------------------------------------------------------------------
 
 namespace {
@@ -101,7 +103,7 @@ uint8_t digitalRead(unsigned pin) {
 }
 
 void analogWrite(unsigned pin, unsigned duty) {
-  // Board::low_pass_filter.tone()/noTone() land here — surface the duty so
+  // Board::fclk.tone()/noTone() land here — surface the duty so
   // the test can watch the LPF drive toggle with Enable.
   Sim::emit("pwm pin=%u duty=%u", pin, duty);
 }
@@ -221,9 +223,10 @@ void SPIClass::endTransaction() {
     return;
   inTransaction = false;
   // CS pins are still asserted here: MEMS::send() deselects only after
-  // Word::send() returns. Board::mems_cs = {9, 10}, LOW = selected.
-  const uint8_t csMask = static_cast<uint8_t>((digitalRead(9) == LOW ? 1 : 0) |
-                                              (digitalRead(10) == LOW ? 2 : 0));
+  // Word::send() returns. Board::dac[n].cs, LOW = selected.
+  const uint8_t csMask = static_cast<uint8_t>(
+      (digitalRead(Board::dac[0].cs.number) == LOW ? 1 : 0) |
+      (digitalRead(Board::dac[1].cs.number) == LOW ? 2 : 0));
   Sim::onDacWord(csMask, word, wordLen);
 }
 
