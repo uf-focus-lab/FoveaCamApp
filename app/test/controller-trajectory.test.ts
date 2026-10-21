@@ -203,6 +203,19 @@ describe("StreamHandle.scheduleAt (CMD_SCHEDULE)", () => {
     expect(() => stream.scheduleAt(1n, { left: P0, right: P0 })).toThrow(/2\.2\.0/);
     expect(mockCalls).toHaveLength(0);
   });
+
+  it("update() reports whether it reached the wire; force bypasses the gate", async () => {
+    ctrl = await makeController();
+    const stream = await ctrl.createStream({ left: P0, right: P0 });
+    mockCalls.length = 0;
+    const pos = { left: { x: 1, y: 1 }, right: P0 };
+    // The gate's min-interval is anchored at CREATE: pace past it.
+    await new Promise((r) => setTimeout(r, 2));
+    expect(stream.update(pos)).toBe(true);
+    expect(stream.update(pos)).toBe(false); // deduped
+    expect(stream.update(pos, { force: true })).toBe(true); // re-asserted anyway
+    expect(mockCalls.filter((c) => c.prop === "MirrorStream")).toHaveLength(2);
+  });
 });
 
 describe("Controller.uploadTrajectory (CMD_TRAJECTORY)", () => {

@@ -224,6 +224,35 @@ export type SystemContract = typeof system;
 /** One live CMD_STREAM's telemetry row — the profiler's per-stream table. */
 export type StreamStat = { id: number; hz: number; left: Pos; right: Pos };
 
+/** The controller node's uploaded-trajectory row (v2.2.0 CMD_TRAJECTORY,
+ *  MirrorLink) — null when no trajectory is open. Plain numbers (telemetry
+ *  must stay JSON-friendly). spec: docs/spec/controller.md#trajectory-ownership */
+export type TrajectoryStat = {
+  /** The input port name the session opened it under. */
+  name: string;
+  /** MCU table id; null while detached (controller unbound / swapped). */
+  id: number | null;
+  state: "uploading" | "ready" | "running" | "detached" | "closed";
+  running: boolean;
+  periodUs: number;
+  markers: number;
+  /** Cycles observed in the current/last run (highest pushed cycle + 1). */
+  cyclesSeen: number;
+  /** Pushes per status since open (OK, STROBE_TIMEOUT, BUSY, CANCELLED,
+   *  ENDED, UNKNOWN). */
+  statusCounts: Record<string, number>;
+  lastMarker: number | null;
+  lastCycle: number | null;
+  /** t_trigger − (t_start + cycle·period + marker offset), µs, of the last
+   *  OK push; null before one. `latenessExact` is false when the run was
+   *  started "now" (t_start = 0 on the MCU) — the host's start estimate then
+   *  carries the serial latency. */
+  lastLatenessUs: number | null;
+  latenessExact: boolean;
+  /** Position-input pushes held locally while the trajectory owned the DAC. */
+  heldPushes: number;
+};
+
 export const controller = defineContract({
   state: { vendorId: "16c0", productId: "0483" },
   telemetry: {
@@ -263,6 +292,8 @@ export const controller = defineContract({
       appliedLookaheadMs: null as number | null,
     },
     streams: [] as StreamStat[],
+    // The controller node's uploaded trajectory (v2.2.0), null when none.
+    trajectory: null as TrajectoryStat | null,
   },
   frames: [] as const,
   commands: {
