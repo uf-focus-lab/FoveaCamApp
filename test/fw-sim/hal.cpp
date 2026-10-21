@@ -4,13 +4,14 @@
 // You may find the full license in project root directory.
 // -------------------------------------------------------
 //
-// Host HAL implementation: the Arduino/SPI surface the real firmware TUs run
+// Host HAL implementation: the Arduino/GPIO surface the real firmware TUs run
 // against. Everything is
 // recorded rather than actuated — pin writes go to a level table (+ the
-// main.cpp hook for trigger/enable observability), MEMS-SPI transactions
-// commit DAC words to the control plane, micros() runs off the steady clock,
-// and noInterrupts()/interrupts() is a recursive-mutex pair shared with the
-// injected strobe "ISRs".
+// main.cpp hook for trigger/enable observability), fast-GPIO register writes
+// (the MEMS bus bit-bang) go through a Teensy 4.0 port model whose bus
+// decoder commits DAC words to the control plane, micros() runs off the
+// steady clock, and noInterrupts()/interrupts() is a recursive-mutex pair
+// shared with the injected strobe "ISRs".
 
 #include <cerrno>
 #include <chrono>
@@ -22,10 +23,11 @@
 
 #include <Arduino.h>
 #include <SPI.h>
+#include <core_pins.h>
 
 #include "sim.h"
 
-#include "Board.h" // Board::dac CS pins (DAC-word capture)
+#include "Board.h" // Board::dac lane pins (MEMS bus decoder)
 
 // --- Time ----------------------------------------------------------------------
 
@@ -198,37 +200,170 @@ size_t HostSerial::println(const char *s) {
   return n + write(crlf, 2);
 }
 
-// --- SPI (MEMS DAC-word capture) --------------------------------------------------
+// --- SPI library stub ------------------------------------------------------------
 
-SPIClass SPI;
+SPIClass SPI; // inert — see shim SPI.h
 
-void SPIClass::begin() {}
+// --- Fast-GPIO port model + MEMS bus decoder --------------------------------------
 
-void SPIClass::beginTransaction(const SPISettings &settings) {
-  (void)settings;
-  inTransaction = true;
-  wordLen = 0;
+namespace {
+
+// Teensy 4.0 pin -> fast-GPIO port/bit (teensy4/core_pins.h CORE_PINn_BIT,
+// GPIO6/7/9 after the startup GPR26..29 remap). Pins past 23 are unmapped
+// (mask 0): register writes never reach them.
+struct PortBit {
+  uint8_t port;
+  uint8_t bit;
+};
+constexpr PortBit PORT_MAP[] = {
+    {6, 3},  {6, 2},  {9, 4},  {9, 5},  {9, 6},  {9, 8},  {7, 10}, {7, 17},
+    {7, 16}, {7, 11}, {7, 0},  {7, 2},  {7, 1},  {7, 3},  {6, 18}, {6, 19},
+    {6, 23}, {6, 22}, {6, 17}, {6, 16}, {6, 26}, {6, 27}, {6, 24}, {6, 25},
+};
+constexpr unsigned MAPPED_PINS = sizeof(PORT_MAP) / sizeof(PORT_MAP[0]);
+constexpr unsigned PORTS = 10;
+
+HostGpioReg *gpioReg(unsigned pin, HostGpioReg::Op op) {
+  static HostGpioReg regs[PORTS][3];
+  static const bool ready = [] {
+    for (unsigned p = 0; p < PORTS; p++)
+      for (unsigned o = 0; o < 3; o++)
+        regs[p][o] = {static_cast<uint8_t>(p), static_cast<HostGpioReg::Op>(o)};
+    return true;
+  }();
+  (void)ready;
+  // Unmapped pins land on port 0, which no mapped pin uses: a write is a no-op.
+  const uint8_t port = pin < MAPPED_PINS ? PORT_MAP[pin].port : 0;
+  return &regs[port][op];
 }
 
-uint8_t SPIClass::transfer(uint8_t byte) {
-  // Transfers outside a transaction are MEMS.cpp's 8-cycle delay byte — not
-  // part of any DAC word.
-  if (inTransaction && wordLen < sizeof(word))
-    word[wordLen++] = byte;
-  return 0; // MISO is not connected on the board (Board::SPI::MISO comment)
+// One decoded AD5664R bus (Board::dac[lane]): SYNC low opens a frame, every
+// SCLK FALLING edge shifts MOSI in (the DAC's sampling edge), SYNC high
+// closes it. A frame that is not exactly 24 bits, or MOSI changing ON a
+// falling edge (a setup/hold violation), is reported as a `dac-error` line
+// and never becomes a DAC word.
+struct DacLane {
+  bool selected = false;
+  bool pending = false; // a closed 24-bit frame waiting for the pair flush
+  bool setupViolation = false;
+  unsigned bits = 0;
+  uint32_t shift = 0;
+  uint32_t word = 0;
+};
+DacLane dacLanes[2];
+
+struct LaneLevels {
+  uint8_t cs, sclk, mosi;
+};
+
+LaneLevels laneLevels(unsigned lane) {
+  const auto &bus = Board::dac[lane];
+  return {pins[bus.cs.number].level, pins[bus.sclk.number].level,
+          pins[bus.mosi.number].level};
 }
 
-void SPIClass::endTransaction() {
-  if (!inTransaction)
+void emitDacWord(uint8_t csMask, uint32_t word) {
+  const uint8_t bytes[3] = {static_cast<uint8_t>(word >> 16),
+                            static_cast<uint8_t>(word >> 8),
+                            static_cast<uint8_t>(word)};
+  Sim::onDacWord(csMask, bytes, sizeof(bytes));
+}
+
+// One register store's effect on both lanes. Within a store the order is:
+// SYNC fall, SCLK fall (samples the PRE-store MOSI), SYNC rise.
+void decodeDacStore(const LaneLevels (&before)[2]) {
+  static const char LANE[] = {'L', 'R'};
+  for (unsigned i = 0; i < 2; i++) {
+    const LaneLevels now = laneLevels(i);
+    DacLane &d = dacLanes[i];
+    if (before[i].cs == HIGH && now.cs == LOW) {
+      d.selected = true;
+      d.setupViolation = false;
+      d.bits = 0;
+      d.shift = 0;
+    }
+    if (d.selected && before[i].sclk == HIGH && now.sclk == LOW) {
+      if (before[i].mosi != now.mosi)
+        d.setupViolation = true;
+      d.shift = (d.shift << 1) | (before[i].mosi ? 1u : 0u);
+      d.bits++;
+    }
+    if (d.selected && before[i].cs == LOW && now.cs == HIGH) {
+      d.selected = false;
+      if (d.bits == 24 && !d.setupViolation) {
+        d.pending = true;
+        d.word = d.shift & 0xFFFFFFu;
+      } else {
+        Sim::emit("dac-error cs=%c bits=%u setup=%s", LANE[i], d.bits,
+                  d.setupViolation ? "violated" : "ok");
+      }
+    }
+  }
+  // Pair flush once both lanes are idle: the bit-bang closes both frames on
+  // the same lockstep edge (left store, then right store), so a frame that
+  // went out on both buses is emitted once — `cs=LR` when the words match,
+  // `cs=L` then `cs=R` when they differ; a single-lane frame as itself.
+  DacLane &l = dacLanes[0], &r = dacLanes[1];
+  if (l.selected || r.selected || !(l.pending || r.pending))
     return;
-  inTransaction = false;
-  // CS pins are still asserted here: MEMS::send() deselects only after
-  // Word::send() returns. Board::dac[n].cs, LOW = selected.
-  const uint8_t csMask = static_cast<uint8_t>(
-      (digitalRead(Board::dac[0].cs.number) == LOW ? 1 : 0) |
-      (digitalRead(Board::dac[1].cs.number) == LOW ? 2 : 0));
-  Sim::onDacWord(csMask, word, wordLen);
+  if (l.pending && r.pending && l.word == r.word) {
+    emitDacWord(3, l.word);
+  } else {
+    if (l.pending)
+      emitDacWord(1, l.word);
+    if (r.pending)
+      emitDacWord(2, r.word);
+  }
+  l.pending = r.pending = false;
 }
+
+bool isDacPin(unsigned pin) {
+  for (const auto &bus : Board::dac)
+    if (pin == bus.cs.number || pin == bus.sclk.number ||
+        pin == bus.mosi.number)
+      return true;
+  return false;
+}
+
+uint32_t cycleCounter = 0;
+
+} // namespace
+
+HostGpioReg *portSetRegister(unsigned pin) {
+  return gpioReg(pin, HostGpioReg::SET);
+}
+HostGpioReg *portClearRegister(unsigned pin) {
+  return gpioReg(pin, HostGpioReg::CLEAR);
+}
+HostGpioReg *portToggleRegister(unsigned pin) {
+  return gpioReg(pin, HostGpioReg::TOGGLE);
+}
+uint32_t digitalPinToBitMask(unsigned pin) {
+  return pin < MAPPED_PINS ? (1u << PORT_MAP[pin].bit) : 0u;
+}
+
+void HostGpioReg::operator=(uint32_t mask) {
+  const LaneLevels before[2] = {laneLevels(0), laneLevels(1)};
+  bool touchedDac = false;
+  for (unsigned pin = 0; pin < MAPPED_PINS; pin++) {
+    if (PORT_MAP[pin].port != port || !(mask & (1u << PORT_MAP[pin].bit)))
+      continue;
+    const uint8_t old = pins[pin].level;
+    const uint8_t val =
+        op == SET ? HIGH : op == CLEAR ? LOW : (old == HIGH ? LOW : HIGH);
+    if (val == old)
+      continue;
+    pins[pin].level = val;
+    touchedDac |= isDacPin(pin);
+    Sim::onPinWrite(pin, val); // same observability as digitalWrite()
+  }
+  if (touchedDac)
+    decodeDacStore(before);
+}
+
+// Each read advances a few "cycles", so the driver's busy-waits end after a
+// couple of polls. Host timing is meaningless here; only edge ORDER matters.
+uint32_t hostCycleCount() { return cycleCounter += 4; }
 
 // --- Control-plane emit -------------------------------------------------------------
 

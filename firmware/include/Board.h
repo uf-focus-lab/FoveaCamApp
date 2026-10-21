@@ -168,6 +168,35 @@ constexpr unsigned CAMERA_COUNT = sizeof(camera) / sizeof(camera[0]);
 // No status LED: pin 13 (LED_BUILTIN) is CAM2's opto trigger line on this
 // board, so nothing may blink it.
 
+// ---------------------------------------------------------------------------
+// Pad control (IOMUXC SW_PAD_CTL_PAD_*, specs.md §6, Mirrorcle guide p10)
+// ---------------------------------------------------------------------------
+// pinMode(OUTPUT) leaves a pad at DSE 7 (the strongest drive, R0/7 ~ 21 ohm)
+// with the default slew. Into a 152 mm ribbon cable that rings and couples
+// (SCK sits between SYN and FCLK_X in the IDC cable), so the DAC buses get a
+// series-terminating drive strength and slow slew, and FCLK the weakest
+// drive. DSE 1/2/3 = R0/1..3 ~ 150/75/50 ohm; SRE 0 = slow slew; SPEED 0 = 50 MHz
+// (plenty for SCLK <= 25 MHz). No keeper/pull (PKE 0): these are push-pull
+// outputs. Tune BUS_PAD_DSE on the bench against a scope.
+constexpr uint32_t BUS_PAD_DSE = 2;  // SCLKn / MOSIn / CSn, 1..3
+constexpr uint32_t FCLK_PAD_DSE = 1; // FCLK
+
+// Must run AFTER every pinMode() on these pins — pinMode rewrites the pad
+// register (analogWrite()/analogWriteFrequency() only touch the mux, so FCLK
+// keeps its pad through tone()/noTone()). init() calls it last.
+inline void padSetup() {
+#ifndef FOVEA_HOST_SIM
+  const uint32_t bus = IOMUXC_PAD_DSE(BUS_PAD_DSE) | IOMUXC_PAD_SPEED(0);
+  for (const auto &b : dac) {
+    *portControlRegister(b.cs.number) = bus;
+    *portControlRegister(b.sclk.number) = bus;
+    *portControlRegister(b.mosi.number) = bus;
+  }
+  *portControlRegister(fclk.number) =
+      IOMUXC_PAD_DSE(FCLK_PAD_DSE) | IOMUXC_PAD_SPEED(0);
+#endif
+}
+
 inline void init() {
   enable.init();
   enable.write(DISABLE); // first thing: drivers stay off until MEMS::enable()
@@ -176,6 +205,7 @@ inline void init() {
   fclk.init();
   for (const auto &cam : camera)
     cam.init();
+  padSetup(); // last: pinMode() above reset these pads to DSE 7
 }
 
 } // namespace Board

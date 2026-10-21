@@ -11,7 +11,7 @@
 // capture + control plane. Proves:
 //   a. M1 periodic config re-assertion — while enabled with a live stream,
 //      exactly the 3 idempotent refresh words (DAC_POWER 0x20000F, INT_REF
-//      0x380001, LDAC 0x300000) appear ~1 s apart, BOTH mirrors selected
+//      0x380001, LDAC 0x300000) appear ~1 s apart, on BOTH buses in lockstep
 //      (cs=LR), with NO RESET (0x28xxxx) and NO value/bias write (refresh must
 //      not move the mirror); the active stream's target is re-committed right
 //      after; and NO refresh words appear while the system is disabled.
@@ -113,9 +113,10 @@ const T1R: AnalogChannels = [4000, 3000, 2000, 1000];
 const REFRESH = ["20000F", "380001", "300000"];
 // The full MEMS enable() train (RESET first, bias last), both mirrors selected.
 const ENABLE_TRAIN = ["280001", "380001", "20000F", "300000", "1F7530"];
-// ch[0]=1000 -> LEFT DAC channel A (WRITE_UPDATE_DAC|A = 0x18): the first word
-// of a stream-1 re-commit. Its reappearance proves targets were re-committed.
-const RECOMMIT_L = "1803E8";
+// ch[0]=1000 -> LEFT DAC channel A (WRITE_IREG|A = 0x00): the first word of a
+// stream-1 re-commit (3x WRITE_IREG + APPLY_IREG per mirror, lockstep). Its
+// reappearance proves targets were re-committed.
+const RECOMMIT_L = "0003E8";
 
 const sim = new Sim(simBinary);
 let device: InstanceType<typeof Device> | null = null;
@@ -175,9 +176,10 @@ try {
     const mark = sim.mark();
     // First refresh lands ~1 s after the enable edge primed the cadence.
     const ldac = await sim.waitLine((l) => l === "dac cs=LR 300000", mark, 3000, "refresh LDAC");
-    // The refresh is broadcast (cs=LR); the follow-up re-commit writes are
-    // per-mirror (cs=L / cs=R), so filtering cs=LR isolates the refresh train
-    // (its own trailing apply 0F0000 sorts after the three assertion words).
+    // The refresh is broadcast (same word on both buses: cs=LR); the
+    // follow-up re-commit frames differ per mirror (T1L != T1R on every
+    // channel, so they decode as cs=L / cs=R pairs), so filtering cs=LR
+    // isolates the refresh train.
     const refresh = sim.dac(mark).filter((w) => w.cs === "LR").slice(0, 3);
     assert.deepEqual(
       refresh.map((w) => w.word),

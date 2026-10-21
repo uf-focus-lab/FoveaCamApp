@@ -142,6 +142,35 @@ adds position streams and synced frame capture (FIN carries the
 exposure-averaged mirror voltage). `verifyVersion()` decides v1/v2 at
 connect, and v2-only surfaces are gated on `v2Capable`.
 
+### MEMS bus
+
+- **Buses:** the V0.1 board gives each Mirrorcle driver (AD5664R DAC) its own
+  point-to-point bus — left `Board::dac[0]` (CS 2, SCLK 3, MOSI 4), right
+  `Board::dac[1]` (CS 9, SCLK 12, MOSI 11); no MISO. Firmware bit-bangs both
+  in lockstep from the cycle counter (`firmware/src/MEMS.cpp`): one GPIO
+  toggle store per bus per edge, left and right stores back to back, so both
+  mirrors' frames go out in the same window. SPI mode 1, 24-bit frames, SYNC
+  low for the frame and high for one half period between frames.
+- **Clock:** `MEMS::SPI::SCLK_HZ` in `firmware/include/MEMS-SPI.h`, a single
+  build-time constant — 10 MHz default (board recommendation until the
+  cables are measured), compile-time ceiling 25 MHz; above ~20 MHz the edge
+  loop itself is the limit and the clock runs slower than asked, never
+  faster. Pads: SCLK/MOSI/CS DSE 2, slow slew; FCLK DSE 1, slow slew
+  (`Board::padSetup()`).
+- **Frames per update:** per mirror 3× `WRITE_IREG` (channels A, B, D) + 1×
+  `APPLY_IREG` (channel C, write and update all), both mirrors concurrently,
+  so all eight outputs change on the same final SCLK edge.
+- **Update rate (expected, not yet measured):** 2.4 µs per frame at 10 MHz →
+  ~9.7 µs on the wire per two-mirror update, ~12 µs per `MEMS::apply()` call
+  including the edge-mask precompute → ~80 kHz ceiling (V0.0 shared bus:
+  ~150 µs, ~6.7 kHz). At 20 MHz ~5 µs on the wire if the loop keeps up.
+  Scope SCLK on both J_SPI ports to confirm the clock and the SYNC timing.
+- **Interrupt cost:** IRQs are masked only for ~20 cycles around each edge
+  (~35 ns worst-case added strobe-ISR latency at 600 MHz); an ISR between
+  edges just stretches that SCLK phase.
+- **Enable order:** DAC init + V_BIAS, FCLK on, then MEMS_EN (pin 6) HIGH;
+  disable drops MEMS_EN first, then bias, then FCLK off.
+
 ## Bench flow
 
 1. **Board bring-up:** work through `pcb/board/bringup.md`, the generated

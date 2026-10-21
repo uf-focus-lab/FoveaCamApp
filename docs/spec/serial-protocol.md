@@ -58,14 +58,20 @@ EXPLICIT:
   Afterwards `Streams::touch()` marks the active stream dirty and the next
   `Streams::tick()` re-commits the current targets. Single-phase ACK (echoes
   the type). **REJects** if the system is not enabled. Unknown types REJ, so an
-  older firmware safely rejects `MEMS`.
+  older firmware safely rejects `MEMS`. The re-init train is unchanged
+  (`0x280001`, `0x380001`, `0x20000F`, `0x300000`, bias `WRITE_UPDATE_DAC`
+  all-channels); since the V0.1 board each word goes out on BOTH DAC buses in
+  the same lockstep frame, and the re-commit is the normal position update
+  (per mirror 3× `WRITE_IREG` A/B/D + 1× `APPLY_IREG` C — see
+  `hardware/rig.md` § MEMS bus).
 
 ## periodic MEMS config re-assertion {#mems-refresh}
 
 While the system is enabled, `loop()` calls `Streams::housekeeping()` which — at
 ~1 Hz, cadenced off `Global::time` — re-sends the three IDEMPOTENT AD5664R setup
 words (`DAC_POWER 0b1111`, `INT_REF_SETUP 1`, `LDAC_SETUP 0`) to BOTH mirrors via
-`MEMS::refresh()`. It NEVER sends a RESET (that would zero the outputs) and NEVER a
+`MEMS::refresh()` — the same word on both DAC buses in lockstep, 3 frames
+(~7.3 µs at the default 10 MHz SCLK). It NEVER sends a RESET (that would zero the outputs) and NEVER a
 value/bias write, so the mirror does not move — safe mid-capture. Each refresh
 `touch()`es the active stream so targets re-commit within one tick. This converts a
 corrupted-word DAC wedge from permanent into a ≤1 s glitch. No re-assertion
@@ -77,7 +83,10 @@ happens while disabled.
 enable, invalidating any host-side clock-delta calibration anyway, so keeping stale
 stream targets buys nothing. Disable cancels all in-flight/queued frame requests
 (`Capture::cancelAll`), clears streams (`Streams::clear`), cancels pending
-actuate/trigger, powers down MEMS, and drops the enable line.
+actuate/trigger, then powers down in the reverse of the enable order (Mirrorcle
+guide p27/p31): drops the driver enable line (MEMS_EN) first, parks the DACs at
+V_BIAS, and stops FCLK. Enable runs DAC init + V_BIAS, starts FCLK, and raises
+MEMS_EN last.
 
 ## camera lines and strobe polarity {#camera-lines}
 
