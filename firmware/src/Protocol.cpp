@@ -185,12 +185,15 @@ HANDLE_GET(System::Enable) {
 
 HANDLE_SET(System::Enable) {
   if (payload.enable && !Global::system_enabled) {
-    // Enable system
+    // Enable system. Order per Mirrorcle guide p27 (Board.h, specs.md §6):
+    // DAC init + V_BIAS on all channels, FCLK running, THEN the driver
+    // enable — the HV stage must never come up on an uninitialised DAC or a
+    // stopped filter clock.
     VERB("Enabling system");
-    Board::enable.write(Board::ENABLE);
-    delay(1);
-    MEMS::enable();
+    MEMS::enable(); // RESET, INT_REF, DAC_POWER, LDAC, V_BIAS (both mirrors)
     Board::fclk.tone();
+    delay(1); // let the filter clock run before the drivers see it
+    Board::enable.write(Board::ENABLE);
     Global::system_enabled = true;
     // v1.1: enable does NOT reset Global::time (only System::Timestamp SET does).
     // spec: docs/spec/serial-protocol.md#clock
@@ -202,9 +205,11 @@ HANDLE_SET(System::Enable) {
     Streams::clear();
     cancelPendingActuate("System disabled");
     cancelPendingTrigger("System disabled");
-    MEMS::disable();
-    delay(1);
+    // Power down in reverse of enable (guide p31): driver enable LOW first,
+    // then park the DAC at V_BIAS, then stop FCLK.
     Board::enable.write(Board::DISABLE);
+    delay(1);
+    MEMS::disable();
     Board::fclk.noTone();
     Global::system_enabled = false;
   } else {

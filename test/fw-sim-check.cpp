@@ -12,16 +12,18 @@
 // core's Device.
 //
 //   1. v2.1.0 GET version handshake.
-//   2. Bias staged while disabled; Enable ACK; Bias REJ while enabled.
-//   3. CMD_STREAM CREATE ACK; seq=0 UPDATE silence (no response bytes);
-//      UPDATE unknown id REJ.
+//   2. Bias staged while disabled; Enable ACK; enable ORDER (DAC init words
+//      + bias on both buses, FCLK, then MEMS_EN); Bias REJ while enabled.
+//   3. CMD_STREAM CREATE ACK + its 8 lockstep position frames (per mirror
+//      3x WRITE_IREG + APPLY_IREG); seq=0 UPDATE silence (no response
+//      bytes); UPDATE unknown id REJ.
 //   4. CMD_FRAME two-phase: ACK{queue_position} -> injected strobes -> FIN
 //      {frame_id, t_trigger < t_exposure, positions == live target}.
 //   5. Strobe-timeout REJ (strobes disarmed).
 //   6. settle_time: SWITCH-frame trigger deferred >= settle (MCU clock);
 //      same-stream frame undeferred; settle 0 switch undeferred.
 //   7. Enable(false) teardown wire ORDER: pending-frame REJ before the
-//      enable ACK.
+//      enable ACK; power-down ORDER (MEMS_EN low, bias, FCLK off).
 //   8. quit -> exit 0.
 
 #include <cassert>
@@ -97,6 +99,22 @@ struct Sim {
           return lines[scanned];
       if (Clock::now() >= deadline)
         throw std::runtime_error("timed out waiting for sim line: " + prefix);
+      pump(20);
+    }
+  }
+
+  // Index of the first line at/after `from` that equals `line` exactly (after
+  // pumping until it appears or the timeout passes).
+  size_t indexOf(const std::string &line, size_t from = 0,
+                 int timeoutMs = 5000) {
+    const auto deadline = Clock::now() + std::chrono::milliseconds(timeoutMs);
+    size_t scanned = from;
+    while (true) {
+      for (; scanned < lines.size(); scanned++)
+        if (lines[scanned] == line)
+          return scanned;
+      if (Clock::now() >= deadline)
+        throw std::runtime_error("timed out waiting for sim line: " + line);
       pump(20);
     }
   }
@@ -382,11 +400,22 @@ int main() {
 
       System::Enable en{};
       en.enable = 1;
+      const size_t mark = sim.lines.size();
       s = wire.next();
       wire.send(setPacket(Protocol::Property::SYS_ENABLE, s, &en, sizeof(en)));
       expectAck(wire, Protocol::Property::SYS_ENABLE, s, "enable ACK");
-      // The recorded MEMS word train, ending in the staged bias broadcast.
-      sim.waitLine("dac cs=LR 1F7530");
+      // The recorded MEMS word train (same word on both buses = cs=LR), in
+      // order, ending in the staged bias broadcast...
+      size_t at = mark;
+      for (const char *word :
+           {"280001", "380001", "20000F", "300000", "1F7530"})
+        at = sim.indexOf(std::string("dac cs=LR ") + word, at) + 1;
+      const size_t biasAt = at - 1;
+      // ...then FCLK running, and only THEN the driver enable rail (guide p27).
+      const size_t fclkAt = sim.indexOf("pwm pin=10 duty=128", mark);
+      const size_t railAt = sim.indexOf("pin 6 1", mark);
+      CHECK(biasAt < fclkAt && fclkAt < railAt,
+            "enable order: DAC init + bias, FCLK, then MEMS_EN");
 
       bias.voltage = 5;
       s = wire.next();
@@ -399,11 +428,30 @@ int main() {
 
     // 3 — stream table: CREATE, seq=0 UPDATE silence, unknown-id REJ
     {
+      const size_t createMark = sim.lines.size();
       uint16_t s = wire.next();
       streamOp(wire, Cmd::MirrorStream::CREATE, 1, pos(1000, 2000, 3000, 4000),
                pos(4000, 3000, 2000, 1000), s);
       expectAck(wire, Protocol::Property::CMD_STREAM, s, "stream CREATE ACK");
-      sim.waitLine("dac cs=L 1803E8"); // fresh stream takes the DAC (ch A)
+      // A fresh stream takes the DAC: per mirror 3x WRITE_IREG (A, B, D) +
+      // APPLY_IREG on C (write + update all), both buses in lockstep — each
+      // frame's left word then its right word. ch[2] -> D, ch[3] -> C.
+      {
+        size_t at = sim.indexOf("dac cs=L 0003E8", createMark); // A 1000
+        for (const char *line :
+             {"dac cs=R 000FA0",  // A 4000
+              "dac cs=L 0107D0",  // B 2000
+              "dac cs=R 010BB8",  // B 3000
+              "dac cs=L 030BB8",  // D 3000
+              "dac cs=R 0307D0",  // D 2000
+              "dac cs=L 120FA0",  // C 4000 + update all
+              "dac cs=R 1203E8"}) { // C 1000 + update all
+          const size_t next = sim.indexOf(line, at);
+          CHECK(next == at + 1,
+                std::string("position frames back to back: ") + line);
+          at = next;
+        }
+      }
 
       // seq=0 fire-and-forget UPDATE: applies (DAC word) with ZERO response.
       const size_t mark = sim.lines.size();
@@ -411,7 +459,7 @@ int main() {
                pos(12000, 22000, 32000, 42000), pos(42000, 32000, 22000, 12000),
                0);
       CHECK(wire.silent(150), "seq=0 UPDATE stays silent");
-      sim.waitLine("dac cs=L 182EE0", 5000, mark); // ...but moved the mirror
+      sim.waitLine("dac cs=L 002EE0", 5000, mark); // ...but moved the mirror
 
       s = wire.next();
       streamOp(wire, Cmd::MirrorStream::UPDATE, 7, pos(0, 0, 0, 0),
@@ -503,6 +551,7 @@ int main() {
       expectAck(wire, Protocol::Property::CMD_FRAME, frameSeq, "parked frame ACK");
 
       System::Enable off{};
+      const size_t disableMark = sim.lines.size();
       const uint16_t disableSeq = wire.next();
       wire.send(setPacket(Protocol::Property::SYS_ENABLE, disableSeq, &off,
                           sizeof(off)));
@@ -514,7 +563,12 @@ int main() {
             "cancel reason");
       expectAck(wire, Protocol::Property::SYS_ENABLE, disableSeq,
                 "enable ACK arrives AFTER the cancels");
-      sim.waitLine("pin 15 0"); // enable rail dropped
+      // Power-down in reverse (guide p31): MEMS_EN LOW, bias, FCLK off.
+      const size_t railAt = sim.indexOf("pin 6 0", disableMark);
+      const size_t biasAt = sim.indexOf("dac cs=LR 1F7530", disableMark);
+      const size_t fclkAt = sim.indexOf("pwm pin=10 duty=0", disableMark);
+      CHECK(railAt < biasAt && biasAt < fclkAt,
+            "disable order: MEMS_EN low, bias to neutral, then FCLK off");
 
       // Stream table cleared: re-enable, then stream 1 must be unknown.
       System::Enable on{};

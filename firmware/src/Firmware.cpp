@@ -4,7 +4,6 @@
 // You may find the full license in project root directory.
 // -------------------------------------------------------
 #include <Arduino.h>
-#include <SPI.h>
 
 #include <Protocol/Packet.h>
 #include <Protocol/Protocol.h>
@@ -16,7 +15,8 @@
 
 void setup() {
   Serial.begin(115200);
-  SPI.begin();
+  // No SPI.begin(): the MEMS DAC buses are bit-banged GPIO (MEMS.cpp), and
+  // LPSPI4 would claim pins 11/12 (MOSI2/SCLK2) and 13 (a camera line).
   Board::init();
   Board::fclk.freq(Global::lpf_frequency);
   Capture::init();
