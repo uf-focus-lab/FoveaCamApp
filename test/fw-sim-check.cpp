@@ -514,7 +514,7 @@ int main() {
             "cancel reason");
       expectAck(wire, Protocol::Property::SYS_ENABLE, disableSeq,
                 "enable ACK arrives AFTER the cancels");
-      sim.waitLine("pin 15 0"); // enable rail dropped
+      sim.waitLine("pin 6 0"); // enable rail (Board::enable, pin 6) dropped
 
       // Stream table cleared: re-enable, then stream 1 must be unknown.
       System::Enable on{};
