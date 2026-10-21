@@ -456,11 +456,11 @@ try {
       assert.match(String(finErrors.get(stream)), /System disabled/, `frame ${stream} REJ reason`);
 
     // Physical teardown: active-frame trigger pins released (Board.h V0.1
-    // Line2 trigger pins: L = camera[1] (22), R = camera[2] (14)), then power-down
+    // Line3 trigger pins: L = camera[1] (20), R = camera[2] (5)), then power-down
     // in reverse of enable (Mirrorcle guide p31): enable rail (pin 6) LOW
     // first, MEMS driven back to bias, FCLK stopped last.
-    await sim.waitLine((l) => l === "pin 22 0", mark, 1000, "L trigger released");
-    await sim.waitLine((l) => l === "pin 14 0", mark, 1000, "R trigger released");
+    await sim.waitLine((l) => l === "pin 20 0", mark, 1000, "L trigger released");
+    await sim.waitLine((l) => l === "pin 5 0", mark, 1000, "R trigger released");
     const rail = await sim.waitLine((l) => l === "pin 6 0", mark, 1000, "enable rail drop");
     const disableDac = await sim.waitLine((l) => l === "dac cs=LR 1F7530", mark, 1000, "MEMS disable bias");
     const fclkOff = await sim.waitLine((l) => l === "pwm pin=10 duty=0", mark, 1000, "FCLK off");

@@ -30,19 +30,25 @@
 | DRV2 (right) CS / SCLK / MOSI | 9 / 12 / 11 | SCLK=FlexIO2 D01, MOSI=D02 |
 | MEMS_EN (shared) | 6 | LOW through reset; raise last, drop first |
 | FCLK (shared) | 10 | PWM, 60x cut-off |
-| CAM0 (C) L2 trig / L3 strobe | 18 / 16 | opto pair 17 / 19 unused |
-| CAM1 (L) L2 trig / L3 strobe | 22 / 20 | opto pair 21 / 23 unused |
-| CAM2 (R) L2 trig / L3 strobe | 14 / 5 | opto pair 13 / 15 unused; 13 is the LED |
+| CAM0 (C) L3 trig / L2 strobe | 16 / 18 | opto pair 17 / 19 unused |
+| CAM1 (L) L3 trig / L2 strobe | 20 / 22 | opto pair 21 / 23 unused |
+| CAM2 (R) L3 trig / L2 strobe | 5 / 14 | opto pair 13 / 15 unused; 13 is the LED |
 
-- Trigger = camera **Line2** (Teensy OUTPUT). Strobe = camera **Line3**
-  (Teensy INPUT, pull-up). Line3 pins are inputs from boot and are never
-  driven (VAUX safety, `pcb/board/pins.h`).
-- `Board::STROBE_ACTIVE_LEVEL = HIGH` for the non-isolated ExposureActive
-  output. Capture keys every edge decision on this constant, never on a
-  literal. Bench verification pending; if the line turns out open-drain the
-  constant flips, nothing else.
-- Host (`app/orchestrator/camera-trigger.ts`) programs `TriggerSource=Line2`,
-  `LineSelector=Line3, LineMode=Output, LineSource=ExposureActive`,
+- Trigger = camera **Line3** (Teensy OUTPUT). Strobe = camera **Line2**
+  (Teensy INPUT, pull-up). Revised 2026-10-21 against FLIR's Blackfly S GPIO
+  documentation: Line3 is the BFS's non-isolated INPUT-ONLY line (high
+  2.6..3.6 V, also the VAUX power input) and Line2 is the bidirectional line
+  whose output is OPEN DRAIN. The first draft had them the other way round,
+  which no BFS can do. The VAUX hazard is an external supply on Line3, so the
+  rig rule is "never power a camera through its GPIO cable"; the Teensy's
+  3.3 V drive sits inside Line3's input window.
+- `Board::STROBE_ACTIVE_LEVEL = LOW`: the open-drain Line2 output pulls the
+  pulled-up line LOW while exposing (host `LineInverter=false`). An unplugged
+  or unprogrammed line therefore reads released, so it fails as a clean strobe
+  timeout rather than a permanent exposure. Capture keys every edge decision
+  on this constant, never on a literal.
+- Host (`app/orchestrator/camera-trigger.ts`) programs `TriggerSource=Line3`,
+  `LineSelector=Line2, LineMode=Output, LineSource=ExposureActive`,
   `LineInverter=false`. The old opto defaults (Line0/Line1) remain selectable
   for a bench fallback, not the default.
 - All three cameras are triggerable: `CAM_C` is a valid mask bit; the

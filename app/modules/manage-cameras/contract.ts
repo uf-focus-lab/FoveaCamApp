@@ -82,8 +82,8 @@ export type FoveaPairView = {
 
 /** One camera's trigger self-test verdict (§Trigger test): the SOFTWARE leg
  *  (camera → convert-pipe frame path, `TriggerSource=Software` + a software
- *  trigger) and the HARDWARE leg (one real MCU pulse on camera `Line2` —
- *  proves the trigger INPUT chain only; the `Line3` strobe RETURN line is only
+ *  trigger) and the HARDWARE leg (one real MCU pulse on camera `Line3` —
+ *  proves the trigger INPUT chain only; the `Line2` strobe RETURN line is only
  *  proven by a live trigger-sync engage). `sw: "fail"` indicts the camera/stream path;
  *  `sw: "ok"` + `hw: "fail"` isolates the trigger wiring; `"no-controller"` =
  *  the hardware leg could not run; `"unavailable"` = the convert producer's

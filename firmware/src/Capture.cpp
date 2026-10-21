@@ -32,7 +32,7 @@ static constexpr uint8_t QUEUE_CAPACITY = 8;
 // Camera lines (V0.1 board, see Board.h "Cameras")
 // ---------------------------------------------------------------------------
 //
-// Every camera's `trigger` (-> camera Line2) and `strobe` (<- camera Line3,
+// Every camera's `trigger` (-> camera Line3) and `strobe` (<- camera Line2,
 // ExposureActive) is cabled, the center camera included, so all three are
 // triggerable. Board::camera[i] is the camera of CameraMask bit (1 << i).
 static_assert(Board::CAMERA_COUNT == 3, "Board::camera must list C, L, R");
@@ -54,12 +54,12 @@ static_assert(Board::STROBE_ACTIVE_LEVEL == HIGH ||
                   Board::STROBE_ACTIVE_LEVEL == LOW,
               "STROBE_ACTIVE_LEVEL must be HIGH or LOW");
 
-// Line3 / VAUX safety. The strobe pin is wired to camera Line3, which is also
-// the camera's 8-24 V VAUX input: the Teensy must never drive it. The same
-// goes for the unused opto pair. Board::Pin::write() already refuses to
-// compile on a non-output Pin, so pinning the pin MODES here makes "nothing
-// writes `strobe`/`opto_*`" a compile-time property — if someone re-types one
-// of them as an output in Board.h, this file stops building.
+// Pin-direction safety. The strobe pin reads camera Line2's open-drain
+// output and must never be driven against it; the same goes for the unused
+// opto pair. Board::Pin::write() already refuses to compile on a non-output
+// Pin, so pinning the pin MODES here makes "nothing writes `strobe`/`opto_*`"
+// a compile-time property — if someone re-types one of them as an output in
+// Board.h, this file stops building.
 namespace detail {
 template <typename P> struct PinMode;
 template <unsigned M, unsigned V> struct PinMode<Board::Pin<M, V>> {
@@ -72,9 +72,9 @@ constexpr bool isOutputPin() {
 }
 } // namespace detail
 static_assert(detail::isOutputPin<decltype(Board::CameraPinout::trigger)>(),
-              "camera trigger (Line2) must be an output");
+              "camera trigger (Line3) must be an output");
 static_assert(!detail::isOutputPin<decltype(Board::CameraPinout::strobe)>(),
-              "camera strobe (Line3 = VAUX) must never be an output");
+              "camera strobe (Line2 open-drain input) must never be an output");
 static_assert(
     !detail::isOutputPin<decltype(Board::CameraPinout::opto_trigger)>(),
     "unused opto trigger (Line0) must stay undriven");
@@ -211,9 +211,9 @@ static inline bool duplicateStream(uint8_t stream) {
   return busy && active.stream == stream;
 }
 
-// Drives the trigger (camera Line2) of every camera in `cameras`. HIGH =
+// Drives the trigger (camera Line3) of every camera in `cameras`. HIGH =
 // asserted (host programs TriggerActivation=RisingEdge). Only ever touches
-// `.trigger` — see the Line3 safety asserts above.
+// `.trigger` — see the pin-direction asserts above.
 static void writeTrigger(uint8_t cameras, uint8_t level) {
   for (unsigned i = 0; i < Board::CAMERA_COUNT; i++)
     if (cameras & (1u << i))
@@ -321,14 +321,15 @@ static void finishActive(const char *rejectReason) {
 
 // REJ reason for a strobe timeout. A requested strobe still reading ASSERTED
 // at timeout means the line never returned to idle — the signature of a
-// polarity mismatch (an active-LOW line read as active-HIGH idles "asserted")
-// or a camera whose Line3 is not driving ExposureActive (the pull-up then
-// holds it HIGH). Both strings start with "Strobe timeout" (host-matched).
+// polarity mismatch (LineInverter=true makes the open-drain line idle LOW =
+// "asserted" to this active-LOW firmware) or a camera holding Line2 low for
+// another reason (LineSource not ExposureActive, or Line2 left as a 3.3 V
+// output sink). Both strings start with "Strobe timeout" (host-matched).
 static const char *strobeTimeoutReason(uint8_t cameras) {
   for (unsigned i = 0; i < Board::CAMERA_COUNT; i++)
     if ((cameras & (1u << i)) && strobeAsserted(Board::camera[i].strobe.number))
       return "Strobe timeout: line stuck at active level "
-             "(check Line3 ExposureActive / STROBE_ACTIVE_LEVEL)";
+             "(check Line2 ExposureActive / LineInverter / STROBE_ACTIVE_LEVEL)";
   return "Strobe timeout";
 }
 

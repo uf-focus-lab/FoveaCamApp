@@ -5,25 +5,26 @@
 // -------------------------------------------------------
 //
 // Strobe polarity on the V0.1 controller board. Triggering uses the camera's
-// NON-isolated lines: `Board::camera[].trigger` drives camera Line2 and
-// `Board::camera[].strobe` reads camera Line3, which the host programs as
-// ExposureActive (LineInverter off). That output is a real logic level that
-// is ASSERTED (HIGH) while the camera exposes and RELEASED (LOW) otherwise —
-// `Board::STROBE_ACTIVE_LEVEL = HIGH`, the single constant Capture.cpp keys
-// every edge decision on. (The old board read the opto-isolated Line1, an
-// open-collector output that idles HIGH and pulls LOW — the mismatch this test
-// used to catch. That shape is `Board::OPTO_STROBE_ACTIVE_LEVEL`, unused.)
+// NON-isolated lines: `Board::camera[].trigger` drives camera Line3 (the
+// BFS's input-only non-isolated line) and `Board::camera[].strobe` reads
+// camera Line2, which the host programs as an ExposureActive output
+// (LineInverter off). The BFS Line2 output is OPEN DRAIN: it pulls the
+// Teensy-pulled-up line LOW while the camera exposes and releases it (HIGH)
+// otherwise — `Board::STROBE_ACTIVE_LEVEL = LOW`, the single constant
+// Capture.cpp keys every edge decision on. (The opto-isolated Line1 the old
+// board used has the same open-collector shape, `OPTO_STROBE_ACTIVE_LEVEL`.)
 //
 // Proves:
-//   1. All three strobe lines (C, L, R) idle at the RELEASED level (LOW) —
-//      the sim's default waveform is the honest non-isolated one.
-//   2. The active-HIGH waveform drives CMD_FRAME to a FIN with sane exposure
+//   1. All three strobe lines (C, L, R) idle at the RELEASED level (HIGH, the
+//      pull-up) — the sim's default waveform is the honest open-drain one.
+//   2. The active-LOW waveform drives CMD_FRAME to a FIN with sane exposure
 //      timing, both for the L|R pair and for C|L|R — the center camera is
 //      triggerable (no "no strobe cable" REJ).
 //   3. Polarity is a board constant, not something the line negotiates: an
-//      active-LOW (opto-shaped) waveform against the active-HIGH firmware
-//      times out ("Strobe timeout: line stuck at active level ..."). If it
-//      FINs instead, Capture.cpp is not honouring STROBE_ACTIVE_LEVEL.
+//      inverted active-HIGH waveform (LineInverter=true) against the
+//      active-LOW firmware times out ("Strobe timeout: line stuck at active
+//      level ..."). If it FINs instead, Capture.cpp is not honouring
+//      STROBE_ACTIVE_LEVEL.
 //
 // Sim support (test/fw-sim/main.cpp): `strobe <C|L|R> ...` arms injection,
 // `polarity <C|L|R> <high|low>` selects the waveform (default = the Board
@@ -149,11 +150,11 @@ try {
     ]);
     assert.equal(
       center,
-      0,
-      "center strobe idles LOW (released) — STROBE_ACTIVE_LEVEL is HIGH on V0.1",
+      1,
+      "center strobe idles HIGH (released, pull-up) — STROBE_ACTIVE_LEVEL is LOW on V0.1",
     );
-    assert.equal(left, 0, "left strobe idles LOW (released)");
-    assert.equal(right, 0, "right strobe idles LOW (released)");
+    assert.equal(left, 1, "left strobe idles HIGH (released)");
+    assert.equal(right, 1, "right strobe idles HIGH (released)");
     console.log("50-strobe-polarity: §1 C/L/R strobe lines idle at the released level OK.");
   }
 
@@ -192,33 +193,33 @@ try {
     return true;
   }
 
-  // --- 2: the honest active-HIGH waveform FINs, center camera included --------
+  // --- 2: the honest active-LOW (open-drain) waveform FINs, C included --------
   {
-    const pair = await capture(["L", "R"], "high");
+    const pair = await capture(["L", "R"], "low");
     assert.equal(
       pair,
       true,
-      `active-HIGH L|R strobe must FIN (got: ${pair}) — Capture.cpp must latch on ` +
+      `active-LOW L|R strobe must FIN (got: ${pair}) — Capture.cpp must latch on ` +
         "Board::STROBE_ACTIVE_LEVEL",
     );
-    const all = await capture(["C", "L", "R"], "high");
+    const all = await capture(["C", "L", "R"], "low");
     assert.equal(
       all,
       true,
       `C|L|R frame must FIN on V0.1 — the center camera is cabled (got: ${all})`,
     );
-    console.log("50-strobe-polarity: §2 active-HIGH strobe FINs for L|R and C|L|R OK.");
+    console.log("50-strobe-polarity: §2 active-LOW strobe FINs for L|R and C|L|R OK.");
   }
 
-  // --- 3: an active-LOW (opto-shaped) waveform cannot pass for active-HIGH ----
+  // --- 3: an inverted active-HIGH waveform cannot pass for active-LOW ---------
   {
     await sleep(100);
-    const inverted = await capture(["L", "R"], "low");
+    const inverted = await capture(["L", "R"], "high");
     assert.notEqual(
       inverted,
       true,
-      "POLARITY NOT A BOARD CONSTANT: an active-LOW strobe FINed against the " +
-        "active-HIGH firmware — Capture.cpp is reading the line without " +
+      "POLARITY NOT A BOARD CONSTANT: an active-HIGH strobe FINed against the " +
+        "active-LOW firmware — Capture.cpp is reading the line without " +
         "Board::STROBE_ACTIVE_LEVEL.",
     );
     assert.match(String(inverted), /Strobe timeout/, "inverted polarity REJs as a strobe timeout");
@@ -228,13 +229,13 @@ try {
       "the timeout names the line stuck at the active level (bench diagnosis)",
     );
 
-    // Back to the honest waveform: idle LOW again, and it captures.
-    await sim.ctl("polarity L high");
-    await sim.ctl("polarity R high");
-    assert.equal(await sim.strobeLevel("L"), 0, "left strobe idles LOW again");
-    assert.equal(await sim.strobeLevel("R"), 0, "right strobe idles LOW again");
-    assert.equal(await capture(["L", "R"], "high"), true, "active-HIGH FINs again");
-    console.log("50-strobe-polarity: §3 active-LOW waveform times out (polarity contract) OK.");
+    // Back to the honest waveform: idle HIGH (pull-up) again, and it captures.
+    await sim.ctl("polarity L low");
+    await sim.ctl("polarity R low");
+    assert.equal(await sim.strobeLevel("L"), 1, "left strobe idles HIGH again");
+    assert.equal(await sim.strobeLevel("R"), 1, "right strobe idles HIGH again");
+    assert.equal(await capture(["L", "R"], "low"), true, "active-LOW FINs again");
+    console.log("50-strobe-polarity: §3 inverted waveform times out (polarity contract) OK.");
   }
 
   await device.set(Protocol.System.Enable, false);

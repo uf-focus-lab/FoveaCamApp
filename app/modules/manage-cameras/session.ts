@@ -409,14 +409,14 @@ export default function manageCamerasSession(): ServerSession<typeof manageCamer
       } finally {
         await restoreFreeRun(e);
       }
-      // HARDWARE leg: one real MCU pulse on camera Line2, only if a controller
+      // HARDWARE leg: one real MCU pulse on camera Line3, only if a controller
       // is up (CMD_TRIGGER pulses every camera's trigger line, C included).
       // A dead probe means neither leg can observe frames — same verdict.
       const controller = activeController();
       if (verdict.sw === "unavailable") verdict.hw = "unavailable";
       else if (controller?.connected) {
         try {
-          await enableHardwareTrigger(e.lease); // Line2 in / Line3 ExposureActive
+          await enableHardwareTrigger(e.lease); // Line3 in / Line2 ExposureActive
           // CMD_TRIGGER duration is MICROSECONDS on the wire (verified: firmware
           // `Trigger.duration` is Microseconds; `Controller.trigger` forwards it
           // verbatim — NEVER ×1000). Cover the exposure, 5 ms floor for a clean

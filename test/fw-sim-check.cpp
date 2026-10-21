@@ -37,10 +37,11 @@
 //   8. Center camera (V0.1 board): cameras = C|L|R drives all three Line2
 //      triggers and FINs; the default mask (0) is still L|R (C untouched) and
 //      FINs right after a C|L|R frame; an out-of-range mask REJs.
-//   9. Strobe polarity contract: lines idle at the released level (LOW for
-//      the default active-HIGH Board::STROBE_ACTIVE_LEVEL); an active-LOW
-//      (opto-shaped) injected waveform times out against it with the
-//      "stuck at active level" hint; back to active-HIGH, it FINs again.
+//   9. Strobe polarity contract: lines idle at the released level (HIGH, the
+//      pull-up, for the default active-LOW Board::STROBE_ACTIVE_LEVEL); an
+//      inverted (active-HIGH, LineInverter-shaped) injected waveform times
+//      out against it with the "stuck at active level" hint; back to the
+//      open-drain active-LOW shape, it FINs again.
 //  10. quit -> exit 0.
 
 #include <algorithm>
@@ -1296,9 +1297,9 @@ int main() {
       std::printf("fw-sim-check: 7 teardown order + stream clear OK\n");
     }
 
-    // Board::camera trigger (Line2) pins, as the sim's `pin` lines report them
-    // (firmware/include/Board.h: C = 18, L = 22, R = 14).
-    const std::string TRIG_C = "pin 18 ", TRIG_L = "pin 22 ", TRIG_R = "pin 14 ";
+    // Board::camera trigger (Line3) pins, as the sim's `pin` lines report them
+    // (firmware/include/Board.h: C = 16, L = 20, R = 5).
+    const std::string TRIG_C = "pin 16 ", TRIG_L = "pin 20 ", TRIG_R = "pin 5 ";
     const auto seen = [&](const std::string &prefix, size_t from) {
       for (size_t i = from; i < sim.lines.size(); i++)
         if (sim.lines[i].rfind(prefix, 0) == 0)
@@ -1346,7 +1347,8 @@ int main() {
       std::printf("fw-sim-check: 8 center camera C|L|R + default L|R OK\n");
     }
 
-    // 9 — strobe polarity contract (Board::STROBE_ACTIVE_LEVEL = HIGH)
+    // 9 — strobe polarity contract (Board::STROBE_ACTIVE_LEVEL = LOW: the
+    //     camera's open-drain Line2 pulls the pulled-up line LOW while exposing)
     {
       const auto level = [&](const std::string &cam) {
         const size_t from = sim.lines.size();
@@ -1355,35 +1357,36 @@ int main() {
         return line.substr(line.rfind(' ') + 1);
       };
       for (const char *cam : {"C", "L", "R"})
-        CHECK(level(cam) == "0",
+        CHECK(level(cam) == "1",
               std::string("strobe ") + cam +
-                  " idles at the released level (LOW, active-HIGH line)");
+                  " idles at the released level (HIGH = pull-up, active-LOW line)");
 
-      // Opto-shaped waveform: idles HIGH, exposure pulls LOW. Against the
-      // active-HIGH firmware the idle reads as "asserted", so the request can
-      // never see a release after its rise and must time out — the contract
-      // that polarity is a board constant, not something the line can flip.
-      sim.ctl("polarity L low");
-      sim.ctl("polarity R low");
-      CHECK(level("L") == "1" && level("R") == "1",
-            "active-LOW line idles at the pull-up (HIGH)");
+      // Inverted waveform (LineInverter=true): idles LOW, exposure drives
+      // HIGH. Against the active-LOW firmware the idle reads as "asserted", so
+      // the request can never see a release after its rise and must time out —
+      // the contract that polarity is a board constant, not something the
+      // line can flip.
+      sim.ctl("polarity L high");
+      sim.ctl("polarity R high");
+      CHECK(level("L") == "0" && level("R") == "0",
+            "inverted (active-HIGH) line idles LOW");
       sim.ctl("strobe L 500 2500");
       sim.ctl("strobe R 700 2500");
       const auto inverted = runFrame(wire, 3, 2000, 0);
       CHECK(inverted.accepted && !inverted.finished,
-            "active-LOW strobe vs active-HIGH firmware: ACK then REJ");
+            "active-HIGH strobe vs active-LOW firmware: ACK then REJ");
       CHECK(inverted.rejReason.rfind("Strobe timeout", 0) == 0,
             "inverted-polarity REJ is a strobe timeout");
       CHECK(inverted.rejReason.find("stuck at active level") != std::string::npos,
             "timeout names the line stuck at the active level");
 
-      // Honest V0.1 waveform again -> FIN.
-      sim.ctl("polarity L high");
-      sim.ctl("polarity R high");
-      CHECK(level("L") == "0" && level("R") == "0",
-            "back to active-HIGH: lines idle LOW again");
+      // Honest V0.1 open-drain waveform again -> FIN.
+      sim.ctl("polarity L low");
+      sim.ctl("polarity R low");
+      CHECK(level("L") == "1" && level("R") == "1",
+            "back to active-LOW: lines idle at the pull-up again");
       const auto honest = runFrame(wire, 3, 2000, 0);
-      CHECK(honest.finished, "active-HIGH strobe FINs");
+      CHECK(honest.finished, "active-LOW (open-drain) strobe FINs");
       std::printf("fw-sim-check: 9 strobe polarity contract (\"%s\") OK\n",
                   inverted.rejReason.c_str());
     }

@@ -445,7 +445,7 @@ const triggerReadout = computed<TriggerReadout>(() => {
         tone: "ok",
         title:
           `${who} produced a frame from a software AND a hardware trigger — the trigger input chain is healthy. ` +
-          "The strobe-return line (camera Line3) is only proven by a live trigger-sync engage." +
+          "The strobe-return line (camera Line2) is only proven by a live trigger-sync engage." +
           testedAt(r.at),
       }
     : {

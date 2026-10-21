@@ -122,7 +122,7 @@ FIXED_SIZE_PACKET(Trigger, CMD_TRIGGER) {
 static_assert(sizeof(Trigger) == sizeof(Microseconds));
 
 // Bitmask for Frame::cameras. Bit i = firmware Board::camera[i]. All three
-// cameras are triggerable on the V0.1 controller board (Line2 trigger, Line3
+// cameras are triggerable on the V0.1 controller board (Line3 trigger, Line2
 // strobe cabled on each); a mask of 0 means the default CAM_L | CAM_R, so C
 // is captured only when asked for. Bits outside C|L|R are REJected.
 typedef enum CameraMask : uint8_t {

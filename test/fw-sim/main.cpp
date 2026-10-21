@@ -18,22 +18,23 @@
 // C, L, R = Board::camera[0], [1], [2]:
 //   strobe <cam> <rise_us> <fall_us> [jitter_us]   arm auto strobe injection:
 //       on each RISE of that camera's trigger pin (the pin the firmware
-//       drives, camera Line2), its strobe pin (the pin the firmware reads,
-//       camera Line3) is ASSERTED at +rise_us and RELEASED at +fall_us
+//       drives, camera Line3), its strobe pin (the pin the firmware reads,
+//       camera Line2) is ASSERTED at +rise_us and RELEASED at +fall_us
 //       (±jitter, deterministic PRNG)
 //   strobe <cam> off                               disarm (timeout tests)
 //   polarity <cam> <high|low>                      level the injected
-//       waveform asserts. Default = Board::STROBE_ACTIVE_LEVEL (HIGH: the
-//       V0.1 non-isolated ExposureActive output, idles LOW). `low` models the
-//       opto output instead (idles at the pull-up, exposure pulls it LOW).
+//       waveform asserts. Default = Board::STROBE_ACTIVE_LEVEL (LOW: the
+//       V0.1 open-drain Line2 ExposureActive output, idles at the pull-up,
+//       exposure pulls it LOW — the opto Line1 has the same shape). `high`
+//       models an inverted line (LineInverter=true: idles LOW, exposure HIGH).
 //       Sticky across re-arming; re-drives the idle (released) level at once.
 //   read <cam>                                     emit `level <cam> <level>`
 //       — that camera's strobe pin as the firmware would read it right now
 //   quit                                           exit 0
 //
 // The modelled camera always drives its strobe line: from boot it sits at the
-// released level of its polarity (as a camera whose Line3 is already set to
-// ExposureActive would), never at the bare pull-up.
+// released level of its polarity (as a camera whose Line2 is already set to
+// ExposureActive would — for the open-drain default that IS the pull-up).
 //
 // Options: --loop-us <n> throttles the service loop (default 50; 0 = free
 // run) to emulate device-side saturation.
@@ -91,8 +92,8 @@ struct StrobeConfig {
   uint32_t fallUs = 2500;
   uint32_t jitterUs = 0;
   // Level the line takes while exposing. Default: the board's honest
-  // non-isolated waveform (Board::STROBE_ACTIVE_LEVEL, HIGH). LOW models the
-  // opto-isolated open-collector output against the pull-up.
+  // open-drain Line2 waveform (Board::STROBE_ACTIVE_LEVEL, LOW — exposure
+  // pulls the pulled-up line low). HIGH models an inverted line.
   uint8_t activeLevel = Board::STROBE_ACTIVE_LEVEL;
   uint8_t releasedLevel() const { return activeLevel == HIGH ? LOW : HIGH; }
 };
@@ -409,7 +410,7 @@ int main(int argc, char **argv) {
   Board::fclk.freq(Global::lpf_frequency);
   Capture::init();
   // The modelled cameras drive their strobe lines from power-up: move each
-  // off the bare pull-up to its polarity's released level (LOW by default).
+  // to its polarity's released level (HIGH = the pull-up by default).
   for (unsigned i = 0; i < CAMS; i++)
     driveIdle(i);
 

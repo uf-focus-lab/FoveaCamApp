@@ -103,9 +103,10 @@ the full hardware rig.
 
 All three cameras are hardware-triggerable on the V0.1 controller board
 (`docs/hardware/rig.md` §Cameras): each camera's GPIO cable lands on a
-`J_CAMn` socket, the MCU drives the trigger on camera **Line2** and reads
-the ExposureActive strobe back on camera **Line3** (active HIGH,
-`Board::STROBE_ACTIVE_LEVEL`). The opto pair (Line0/Line1) stays cabled as
+`J_CAMn` socket, the MCU drives the trigger on camera **Line3** (the BFS's
+input-only non-isolated line) and reads the ExposureActive strobe back on
+camera **Line2** (open-drain output, so active LOW against the Teensy
+pull-up, `Board::STROBE_ACTIVE_LEVEL`). The opto pair (Line0/Line1) stays cabled as
 a bench fallback only.
 
 - **Camera mask.** `CMD_FRAME`'s `cameras` bitmask follows the
@@ -121,16 +122,16 @@ a bench fallback only.
 - **Camera side.** The MCU only pulses lines. Each triggered camera has to
   be switched into FrameStart-triggered mode with its strobe output
   programmed, through `enableHardwareTrigger`
-  (`app/orchestrator/camera-trigger.ts`): `LineSelector=Line2`,
-  `LineMode=Input`; `TriggerSource=Line2`; `LineSelector=Line3`,
-  `LineMode=Output`, `LineSource=ExposureActive`, `LineInverter=false`.
+  (`app/orchestrator/camera-trigger.ts`): `TriggerSource=Line3`;
+  `LineSelector=Line2`, `LineMode=Output`, `LineSource=ExposureActive`,
+  `LineInverter=false`.
   `disableHardwareTrigger` returns it to free-run and leaves the line
   config in place. Never put a camera in the mask before its trigger is
   enabled. A camera that is not in trigger mode does not expose on the
-  pulse. Its strobe then follows free-run exposures (the Line3 config is
-  still in place), or reads as active all the time: an unprogrammed Line3
-  is an input, so the Teensy pull-up holds it HIGH. Either way, the FIN
-  does not describe a triggered exposure.
+  pulse. Its strobe then follows free-run exposures (the Line2 config is
+  still in place), or stays released: an unprogrammed Line2 does not pull
+  the line, so the Teensy pull-up holds it HIGH and the request times out.
+  Either way, the FIN does not describe a triggered exposure.
 
 Wire-level framing — packet layout, seq/ACK/REJ/FIN encoding, CRC — lives in
 `core/src/Controller.cpp` and `firmware/include/`.

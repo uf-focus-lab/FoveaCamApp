@@ -250,33 +250,37 @@ MEMS_EN last.
 
 - **Lines.** All four FLIR GPIO lines are cabled on all three cameras.
   Triggering uses the non-isolated pair: `trigger` (Teensy OUTPUT) drives
-  camera **Line2**, asserted HIGH for `pulse` µs; `strobe` (Teensy
-  `INPUT_PULLUP`) reads camera **Line3**, which the host programs as
-  `ExposureActive`. The opto pair (`opto_trigger` → Line0, `opto_strobe` ←
+  camera **Line3** (the BFS's input-only non-isolated line, 2.6..3.6 V high),
+  asserted HIGH for `pulse` µs; `strobe` (Teensy `INPUT_PULLUP`) reads camera
+  **Line2**, whose open-drain output the host programs as `ExposureActive`.
+  The opto pair (`opto_trigger` → Line0, `opto_strobe` ←
   Line1) stays cabled but is never driven or read by Capture.
-- **Polarity.** `Board::STROBE_ACTIVE_LEVEL` (HIGH for the non-isolated
-  ExposureActive output, host `LineInverter=false`) is the level `strobe`
-  reads while the camera exposes. Capture keys every edge on it: exposure
+- **Polarity.** `Board::STROBE_ACTIVE_LEVEL` (LOW: the open-drain Line2
+  output pulls the pulled-up line low while exposing, host
+  `LineInverter=false`) is the level `strobe` reads while the camera exposes. Capture keys every edge on it: exposure
   start = line becomes asserted (latches `t_exposure` + the start position),
   exposure finish = line becomes released (latches the finish position). A
   request FINs once every requested camera has been asserted and released
   again. Changing the polarity means changing that one constant
-  (`OPTO_STROBE_ACTIVE_LEVEL = LOW` documents the opto shape); nothing on the
-  wire changes.
+  (`OPTO_STROBE_ACTIVE_LEVEL = LOW` records that the opto Line1 has the same
+  open-collector shape); nothing on the wire changes.
 - **Timeout.** No complete assert/release within `pulse + 5 ms` → REJ with a
   reason starting `Strobe timeout`. If a requested line still reads asserted
   at that point the reason says `line stuck at active level` — the signature
-  of a polarity mismatch or a camera whose Line3 is not set to
-  ExposureActive (the pull-up then holds the line HIGH).
+  of a polarity mismatch (`LineInverter=true` idles the line LOW) or a camera
+  holding Line2 low for another reason. An unplugged or unprogrammed line
+  idles at the pull-up (released) and fails as a plain `Strobe timeout`.
 - **Camera mask.** `cameras` may be any non-empty subset of `CAM_C | CAM_L |
   CAM_R`; `0` means `CAM_L | CAM_R` (pre-V0.1 behavior: C is captured only
   when asked for). Other bits REJ (`Invalid camera mask`). Strobe ISRs run on
   all three cameras; edges from a camera outside the request are ignored.
-- **Line3 safety.** Line3 is also the camera's 8-24 V VAUX power input and a
-  Teensy pin is 3.6 V abs. max: `strobe` is an input from boot and is never
-  written (`Capture.cpp` static-asserts that `strobe` and the opto pins are
-  not output Pins, and `Board::Pin::write()` cannot compile on an input).
-  Never power a camera through VAUX on this board.
+- **Pin directions / VAUX.** `Capture.cpp` static-asserts that `trigger` is
+  an output and that `strobe` and the opto pins are not (and
+  `Board::Pin::write()` cannot compile on an input), so nothing can drive
+  against the camera's open-drain output. Line3 is also the camera's 8-24 V
+  VAUX power input and a Teensy pin is 3.6 V abs. max: never power a camera
+  through its GPIO cable on this rig (the Teensy's own 3.3 V trigger drive is
+  within Line3's input spec).
 
 
 ## timestamped keyframes — CMD_SCHEDULE {#schedule}

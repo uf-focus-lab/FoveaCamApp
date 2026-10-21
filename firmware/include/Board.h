@@ -121,31 +121,40 @@ constexpr Pin<OUTPUT> fclk{10};
 // Cameras (FLIR Blackfly S GPIO, J_CAM0..2, all four lines cabled 1:1)
 // ---------------------------------------------------------------------------
 
-// Camera-side line map (FLIR BFS): Line0 = opto-isolated input, Line1 =
-// opto-isolated output (open collector, pulls LOW only), Line2 = non-isolated
-// bidirectional 3.3 V, Line3 = non-isolated bidirectional 3.3 V that doubles
-// as the camera's 8-24 V VAUX power input.
+// Camera-side line map (FLIR Blackfly S GPIO, FLIR "GPIO electrical
+// characteristics" + Getting Started footnotes):
+//   Line0 = opto-isolated INPUT (pin 2);
+//   Line1 = opto-isolated OUTPUT, open collector (pin 4);
+//   Line2 = non-isolated bidirectional (pin 3): as an output it is OPEN DRAIN
+//           (needs a pull-up; sinks 25 mA; input high 2.6..24 V);
+//   Line3 = non-isolated INPUT ONLY (pin 1): high 2.6..3.6 V, ~1 us
+//           propagation delay; the same pin is the camera's 8-24 V VAUX
+//           power input.
 //
-// This board uses the NON-isolated lines for triggering (no opto edge lag,
-// a real logic level in both directions):
-//   trigger: Teensy OUTPUT -> camera Line2 (host sets TriggerSource=Line2)
-//   strobe:  Teensy INPUT  <- camera Line3 (host sets Line3 = ExposureActive)
-// Line3 is the strobe (an input on our side) on purpose: the Teensy pin must
-// never drive Line3 — a pin is 3.6 V abs. max and that net is the camera's
-// VAUX input — so it is INPUT from boot and stays so (pcb/board/pins.h).
+// This board triggers on the NON-isolated lines (no opto edge lag):
+//   trigger: Teensy OUTPUT -> camera Line3 (host sets TriggerSource=Line3).
+//            3.3 V sits inside Line3's 2.6..3.6 V input window.
+//   strobe:  Teensy INPUT_PULLUP <- camera Line2 (host sets Line2 =
+//            ExposureActive output, LineInverter off). Open drain: the camera
+//            pulls the line LOW while exposing; the Teensy pull-up idles it
+//            HIGH. An unplugged cable therefore reads "idle", never "exposing".
+// Line3 cannot be the strobe: it has no output mode on the BFS. Driving it
+// at 3.3 V is within its input spec; the VAUX hazard is an EXTERNAL supply on
+// that net, so never power a camera through its GPIO cable on this rig.
 // The opto pair stays cabled; `opto_trigger`/`opto_strobe` keep the old pins
 // reachable for a bench fallback but Capture does not use them.
 //
 // STROBE_ACTIVE_LEVEL: the level read on `strobe` while the camera exposes.
-// Non-isolated ExposureActive asserts HIGH (host leaves LineInverter off);
-// the opto output, if ever used instead, asserts LOW against the pull-up.
+// Open-drain Line2 (and the opto Line1 alike) asserts LOW against the
+// pull-up. A host that sets LineInverter=true would flip this to HIGH; the
+// host keeps it off so that an idle or disconnected line reads released.
 // Verify on the bench with a scope before the first synced capture.
-constexpr uint8_t STROBE_ACTIVE_LEVEL = HIGH;
+constexpr uint8_t STROBE_ACTIVE_LEVEL = LOW;
 constexpr uint8_t OPTO_STROBE_ACTIVE_LEVEL = LOW;
 
 struct CameraPinout {
-  const Pin<OUTPUT> trigger;             // -> camera Line2 (CAMn_L2)
-  const Pin<INPUT_PULLUP> strobe;        // <- camera Line3 (CAMn_L3)
+  const Pin<OUTPUT> trigger;             // -> camera Line3 (CAMn_L3)
+  const Pin<INPUT_PULLUP> strobe;        // <- camera Line2 (CAMn_L2)
   const Pin<INPUT_DISABLE> opto_trigger; // -> camera Line0 (CAMn_IN), unused
   const Pin<INPUT_PULLUP> opto_strobe;   // <- camera Line1 (CAMn_OUT), unused
   inline void init() const {
@@ -157,11 +166,11 @@ struct CameraPinout {
 };
 
 // Index == Packet::Command camera bit order: 0 = C, 1 = L, 2 = R.
-//                 L2    L3    L0    L1
+//                 L3    L2    L0    L1
 constexpr CameraPinout camera[] = {
-    {{18}, {16}, {17}, {19}}, // CAM0 - Center      (J_CAM0)
-    {{22}, {20}, {21}, {23}}, // CAM1 - Left Fovea  (J_CAM1)
-    {{14}, {5}, {13}, {15}},  // CAM2 - Right Fovea (J_CAM2)
+    {{16}, {18}, {17}, {19}}, // CAM0 - Center      (J_CAM0)
+    {{20}, {22}, {21}, {23}}, // CAM1 - Left Fovea  (J_CAM1)
+    {{5}, {14}, {13}, {15}},  // CAM2 - Right Fovea (J_CAM2)
 };
 constexpr unsigned CAMERA_COUNT = sizeof(camera) / sizeof(camera[0]);
 
