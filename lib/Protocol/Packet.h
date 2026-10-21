@@ -118,9 +118,10 @@ FIXED_SIZE_PACKET(Trigger, CMD_TRIGGER) {
 
 static_assert(sizeof(Trigger) == sizeof(Microseconds));
 
-// Bitmask for Frame::cameras. C (center) is reserved: the CAM0 port has no
-// GPIO cable today (camera-side size constraints) — firmware REJects a mask
-// containing CAM_C until one is connected.
+// Bitmask for Frame::cameras. Bit i = firmware Board::camera[i]. All three
+// cameras are triggerable on the V0.1 controller board (Line2 trigger, Line3
+// strobe cabled on each); a mask of 0 means the default CAM_L | CAM_R, so C
+// is captured only when asked for. Bits outside C|L|R are REJected.
 typedef enum CameraMask : uint8_t {
   CAM_NONE = 0,
   CAM_C = 1,
@@ -177,7 +178,7 @@ PACKED(FrameResult) {
   // uint16 protocol `seq` (which is per-request and wraps at 65536).
   uint32_t frame_id;
   Timestamp t_trigger;  // MCU us: trigger rise
-  Timestamp t_exposure; // MCU us: strobe rise (exposure start)
+  Timestamp t_exposure; // MCU us: strobe rise = line asserted (exposure start)
   // Exposure-AVERAGED mirror position: per-channel round-half-up mean of the
   // DAC target latched at strobe rise (exposure start) and at strobe fall
   // (exposure finish).

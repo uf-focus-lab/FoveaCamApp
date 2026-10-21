@@ -78,3 +78,39 @@ enable, invalidating any host-side clock-delta calibration anyway, so keeping st
 stream targets buys nothing. Disable cancels all in-flight/queued frame requests
 (`Capture::cancelAll`), clears streams (`Streams::clear`), cancels pending
 actuate/trigger, powers down MEMS, and drops the enable line.
+
+## camera lines and strobe polarity {#camera-lines}
+
+`CMD_FRAME` (and the legacy `CMD_TRIGGER`) drive the cameras through
+`Board::camera[]` (`firmware/include/Board.h`, V0.1 board). Index `i` is
+`CameraMask` bit `1 << i`: 0 = C, 1 = L, 2 = R.
+
+- **Lines.** All four FLIR GPIO lines are cabled on all three cameras.
+  Triggering uses the non-isolated pair: `trigger` (Teensy OUTPUT) drives
+  camera **Line2**, asserted HIGH for `pulse` µs; `strobe` (Teensy
+  `INPUT_PULLUP`) reads camera **Line3**, which the host programs as
+  `ExposureActive`. The opto pair (`opto_trigger` → Line0, `opto_strobe` ←
+  Line1) stays cabled but is never driven or read by Capture.
+- **Polarity.** `Board::STROBE_ACTIVE_LEVEL` (HIGH for the non-isolated
+  ExposureActive output, host `LineInverter=false`) is the level `strobe`
+  reads while the camera exposes. Capture keys every edge on it: exposure
+  start = line becomes asserted (latches `t_exposure` + the start position),
+  exposure finish = line becomes released (latches the finish position). A
+  request FINs once every requested camera has been asserted and released
+  again. Changing the polarity means changing that one constant
+  (`OPTO_STROBE_ACTIVE_LEVEL = LOW` documents the opto shape); nothing on the
+  wire changes.
+- **Timeout.** No complete assert/release within `pulse + 5 ms` → REJ with a
+  reason starting `Strobe timeout`. If a requested line still reads asserted
+  at that point the reason says `line stuck at active level` — the signature
+  of a polarity mismatch or a camera whose Line3 is not set to
+  ExposureActive (the pull-up then holds the line HIGH).
+- **Camera mask.** `cameras` may be any non-empty subset of `CAM_C | CAM_L |
+  CAM_R`; `0` means `CAM_L | CAM_R` (pre-V0.1 behavior: C is captured only
+  when asked for). Other bits REJ (`Invalid camera mask`). Strobe ISRs run on
+  all three cameras; edges from a camera outside the request are ignored.
+- **Line3 safety.** Line3 is also the camera's 8-24 V VAUX power input and a
+  Teensy pin is 3.6 V abs. max: `strobe` is an input from boot and is never
+  written (`Capture.cpp` static-asserts that `strobe` and the opto pins are
+  not output Pins, and `Board::Pin::write()` cannot compile on an input).
+  Never power a camera through VAUX on this board.

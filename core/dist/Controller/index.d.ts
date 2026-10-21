@@ -50,8 +50,8 @@ declare module "core/Controller" {
   export type FrameArg = {
     stream: number;
     // Bitmask (CameraName[] or a raw number); omitted/undefined means
-    // the firmware default (CAM_L | CAM_R). "C" is REJected until the
-    // center camera has a strobe cable.
+    // the firmware default (CAM_L | CAM_R). "C" (center) is triggerable on
+    // the V0.1 controller board — request it explicitly.
     cameras?: CameraName[] | number;
     pulse?: number; // trigger pulse width, in microseconds
     // v2.0 trigger settle HOLD (µs) — held only when this request SWITCHES the
@@ -66,8 +66,8 @@ declare module "core/Controller" {
   };
   /** CMD_FRAME ACK payload: position in the per-stream FIFO (0 = next). */
   export type FrameAccepted = { queue_position: number };
-  /** CMD_FRAME FIN payload, latched at exposure start (strobe rising
-   *  edge). Timestamps are MCU microseconds, as `bigint` (uint64,
+  /** CMD_FRAME FIN payload, latched at exposure start (strobe line
+   *  asserted — rising edge of the non-isolated ExposureActive line). Timestamps are MCU microseconds, as `bigint` (uint64,
    *  matching firmware's Global::time). */
   export type FrameResult = {
     stream: number;

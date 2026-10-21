@@ -10,21 +10,30 @@ Three GigE (Aravis) cameras: **L**/**R** foveal (behind the MEMS mirrors) and
 orchestrator's registry leases them per-serial (Aravis is per-process
 exclusive — `architecture/processes.md`).
 
-- **Hardware triggering:** only L and R are cabled for hardware trigger. The
-  center camera's CAM0 port is reserved on the controller board but no cable
-  currently fits (camera-side connector size constraint) — recoverable with a
-  slimmer cable. Until then C free-runs.
-- **GPIO wiring (L/R):** ONLY the opto-isolated pins + opto-GND are
-  physically cabled — the non-isolated lines float. On the FLIR line map
-  that is **Line0** (opto input — the trigger) and **Line1** (opto output —
-  the ExposureActive strobe), which is exactly what
-  `@orchestrator/camera-trigger` programs by default; a non-isolated line
-  name can never work on this rig. Note the opto input wants the MCU pulse
-  within its voltage spec and adds µs-scale edge lag — irrelevant at the
-  ms-scale pulse widths `pairTriggerBudget` derives.
-- **Controller side:** `firmware/include/Board.h` `camera[]` pairs are
-  controller-directional — `trigger` (Teensy OUTPUT → camera Line0),
-  `strobe` (Teensy INPUT ← camera Line1).
+- **Hardware triggering:** all three cameras — C included — are hardware
+  triggerable on the V0.1 controller board (J_CAM0 = C, J_CAM1 = L, J_CAM2 =
+  R). A `CMD_FRAME` with no camera mask still triggers only L and R; C is
+  captured when the host asks for it.
+- **GPIO wiring (V0.1):** all four FLIR GPIO lines (plus opto GND and GND)
+  are cabled 1:1 on every camera. Triggering uses the **non-isolated** lines:
+  **Line2** is the trigger input and **Line3** the ExposureActive strobe
+  output (no opto edge lag, a real 3.3 V logic level both ways). The opto
+  pair (Line0 in / Line1 out) stays cabled as a bench fallback only.
+- **Strobe polarity:** `Board::STROBE_ACTIVE_LEVEL` (HIGH — ExposureActive
+  with LineInverter off) is the one constant the firmware keys exposure
+  start/finish on; if the bench shows the line inverted, that constant flips
+  and nothing else. A strobe REJ reading `Strobe timeout: line stuck at
+  active level` means the line never returned to idle — wrong polarity, or
+  Line3 not set to ExposureActive. Not yet scope-verified on the bench.
+- **Line3 / VAUX safety:** Line3 doubles as the camera's 8-24 V VAUX power
+  input and a Teensy pin is 3.6 V abs. max. The controller pin on Line3 is
+  an input from boot and is never driven (enforced at compile time in
+  `firmware/src/Capture.cpp`). Never power a camera through VAUX on this
+  board (`pcb/board/bringup.md` step 9).
+- **Controller side:** `firmware/include/Board.h` `camera[]` entries are
+  controller-directional — `trigger` (Teensy OUTPUT → camera Line2),
+  `strobe` (Teensy INPUT_PULLUP ← camera Line3), plus the unused
+  `opto_trigger` (→ Line0) / `opto_strobe` (← Line1).
 - 12-bit readout formats are supported end-to-end in code (preview-safe
   option filtering); live A/B requires the full hardware rig.
 
