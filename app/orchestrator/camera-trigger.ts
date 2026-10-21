@@ -51,21 +51,19 @@ const BIDIRECTIONAL_LINES: ReadonlySet<string> = new Set(["Line2", "Line3"]);
  *  `LineInverter` write (null = written). */
 export type HardwareTriggerResult = { lineInverter: string | null };
 
-type BooleanFeatureWriter = {
-  setFeatureBool?: (name: string, value: boolean) => void;
-};
-
 /** `LineInverter` is a GenICam IBoolean. The native `setFeature` goes
  *  through `arv_camera_set_string`, which refuses non-string nodes
- *  ("[LineInverter:ArvGcBoolean] Not a ArvGcString"), so prefer a boolean
- *  writer when the binding has one and fall back to the string path. */
+ *  ("[LineInverter:ArvGcBoolean] Not a ArvGcString"), so the write goes
+ *  through the binding's `setFeatureBool` (`arv_camera_set_boolean`). The
+ *  string path stays as a fallback for a camera object without it (an older
+ *  addon build, or a test fake). */
 function setBooleanFeature(
   camera: CameraLease["camera"],
   name: string,
   value: boolean,
 ): void {
-  const writer = (camera as unknown as BooleanFeatureWriter).setFeatureBool;
-  if (typeof writer === "function") writer.call(camera, name, value);
+  if (typeof camera.setFeatureBool === "function")
+    camera.setFeatureBool(name, value);
   else camera.setFeature(name, value ? "true" : "false");
 }
 
@@ -90,9 +88,10 @@ const firstLine = (e: unknown): string =>
  * TriggerSelector=FrameStart, and TriggerActivation=RisingEdge. (Passing
  * "FrameStart" here fails with "[TriggerSource] 'FrameStart' not an entry".)
  * A source missing from `trigger_source_options` is refused up front with
- * the offered list. The `LineInverter` write is best-effort (see
- * {@link setBooleanFeature}): its failure is returned, not thrown, since the
- * camera default (`false`) is what the firmware expects. Runs through
+ * the offered list. `LineInverter` is written through the binding's boolean
+ * setter `setFeatureBool` (see {@link setBooleanFeature}); a failure of that
+ * one write is still returned, not thrown, since the camera default (`false`)
+ * is what the firmware expects. Runs through
  * `lease.reconfigure()` so shared-handle mutation stays on the lease's safe
  * path — pipe consumers ride the transient.
  */

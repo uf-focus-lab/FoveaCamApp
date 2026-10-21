@@ -72,6 +72,16 @@ declare module "core/Aravis" {
      *  `arv_camera_get_string` and throws on integer nodes. */
     getFeatureInt(name: string): number;
     setFeature(name: string, value: string): void;
+    /** Write an integer GenICam node (`arv_camera_set_integer`). A Number
+     *  must be a safe integer; a BigInt is passed through as int64. */
+    setFeatureInt(name: string, value: number | bigint): void;
+    /** Read a boolean GenICam node (e.g. `LineInverter`) — `getFeature` uses
+     *  `arv_camera_get_string` and throws "Not a ArvGcString" on IBoolean. */
+    getFeatureBool(name: string): boolean;
+    /** Write a boolean GenICam node (`arv_camera_set_boolean`), e.g.
+     *  `LineInverter` — `setFeature` goes through the string API and fails
+     *  on IBoolean nodes. */
+    setFeatureBool(name: string, value: boolean): void;
     executeFeature(name: string): void;
 
     // Exposure control

@@ -45,11 +45,12 @@ per-process exclusive — `architecture/processes.md`).
   cameras do this themselves when a session engages, so a camera's saved
   config does not need to be set up by hand. A trigger source that the
   camera does not list in `trigger_source_options` is refused with the list
-  it does offer. Caveat: `LineInverter` is a GenICam boolean, and the
-  current native `setFeature` binding (`arv_camera_set_string`) can only
-  write string and enumeration nodes. Until the binding gains a boolean
-  writer, that write is best-effort and the camera default (`false`) has to
-  hold. The engage diagnostics span records the live line state.
+  it does offer. `LineInverter` is a GenICam boolean, which the string
+  `setFeature` binding (`arv_camera_set_string`) cannot write, so it is now
+  written through the binding's `setFeatureBool` (`arv_camera_set_boolean`;
+  `getFeatureBool`, `setFeatureInt` and `getFeatureInt` cover the other
+  non-string nodes); a failure of that write is reported, not thrown. The
+  engage diagnostics span records the live line state.
 - **Polarity:** the non-isolated ExposureActive output on Line3 is read
   **active HIGH** (`LineInverter=false`, firmware
   `Board::STROBE_ACTIVE_LEVEL = HIGH`). It is not yet verified on the bench.

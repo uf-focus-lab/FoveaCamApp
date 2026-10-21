@@ -19,8 +19,11 @@ import {
 } from "@orchestrator/camera-trigger";
 import type { CameraLease } from "@orchestrator/registry";
 
-function makeFakeLease(opts: { triggerSourceOptions?: string[] } = {}) {
-  /** Every write in call order: setFeature + setTrigger + setFeatureBool. */
+function makeFakeLease(
+  opts: { triggerSourceOptions?: string[]; boolWriter?: boolean } = {},
+) {
+  /** Every write in call order: setFeature (`Name=value`), setTrigger
+   *  (`setTrigger=src`) and setFeatureBool (`Name:bool=value`). */
   const writes: string[] = [];
   const features: Record<string, string> = {};
   const camera: Record<string, any> = {
@@ -37,6 +40,13 @@ function makeFakeLease(opts: { triggerSourceOptions?: string[] } = {}) {
       return features[name];
     }),
   };
+  // The native binding's boolean setter (arv_camera_set_boolean). Omit it
+  // (boolWriter: false) to model an older addon build without the method.
+  if (opts.boolWriter !== false)
+    camera.setFeatureBool = vi.fn((name: string, value: boolean) => {
+      writes.push(`${name}:bool=${value}`);
+      features[name] = String(value);
+    });
   if (opts.triggerSourceOptions)
     camera.trigger_source_options = opts.triggerSourceOptions;
   const lease = {
@@ -79,7 +89,7 @@ describe("enableHardwareTrigger", () => {
       "LineSelector=Line3",
       "LineMode=Output",
       "LineSource=ExposureActive",
-      "LineInverter=false",
+      "LineInverter:bool=false",
     ]);
     expect(result).toEqual({ lineInverter: null });
     expect(camera.clearTriggers).not.toHaveBeenCalled();
@@ -92,23 +102,44 @@ describe("enableHardwareTrigger", () => {
       "LineSelector=Line3",
       "LineMode=Output",
       "LineSource=ExposureActive",
-      "LineInverter=false",
+      "LineInverter:bool=false",
     ]);
   });
 
-  it("prefers a native boolean writer for LineInverter when the binding has one", async () => {
-    const { lease, camera, writes } = makeFakeLease();
-    camera.setFeatureBool = vi.fn((name: string, value: boolean) => {
-      writes.push(`${name}:bool=${value}`);
-    });
+  it("writes LineInverter through the boolean setter, never the string one", async () => {
+    const { lease, camera } = makeFakeLease();
     await enableHardwareTrigger(lease);
+    expect(camera.setFeatureBool).toHaveBeenCalledTimes(1);
     expect(camera.setFeatureBool).toHaveBeenCalledWith("LineInverter", false);
-    expect(writes.at(-1)).toBe("LineInverter:bool=false");
     expect(camera.setFeature).not.toHaveBeenCalledWith("LineInverter", expect.anything());
   });
 
-  it("reports (does not throw) a LineInverter write the binding cannot do", async () => {
+  it("writes LineInverter=true through the boolean setter when asked", async () => {
     const { lease, camera } = makeFakeLease();
+    await enableHardwareTrigger(lease, { lineInverter: true });
+    expect(camera.setFeatureBool).toHaveBeenCalledWith("LineInverter", true);
+    expect(camera.setFeature).not.toHaveBeenCalledWith("LineInverter", expect.anything());
+  });
+
+  it("falls back to the string setter on a binding without setFeatureBool", async () => {
+    const { lease, writes } = makeFakeLease({ boolWriter: false });
+    const result = await enableHardwareTrigger(lease);
+    expect(writes.at(-1)).toBe("LineInverter=false");
+    expect(result).toEqual({ lineInverter: null });
+  });
+
+  it("reports (does not throw) a failed boolean LineInverter write", async () => {
+    const { lease, camera } = makeFakeLease();
+    camera.setFeatureBool.mockImplementation(() => {
+      throw new Error("[LineInverter] Not writable\nmore");
+    });
+    const result = await enableHardwareTrigger(lease);
+    expect(result.lineInverter).toBe("[LineInverter] Not writable");
+    expect(camera.setTrigger).toHaveBeenCalledWith("Line2");
+  });
+
+  it("reports (does not throw) a LineInverter write the string fallback cannot do", async () => {
+    const { lease, camera } = makeFakeLease({ boolWriter: false });
     const base = camera.setFeature.getMockImplementation()!;
     camera.setFeature.mockImplementation((name: string, value: string) => {
       if (name === "LineInverter")
@@ -135,7 +166,7 @@ describe("enableHardwareTrigger", () => {
       "LineSelector=Line1",
       "LineMode=Output",
       "LineSource=ExposureActive",
-      "LineInverter=true",
+      "LineInverter:bool=true",
     ]);
   });
 
@@ -188,7 +219,7 @@ describe("enableSoftwareTrigger", () => {
       "LineSelector=Line3",
       "LineMode=Output",
       "LineSource=ExposureActive",
-      "LineInverter=false",
+      "LineInverter:bool=false",
     ]);
   });
 });
