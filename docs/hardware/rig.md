@@ -26,21 +26,23 @@ per-process exclusive — `architecture/processes.md`).
 
   | `J_CAMn` pin | Camera line | Teensy pin C / L / R | Direction | Use |
   |---|---|---|---|---|
-  | 1 | Line3, non-isolated (also VAUX in) | 16 / 20 / 5 | camera → Teensy (INPUT_PULLUP) | **strobe** (ExposureActive) |
+  | 1 | Line3, non-isolated INPUT only, 2.6–3.6 V high (also VAUX in) | 16 / 20 / 5 | Teensy → camera (OUTPUT, 3.3 V) | **trigger** |
   | 2 | Line0, opto input | 17 / 21 / 13 | Teensy → camera | bench fallback only |
-  | 3 | Line2, non-isolated | 18 / 22 / 14 | Teensy → camera (OUTPUT) | **trigger** |
+  | 3 | Line2, non-isolated bidirectional, open-drain output | 18 / 22 / 14 | camera → Teensy (INPUT_PULLUP) | **strobe** (ExposureActive) |
   | 4 | Line1, opto output (open collector) | 19 / 23 / 15 | camera → Teensy (INPUT_PULLUP) | bench fallback only |
   | 5 | opto GND | board GND | | |
   | 6 | GND | board GND | | |
 
   Pins 5 and 6 both landing on board GND is the board designer's reading of
   the FLIR pinout and is still marked TODO in `pcb/board/specs.md` §4.
-  Check it against the FLIR GPIO diagram.
+  Check it against the FLIR GPIO diagram. Line roles follow FLIR's Blackfly S
+  GPIO documentation (2026-10-21): Line3 has no output mode, so it is the
+  trigger; Line2's output is open drain, so it is the strobe.
 - **Camera programming (host):** `enableHardwareTrigger`
   (`app/orchestrator/camera-trigger.ts`) writes, in order:
-  `LineSelector=Line2`, `LineMode=Input`; `TriggerSource=Line2` (Aravis also
-  sets `TriggerMode=On`, `TriggerSelector=FrameStart`,
-  `TriggerActivation=RisingEdge`); then `LineSelector=Line3`,
+  `TriggerSource=Line3` (Aravis also sets `TriggerMode=On`,
+  `TriggerSelector=FrameStart`, `TriggerActivation=RisingEdge`; Line3 is
+  input-only, so nothing to force); then `LineSelector=Line2`,
   `LineMode=Output`, `LineSource=ExposureActive`, `LineInverter=false`. The
   cameras do this themselves when a session engages, so a camera's saved
   config does not need to be set up by hand. A trigger source that the
@@ -51,44 +53,39 @@ per-process exclusive — `architecture/processes.md`).
   `getFeatureBool`, `setFeatureInt` and `getFeatureInt` cover the other
   non-string nodes); a failure of that write is reported, not thrown. The
   engage diagnostics span records the live line state.
-- **Polarity:** the non-isolated ExposureActive output on Line3 is read
-  **active HIGH** (`LineInverter=false`, firmware
-  `Board::STROBE_ACTIVE_LEVEL = HIGH`). It is not yet verified on the bench.
-  Scope one camera's `J_CAMn` pin 1 during a triggered exposure before the
-  first synced capture. If the line turns out to idle HIGH and pull LOW,
-  change the firmware constant. Nothing on the host side changes. A frame
-  REJ reading `Strobe timeout: line stuck at active level` means the line
-  never returned to idle: wrong polarity, or Line3 not set to
-  ExposureActive. The strobe pin has a pull-up, so an unplugged cable or a camera whose Line3
-  was never programmed reads HIGH, which looks like a permanent exposure
-  rather than an idle line.
+- **Polarity:** the Line2 ExposureActive output is open drain, so at the
+  Teensy's pull-up it reads **active LOW**: idle HIGH, pulled low while the
+  camera exposes (`LineInverter=false`, firmware
+  `Board::STROBE_ACTIVE_LEVEL = LOW`). An unplugged cable or a camera whose
+  Line2 was never programmed therefore reads idle and fails as a plain
+  `Strobe timeout`. A REJ reading `Strobe timeout: line stuck at active
+  level` means the line never returned to idle: `LineInverter` left on, or
+  Line2 held low for another reason. Not yet scope-verified: scope one
+  camera's `J_CAMn` pin 3 during a triggered exposure before the first synced
+  capture.
 - **Line3 / VAUX safety:** Line3 is also the camera's 8–24 V auxiliary
   power input (VAUX), and on this board it is wired straight to a Teensy
-  pin with a 3.6 V absolute maximum and no protection. **Never configure a
-  camera to put VAUX on Line3**, and never power a camera through its GPIO
-  cable. The only host configuration for Line3 is the 3.3 V ExposureActive
-  output above. The firmware keeps the Line3 pins as inputs from boot and
-  never drives them. Likewise, Line2 must stay an input on the camera
-  (the host forces `LineMode=Input`), because the Teensy drives it. If the
-  camera model offers a 3.3 V power output on Line2 (FLIR `V3_3Enable`),
-  leave it off. Plug in the ground pins (5, 6) before any signal line, as
-  FLIR warns.
+  pin with a 3.6 V absolute maximum and no protection. The Teensy's own
+  3.3 V trigger drive sits inside Line3's 2.6–3.6 V input window and is
+  safe; the hazard is an external supply on that net. **Never power a
+  camera through its GPIO cable** on this rig. If the camera model offers a
+  3.3 V power output on Line2 (FLIR `V3_3Enable`), leave it off: the Teensy
+  reads that line. Plug in the ground pins (5, 6) before any signal line,
+  as FLIR warns.
 - **Opto pair (bench fallback):** Line0/Line1 stay cabled but are not used.
-  The opto output (Line1) is open-collector and can only pull LOW, so its
-  ExposureActive reads **active LOW** at the Teensy. To use the pair,
-  program the cameras with
-  `enableHardwareTrigger(lease, { triggerSource: "Line0", lineSelector: "Line1", lineInverter: true })`
-  (the inverted line idles LOW and reads HIGH during exposure, matching
-  `STROBE_ACTIVE_LEVEL`), or build the firmware with
-  `Board::OPTO_STROBE_ACTIVE_LEVEL`. The firmware must also pulse the opto
-  trigger pins instead of Line2. The opto input wants the MCU pulse within
-  its voltage spec and adds µs-scale edge lag. That lag does not matter at
-  the ms-scale pulse widths `pairTriggerBudget` derives.
+  The opto output (Line1) is open-collector and has the same active-LOW
+  shape as Line2, so
+  `enableHardwareTrigger(lease, { triggerSource: "Line0", lineSelector: "Line1" })`
+  matches `STROBE_ACTIVE_LEVEL` as is; the firmware would also have to
+  pulse the opto trigger pins (`Board::camera[].opto_trigger`) instead of
+  Line3, which the V0.1 build does not. The opto input wants the MCU pulse
+  within its voltage spec and adds µs-scale edge lag. That lag does not
+  matter at the ms-scale pulse widths `pairTriggerBudget` derives.
 - **Controller side:** `firmware/include/Board.h` `camera[]` is indexed in
   the `Packet::Command` camera-mask bit order (0 = C, 1 = L, 2 = R). Its
   pin pairs are named from the controller's side: `trigger` (Teensy OUTPUT
-  → camera Line2) and `strobe` (Teensy INPUT ← camera Line3), plus the unused
-  `opto_trigger` (→ Line0) and `opto_strobe` (← Line1).
+  → camera Line3) and `strobe` (Teensy INPUT_PULLUP ← camera Line2), plus
+  the unused `opto_trigger` (→ Line0) and `opto_strobe` (← Line1).
 - 12-bit readout formats are supported end-to-end in code (preview-safe
   option filtering); live A/B requires the full hardware rig.
 
@@ -185,7 +182,7 @@ connect, and v2-only surfaces are gated on `v2Capable`.
 3. **Cameras:** connect each GPIO cable to its `J_CAMn` (grounds first;
    observe the Line3/VAUX rule above). In Manage Cameras, assign roles and
    run the Fovea Pair **Trigger** test. With a Wide Angle camera assigned,
-   it covers C too. Scope the Line3 strobe polarity before the first synced
+   it covers C too. Scope the Line2 strobe polarity before the first synced
    capture.
 4. **Rig verification:** hardware verification runs the pre-flight and
    playbook passes, exports profiler snapshots as the baseline, and works

@@ -17,34 +17,36 @@ import type { CameraLease } from "./registry.js";
  *  which cables all four lines of every camera (C, L and R) 1:1 through
  *  `J_CAMn`:
  *
- *  - `triggerSource` = **Line2** (non-isolated, bidirectional 3.3 V): the
- *    camera input the Teensy drives (`Board::camera[n].trigger`).
- *  - `lineSelector` = **Line3** (non-isolated, bidirectional 3.3 V): the
- *    camera drives ExposureActive into a Teensy INPUT_PULLUP pin
- *    (`Board::camera[n].strobe`). Line3 doubles as the camera's 8-24 V VAUX
- *    input; the Teensy never drives it, and the camera must never be set to
- *    put VAUX on it.
+ *  - `triggerSource` = **Line3** (FLIR BFS: non-isolated INPUT-ONLY line,
+ *    high 2.6..3.6 V, pin 1): the camera input the Teensy drives at 3.3 V
+ *    (`Board::camera[n].trigger`). Line3 is also the camera's 8-24 V VAUX
+ *    power input; never power a camera through its GPIO cable on this rig.
+ *  - `lineSelector` = **Line2** (non-isolated bidirectional, pin 3): set as
+ *    an ExposureActive output. The BFS Line2 output is OPEN DRAIN, so it
+ *    pulls the Teensy's INPUT_PULLUP pin (`Board::camera[n].strobe`) LOW
+ *    while exposing and releases it otherwise.
  *  - `lineInverter` = **false**: the firmware reads ExposureActive as
- *    active-HIGH (`Board::STROBE_ACTIVE_LEVEL`).
+ *    active-LOW (`Board::STROBE_ACTIVE_LEVEL = LOW`), so an idle, unplugged
+ *    or unprogrammed line reads released. `true` would make the line idle LOW
+ *    and read as a permanent exposure ("line stuck at active level").
  *
  *  Bench fallback, the opto pair: `{ triggerSource: "Line0", lineSelector:
- *  "Line1" }`. Line1 is an open-collector opto output that can only pull
- *  LOW, so ExposureActive reads active-LOW at the Teensy. Using it needs
- *  either `lineInverter: true` (the line then idles LOW and the pull-up
- *  reads HIGH during exposure, matching `STROBE_ACTIVE_LEVEL`) or a firmware
- *  built with `Board::OPTO_STROBE_ACTIVE_LEVEL`. The V0.1 firmware pulses
- *  Line2, not Line0, so an opto trigger also needs a firmware that drives
- *  the opto pins. Verify the names against `lease.camera.trigger_source_options`
- *  on a new camera model ({@link enableHardwareTrigger} checks it). */
+ *  "Line1" }`. Line1 is an open-collector opto output with the same
+ *  active-LOW shape, so `lineInverter` stays false; the firmware would still
+ *  have to pulse the Line0 pins (`Board::camera[n].opto_trigger`), which the
+ *  V0.1 build does not. Verify the names against
+ *  `lease.camera.trigger_source_options` on a new camera model
+ *  ({@link enableHardwareTrigger} checks it). */
 export interface TriggerLines {
   triggerSource?: string;
   lineSelector?: string;
   lineInverter?: boolean;
 }
 
-/** FLIR lines that are bidirectional (non-isolated), the only ones whose
- *  `LineMode` is writable; Line0/Line1 are fixed-direction opto lines. */
-const BIDIRECTIONAL_LINES: ReadonlySet<string> = new Set(["Line2", "Line3"]);
+/** FLIR BFS lines whose `LineMode` is writable: only Line2. Line0/Line1 are
+ *  fixed-direction opto lines and Line3 is input-only, so a trigger on any of
+ *  those needs no `LineMode=Input` write. */
+const BIDIRECTIONAL_LINES: ReadonlySet<string> = new Set(["Line2"]);
 
 /** What {@link enableHardwareTrigger} could not program, for the caller's
  *  diagnostics. `lineInverter` is the first error line of a failed
@@ -75,10 +77,10 @@ const firstLine = (e: unknown): string =>
  * `lineSelector` as an ExposureActive output (strobe) via the generic
  * feature accessors. The GenICam sequence, in order:
  *
- * 1. `LineSelector=<triggerSource>`, `LineMode=Input`, only for a
- *    bidirectional trigger line (Line2/Line3), so a camera whose saved
- *    config left that line as an output never drives against the Teensy's
- *    trigger pin.
+ * 1. `LineSelector=<triggerSource>`, `LineMode=Input`, only when the
+ *    trigger line is the bidirectional Line2, so a camera whose saved config
+ *    left it as an output never drives against the Teensy's trigger pin.
+ *    (The default Line3 is input-only on the BFS; nothing to force.)
  * 2. `setTrigger(triggerSource)`.
  * 3. `LineSelector=<lineSelector>`, `LineMode=Output`,
  *    `LineSource=ExposureActive`, `LineInverter=<lineInverter>`.
@@ -91,15 +93,15 @@ const firstLine = (e: unknown): string =>
  * the offered list. `LineInverter` is written through the binding's boolean
  * setter `setFeatureBool` (see {@link setBooleanFeature}); a failure of that
  * one write is still returned, not thrown, since the camera default (`false`)
- * is what the firmware expects. Runs through
+ * is what the firmware's active-LOW open-drain read expects. Runs through
  * `lease.reconfigure()` so shared-handle mutation stays on the lease's safe
  * path — pipe consumers ride the transient.
  */
 export async function enableHardwareTrigger(
   lease: CameraLease,
   {
-    triggerSource = "Line2",
-    lineSelector = "Line3",
+    triggerSource = "Line3",
+    lineSelector = "Line2",
     lineInverter = false,
   }: TriggerLines = {},
 ): Promise<HardwareTriggerResult> {
@@ -173,9 +175,8 @@ const TRIGGER_CONFIG_FEATURES = [
   "LineSelector",
   "LineMode",
   "LineSource",
-  // IBoolean: the string reader reports `<error: … Not a ArvGcString>` until
-  // the binding grows a boolean getter.
-  "LineInverter",
+  "LineInverter", // IBoolean: read through getFeatureBool when available
+
   "ExposureMode",
   "ExposureAuto",
 ] as const;
@@ -196,7 +197,11 @@ export function readTriggerConfig(lease: CameraLease): Record<string, string> {
     }
   };
   for (const name of TRIGGER_CONFIG_FEATURES)
-    probe(name, () => camera.getFeature(name));
+    probe(name, () =>
+      name === "LineInverter" && typeof camera.getFeatureBool === "function"
+        ? String(camera.getFeatureBool(name))
+        : camera.getFeature(name),
+    );
   probe("trigger_source", () => camera.trigger_source);
   probe("trigger_source_options", () => camera.trigger_source_options.join(", "));
   return out;
