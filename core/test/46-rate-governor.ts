@@ -17,11 +17,15 @@
 //      link; multiplicative halve → floor on EACH pressure signal (EAGAIN
 //      burst, outq HIGH breach, RTT inflation), then re-probe upward; the
 //      floor and ceiling clamp; a lowered ceiling clamps immediately.
-//   3. FAIRNESS — under a full-rate flood, a pending two-phase request older
-//      than fairnessMs DEFERS updates (counted) until its ACK; the request
-//      completes within the deadline; maxDeferMs caps starvation.
+//   3. FAIRNESS — OFF by default (fairnessMs = 0: a FIFO link gains nothing
+//      from holding UPDATEs behind an already-written request, and holding
+//      them froze the mirror behind every pending two-phase CMD_FRAME —
+//      asserted in §1). Opted in (fairnessMs > 0), under a full-rate flood a
+//      pending request older than fairnessMs DEFERS updates (counted) until
+//      its ACK; maxDeferMs caps starvation.
 //   4. OFF SWITCH — `setGovernor({enabled:false})` pins the fixed
-//      1 ms gate (throttle behavior identical; no governor evaluation).
+//      minIntervalUs gate (throttle behavior identical; no governor
+//      evaluation).
 //   5. FRAMING under real EAGAIN — flooding an undrained pty until the
 //      kernel buffer fills produces txSoftFail events while every frame that
 //      reaches the wire still decodes cleanly (short writes
@@ -46,6 +50,8 @@ const C = Controller as unknown as {
       outqHighWater: number;
       outqSupported: boolean;
       txSoftFail: number;
+      inFlight: number;
+      txQueuedBytes: number;
       ackRttMs: { p50: number; p95: number; max: number; count: number; baselineP50: number };
       governor: { effectiveRateHz: number; ceilingHz: number; state: string };
     };
@@ -62,7 +68,7 @@ type Sink = {
   probe(): {
     received: number; written: number; deduped: number; throttled: number;
     errors: number; deferred: number; backoffs: number; open: boolean;
-    effectiveRateHz: number; ceilingHz: number; governorState: string;
+    effectiveRateHz: number; ceilingHz: number; minIntervalUs: number; governorState: string;
     ackRttP50: number; ackRttP95: number; ackRttCount: number;
   };
   setGovernor(p: object): void;
@@ -128,6 +134,14 @@ const drainTimer = setInterval(drainPty, 10); // keep the pty buffer empty
   assert.equal(st.ackRttMs.count, 8, "rtt samples recorded");
   assert.equal(st.ackRttMs.baselineP50, 2, "connect-time baseline = median of first samples");
   assert.equal(st.governor.state, "steady", "governor mirror live (defaults)");
+  {
+    // Re-derived V0.1 defaults (spec serial-protocol.md#rate-limits): 200 µs
+    // emission floor, 5 kHz ceiling (the session lowers it to its rate).
+    const p = sink.probe();
+    assert.equal(p.minIntervalUs, 200, "default emission floor 200 µs");
+    assert.equal(p.ceilingHz, 5000, "default ceiling 5 kHz");
+    assert.equal(p.effectiveRateHz, 5000, "optimistic start at the ceiling");
+  }
   assert(st.outqSupported, "TIOCOUTQ supported on this platform (Linux tty)");
   // PROBE PING coexists with the active stream (SYS_TIMESTAMP GET is not
   // Actuate): fire one against the silent pty — the WRITE must succeed (the
@@ -139,6 +153,16 @@ const drainTimer = setInterval(drainPty, 10); // keep the pty buffer empty
   await sleep(30);
   const st2 = dev.stats;
   assert(st2.txSoftFail === 0, "ping + stream writes clean (no soft fails)");
+  assert(st2.inFlight >= 1, "the unanswered ping is counted in flight");
+  // FAIRNESS OFF BY DEFAULT: the ping now sits pending inside the old
+  // 5..100 ms defer window — UPDATEs must keep flowing, none deferred.
+  {
+    const before = sink.probe();
+    await sleep(60);
+    const after = sink.probe();
+    assert.equal(after.deferred, before.deferred, "no UPDATE deferred behind a pending request (default)");
+    assert(after.written > before.written, "stream keeps writing while the request is pending");
+  }
   stop();
   console.log("46-rate-governor: pressure stats + probe-ping/stream coexistence OK.");
 }
@@ -207,6 +231,7 @@ const drainTimer = setInterval(drainPty, 10); // keep the pty buffer empty
 
 // --- 3: fairness deferral under full-rate flood ---------------------------------
 {
+  // Opt-in: the reserve is OFF by default (see §1); enable it explicitly.
   sink.setGovernor({ ...EVAL, ceilingHz: 1000, fairnessMs: 5, maxDeferMs: 150 });
   const stop = startDrive(compose);
   await sleep(50);
@@ -240,16 +265,16 @@ const drainTimer = setInterval(drainPty, 10); // keep the pty buffer empty
     assert.equal(p.effectiveRateHz, 0, "no governed rate advertised");
   }
   assert.equal(dev.stats.governor.state, "off", "stats mirror reports off");
-  // Fixed 1 ms gate still applies: a 3 ms-spaced pair of distinct
-  // poses both write; pressure signals change NOTHING while off.
+  // The fixed minIntervalUs gate still applies: a 3 ms-spaced pair of
+  // distinct poses both write; pressure signals change NOTHING while off.
   dev.__testPressure({ outq: 100000, softFail: 5 });
   // Timing flake guard: a preceding flood can finish <1 ms before this pose, so
-  // the fixed 1 ms gate would THROTTLE pose 1 (dropped — latest-wins has no
+  // the fixed min-interval gate would THROTTLE pose 1 (dropped — latest-wins has no
   // retry) and only pose 2 writes. Clear the min-interval first, then confirm
   // each pose actually lands before the next. The assertion's meaning is
   // unchanged: with the governor off, both DISTINCT spaced poses write through
-  // the fixed 1 ms gate.
-  await sleep(5); // clear the fixed 1 ms min-interval after the flood
+  // the fixed min-interval gate.
+  await sleep(5); // clear the fixed min-interval (≤ 1 ms) after the flood
   const w0 = sink.probe().written;
   compose.rebase({ vPid: { l: { x: 500, y: 1 }, r: { x: 0, y: 0 } }, feedForward: false });
   await waitFor(() => sink.probe().written - w0 >= 1, "first off-switch pose written");
@@ -268,7 +293,7 @@ const drainTimer = setInterval(drainPty, 10); // keep the pty buffer empty
   clearInterval(drainTimer);
   drainPty(); // start from an empty buffer
   const sf0 = dev.stats.txSoftFail;
-  sink.setGovernor({ enabled: false }); // fixed 1 kHz gate — maximum push
+  sink.setGovernor({ enabled: false }); // fixed minIntervalUs gate — maximum push
   const stop = startDrive(compose);
   // Flood until the kernel tty buffer fills → real EAGAIN/short-write events.
   await waitFor(() => dev.stats.txSoftFail > sf0, "real EAGAIN under flood", 30000);

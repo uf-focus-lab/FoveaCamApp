@@ -159,6 +159,14 @@ declare module "core/Controller" {
        *  overflow event. Short writes are framing-safe (the remainder is
        *  tailed and completes before any new frame starts). */
       txSoftFail: number;
+      /** Requests awaiting their ACK/FIN right now. Requests are PIPELINED:
+       *  any number may be in flight, matched to responses by seq (docs/spec/
+       *  serial-protocol.md#pipelining). */
+      inFlight: number;
+      /** ACK-backed request bytes queued in the write seam behind a full
+       *  kernel tty queue (drained by the rx thread on POLLOUT) — a burst
+       *  past the kernel buffer queues instead of throwing. */
+      txQueuedBytes: number;
       /** ACK round-trip rolling stats over the trailing window, from the
        *  existing two-phase request timing (+ the ~2 Hz probe ping).
        *  `baselineP50` = the connect-time baseline the governor's inflation
@@ -197,8 +205,11 @@ declare module "core/Controller" {
      * Sequence == 0 fire-and-forget: the firmware performs the SET but sends
      * no ACK/FIN/REJ at
      * all — no promise, no pending-map entry. Intended for high-rate
-     * stream position updates (CMD_STREAM UPDATE, ~1kHz); throws
-     * synchronously on a transport/encode failure.
+     * stream position updates (CMD_STREAM UPDATE, multi-kHz); written at
+     * once, never behind an unanswered request. Latest-wins under
+     * backpressure: a frame that cannot start on a full kernel queue is
+     * dropped (counted in txSoftFail) and throws synchronously, like any
+     * transport/encode failure.
      */
     fireAndForget<T>(fn: PacketFactory<T>, arg: T | BufferLike): void;
 
@@ -255,12 +266,13 @@ declare module "core/Controller" {
    * The controller's NATIVE position in-port: accepts FINAL volts off a port
    * link's delivery
    * thread and natively replicates the JS StreamHandle.update path — the
-   * stream-update GATE (1 ms min interval + dedupe), the channels() volt→DAC
+   * stream-update GATE (min interval — `minIntervalUs`, default 200 µs — +
+   * dedupe), the channels() volt→DAC
    * conversion, and the CMD_STREAM UPDATE fire-and-forget write through the
    * device's shared write seam (one mutex — never interleaves with NAPI
    * writes; the seam closes BEFORE the fd on device release, so post-
    * disconnect writes are counted no-ops). Each accepted write records into
-   * a fixed 4096-sample native history ring (the mirror-history authority
+   * a fixed 16384-sample native history ring (the mirror-history authority
    * for NATIVELY-driven inputs). Stream lifecycle stays JS: create/TERMINATE
    * ride `Controller.createStream` (quiesce ownership unchanged).
    */
@@ -274,7 +286,7 @@ declare module "core/Controller" {
       throttled: number;
       errors: number;
       /** Fairness-reserve deferrals (coalesced UPDATEs behind a pending
-       *  two-phase request). */
+       *  request) — only when opted in (`fairnessMs > 0`; default off). */
       deferred: number;
       /** Governor multiplicative decreases. */
       backoffs: number;
@@ -283,6 +295,8 @@ declare module "core/Controller" {
       /** The governed emission rate (0 when the governor is off). */
       effectiveRateHz: number;
       ceilingHz: number;
+      /** The emission floor (µs) — no two UPDATEs closer than this. */
+      minIntervalUs: number;
       governorState: "off" | "steady" | "seeking" | "backoff";
       /** ACK-RTT view — the session's serial-latency estimate reads
        *  p50 here at its stats throttle. */
@@ -291,8 +305,12 @@ declare module "core/Controller" {
       ackRttCount: number;
     };
     /** Live-retune the AIMD governor (partial update; named errors on bad
-     *  ranges). `enabled: false` pins the fixed 1 ms gate exactly.
-     *  The session sets `ceilingHz` = the global prediction_rate_hz. */
+     *  ranges). `enabled: false` pins the fixed `minIntervalUs` gate exactly.
+     *  The session sets `ceilingHz` = the global prediction_rate_hz.
+     *  Defaults (docs/spec/serial-protocol.md#rate-limits): ceilingHz 5000,
+     *  floorHz 60, stepHz 125, evalMs 100, outqLow 256, outqHigh 1024,
+     *  rttInflation 2, fairnessMs 0 (reserve OFF), maxDeferMs 100,
+     *  minIntervalUs 200. */
     setGovernor(params: {
       enabled?: boolean;
       ceilingHz?: number;
@@ -302,8 +320,11 @@ declare module "core/Controller" {
       outqLow?: number;
       outqHigh?: number;
       rttInflation?: number;
+      /** Defer UPDATEs behind a request pending this long; 0 = off. */
       fairnessMs?: number;
       maxDeferMs?: number;
+      /** Emission floor in µs (0..1e6). */
+      minIntervalUs?: number;
     }): void;
     historyLatest(): MirrorHistorySample | null;
     historyAt(tNs: bigint): MirrorHistoryAt | null;

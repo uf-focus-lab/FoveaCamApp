@@ -52,21 +52,41 @@ int SerialOpen(const Napi::CallbackInfo &info) noexcept {
     ::close(fd);
     JS_THROW(Error, "Failed to get serial port attributes", -1);
   }
-  // Set baud rate
+  // Set baud rate. The controller is a Teensy 4.0 USB CDC-ACM device
+  // (480 Mbit/s high-speed USB): the line rate is a NO-OP on it — bytes move
+  // at USB speed whatever is set here, so nothing host-side may assume a
+  // real UART's per-byte time (115200 baud would be ~87 µs/byte; the real
+  // per-packet cost is USB microframe + MCU loop latency, see
+  // docs/spec/serial-protocol.md#pipelining). It stays settable for a real
+  // UART bridge. (Never 134: Teensy treats that line coding as "reboot into
+  // the bootloader".) termios wants the B<rate> constant, not the integer —
+  // on Linux B115200 != 115200 and cfset*speed(115200) fails with EINVAL.
+  speed_t speed;
   switch (baud) {
   case 9600:
+    speed = B9600;
+    break;
   case 19200:
+    speed = B19200;
+    break;
   case 38400:
+    speed = B38400;
+    break;
   case 57600:
+    speed = B57600;
+    break;
   case 115200:
+    speed = B115200;
+    break;
   case 230400:
+    speed = B230400;
     break;
   default:
     ::close(fd);
     JS_THROW(Error, "Unsupported baud rate: " + std::to_string(baud), -1);
   }
-  cfsetispeed(&tty, baud);
-  cfsetospeed(&tty, baud);
+  cfsetispeed(&tty, speed);
+  cfsetospeed(&tty, speed);
   // Configure 8N1 (8 data bits, no parity, 1 stop bit) by default
   tty.c_cflag &= ~PARENB; // No parity
   tty.c_cflag &= ~CSTOPB; // 1 stop bit
