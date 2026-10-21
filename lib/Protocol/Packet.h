@@ -6,6 +6,9 @@
 #pragma once
 
 #include <cstddef> // offsetof (wire-layout static_asserts below)
+#include <cstring> // std::memcpy (Trajectory::View::as)
+
+#include <COBS/TX.h> // COBS::MaxPacketSize (Trajectory::CHUNK_SAMPLES)
 
 #include "Protocol.h"
 
@@ -200,6 +203,200 @@ static_assert(offsetof(FrameResult, t_trigger) == 5);
 static_assert(offsetof(FrameResult, t_exposure) == 13);
 static_assert(offsetof(FrameResult, left) == 21);
 static_assert(offsetof(FrameResult, right) == 29);
+
+// ============================================================================
+// v2.2.0 — timestamped keyframes (CMD_SCHEDULE) and uploaded trajectories
+// (CMD_TRAJECTORY). Both run in the MCU Global::time µs domain (same clock as
+// SYS_TIMESTAMP and FrameResult). spec: docs/spec/serial-protocol.md#schedule,
+// docs/spec/serial-protocol.md#trajectory.
+// ============================================================================
+
+// SET request: append one keyframe to an EXISTING stream's time-ordered
+// schedule ring (firmware Streams.cpp, depth Streams::SCHEDULE_DEPTH). The
+// stream's target becomes `left`/`right` once Global::time >= t_apply; with
+// INTERPOLATE the target ramps linearly from the previous keyframe (or, for a
+// keyframe arriving into an empty schedule, from the stream's current target
+// at arrival) to this one, re-evaluated every loop tick. A late keyframe
+// (t_apply <= now) applies on the next tick; one older than the last APPLIED
+// keyframe is dropped and counted. CMD_STREAM UPDATE clears the schedule.
+// Single-phase: ACK echoes the payload; seq == 0 is fire-and-forget (silent,
+// drops still counted). REJ: system disabled, unknown stream, schedule full,
+// stale keyframe, a running trajectory owns the DAC.
+FIXED_SIZE_PACKET(Schedule, CMD_SCHEDULE) {
+  typedef enum Flag : uint8_t { NONE = 0, INTERPOLATE = 1 } Flag;
+  uint8_t stream;    // CMD_STREAM id (must exist)
+  uint8_t flags;     // Flag bitmask
+  Timestamp t_apply; // MCU µs at which the keyframe takes effect
+  MirrorPosition left;
+  MirrorPosition right;
+};
+
+static_assert(sizeof(Schedule) == 26,
+              "Schedule = stream(1)+flags(1)+t_apply(8)+left(8)+right(8)");
+static_assert(offsetof(Schedule, stream) == 0);
+static_assert(offsetof(Schedule, flags) == 1);
+static_assert(offsetof(Schedule, t_apply) == 2);
+static_assert(offsetof(Schedule, left) == 10);
+static_assert(offsetof(Schedule, right) == 18);
+
+// One trajectory table sample: the mirror target at `t_offset` µs into the
+// period. Offsets are strictly increasing and < period (checked at COMMIT).
+PACKED(TrajectorySample) {
+  Microseconds t_offset;
+  MirrorPosition left;
+  MirrorPosition right;
+};
+static_assert(sizeof(TrajectorySample) == 20,
+              "TrajectorySample = t_offset(4)+left(8)+right(8)");
+
+// CMD_TRAJECTORY SET is op-tagged and VARIABLE-size: byte 0 is the Op, byte 1
+// the table id, then the op's fixed fields below; DATA additionally carries
+// `count` TrajectorySamples right after its header. Every op is single-phase
+// (ACK/REJ); the ACK echoes the op's fixed header (DATA: header only, no
+// samples). Results are NOT request-bound: each marker capture pushes
+// `SYN CMD_TRAJECTORY` (seq 0) with a TrajectoryFrame payload.
+PACKED(TrajectoryBegin) { // allocate (or re-allocate) table `id`
+  uint8_t op;             // Trajectory::BEGIN
+  uint8_t id;
+  uint16_t sample_count; // samples the table will hold (>= 1)
+  Microseconds period;   // cycle length, µs (> 0)
+  uint8_t flags;         // Trajectory::Flag bitmask
+};
+PACKED(TrajectoryData) { // fill samples [first_index, first_index + count)
+  uint8_t op;            // Trajectory::DATA
+  uint8_t id;
+  uint16_t first_index;
+  uint8_t count; // 1..Trajectory::CHUNK_SAMPLES samples follow
+};
+PACKED(TrajectoryMark) { // place (cameras != 0) or clear (cameras == 0) marker
+  uint8_t op;            // Trajectory::MARK
+  uint8_t id;
+  uint8_t marker;        // 0..MAX_MARKERS-1 (firmware Trajectory.h)
+  Microseconds t_offset; // trigger phase inside the period (< period)
+  uint8_t cameras;       // CameraMask
+  Microseconds pulse;    // trigger pulse width, µs (> 0)
+};
+PACKED(TrajectoryStart) {
+  uint8_t op; // Trajectory::START
+  uint8_t id;
+  Timestamp t_start; // MCU µs of phase 0, cycle 0 (0 = now)
+  uint32_t cycles;   // cycles to run (0 = forever)
+};
+PACKED(TrajectoryRef) { // COMMIT / STOP / DELETE
+  uint8_t op;
+  uint8_t id;
+};
+
+static_assert(sizeof(TrajectoryBegin) == 9);
+static_assert(sizeof(TrajectoryData) == 5);
+static_assert(sizeof(TrajectoryMark) == 12);
+static_assert(sizeof(TrajectoryStart) == 14);
+static_assert(sizeof(TrajectoryRef) == 2);
+static_assert(offsetof(TrajectoryBegin, sample_count) == 2);
+static_assert(offsetof(TrajectoryBegin, period) == 4);
+static_assert(offsetof(TrajectoryBegin, flags) == 8);
+static_assert(offsetof(TrajectoryData, first_index) == 2);
+static_assert(offsetof(TrajectoryData, count) == 4);
+static_assert(offsetof(TrajectoryMark, t_offset) == 3);
+static_assert(offsetof(TrajectoryMark, cameras) == 7);
+static_assert(offsetof(TrajectoryMark, pulse) == 8);
+static_assert(offsetof(TrajectoryStart, t_start) == 2);
+static_assert(offsetof(TrajectoryStart, cycles) == 10);
+
+// SYN CMD_TRAJECTORY push payload: one per marker firing (plus one ENDED push
+// when a finite run completes). `result` is the same exposure-averaged
+// FrameResult CMD_FRAME's FIN carries, with result.stream = the trajectory id
+// and result.frame_id the firmware-monotonic capture counter shared with
+// CMD_FRAME. Only meaningful when status == OK; on a failure status the
+// timestamps that were latched are kept and the rest is zero.
+PACKED(TrajectoryFrame) {
+  typedef enum Status : uint8_t {
+    OK = 0,
+    STROBE_TIMEOUT = 1, // no complete strobe within pulse + margin
+    BUSY = 2,      // capture engine busy at the marker phase — not triggered
+    CANCELLED = 3, // in-flight capture cancelled (System::Enable(false))
+    ENDED = 4,     // finite run completed (marker = NO_MARKER, cycle = cycles)
+  } Status;
+  static constexpr uint8_t NO_MARKER = 0xFF;
+  uint8_t id;
+  uint8_t marker;
+  uint32_t cycle; // 0-based cycle index the marker fired in
+  uint8_t status; // Status
+  FrameResult result;
+};
+static_assert(sizeof(TrajectoryFrame) == 44,
+              "TrajectoryFrame = id(1)+marker(1)+cycle(4)+status(1)+"
+              "FrameResult(37)");
+static_assert(offsetof(TrajectoryFrame, cycle) == 2);
+static_assert(offsetof(TrajectoryFrame, status) == 6);
+static_assert(offsetof(TrajectoryFrame, result) == 7);
+
+// The CMD_TRAJECTORY packet type: op-dispatched, variable size, so it is NOT a
+// FixedSizePacket. validate() only requires op + id (the handler REJects a
+// wrong per-op length with a specific reason); inflate() returns a view of the
+// raw payload. Plugged into the firmware dispatch with the same CASE_SET macro.
+class Trajectory : public Protocol::Packet<Protocol::Property::CMD_TRAJECTORY> {
+public:
+  using Prototype = Trajectory;
+  typedef enum Op : uint8_t {
+    BEGIN = 0,
+    DATA = 1,
+    MARK = 2,
+    COMMIT = 3,
+    START = 4,
+    STOP = 5,
+    DELETE = 6,
+  } Op;
+  typedef enum Flag : uint8_t {
+    NONE = 0,
+    STEP = 1, // hold each sample until the next (default: linear interpolation)
+  } Flag;
+  // Samples per DATA chunk: the largest count whose packet (header + DATA
+  // header + samples) still fits one COBS frame (COBS::MaxPacketSize).
+  static constexpr uint8_t CHUNK_SAMPLES = static_cast<uint8_t>(
+      (COBS::MaxPacketSize - sizeof(Protocol::Header) -
+       sizeof(TrajectoryData)) /
+      sizeof(TrajectorySample));
+
+  struct View {
+    const uint8_t *data;
+    size_t size;
+    Op op() const { return static_cast<Op>(data[0]); }
+    uint8_t id() const { return data[1]; }
+    // Copy-out (the payload sits unaligned inside the packet).
+    template <typename T> T as() const {
+      T out{};
+      std::memcpy(&out, data, sizeof(T) <= size ? sizeof(T) : size);
+      return out;
+    }
+  };
+  using Inflated = const View &;
+
+  // Fixed header size for `op` (0 = unknown op).
+  static constexpr size_t headerSize(uint8_t op) {
+    return op == BEGIN    ? sizeof(TrajectoryBegin)
+           : op == DATA   ? sizeof(TrajectoryData)
+           : op == MARK   ? sizeof(TrajectoryMark)
+           : op == START  ? sizeof(TrajectoryStart)
+           : op == COMMIT || op == STOP || op == DELETE ? sizeof(TrajectoryRef)
+                                                         : 0;
+  }
+  static bool validate(const Protocol::RawPacket &packet) {
+    return packet.dataSize() >= sizeof(TrajectoryRef);
+  }
+  static View inflate(const Protocol::RawPacket &packet) {
+    return {packet.data(), packet.dataSize()};
+  }
+  // MCU-side handler (firmware/src/Protocol.cpp).
+  static void SET(const Protocol::Sequence &seq, Inflated payload);
+};
+
+static_assert(Trajectory::CHUNK_SAMPLES == 12,
+              "DATA chunk = (254 - 4 - 5) / 20 samples");
+static_assert(sizeof(Protocol::Header) + sizeof(TrajectoryData) +
+                      Trajectory::CHUNK_SAMPLES * sizeof(TrajectorySample) <=
+                  COBS::MaxPacketSize,
+              "a full DATA chunk fits one COBS frame");
 
 } // namespace Command
 

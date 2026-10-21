@@ -57,6 +57,7 @@ add_executable(fovea-fw-sim
   ${FW_DIR}/src/Protocol.cpp
   ${FW_DIR}/src/Streams.cpp
   ${FW_DIR}/src/Capture.cpp
+  ${FW_DIR}/src/Trajectory.cpp
   ${FW_DIR}/src/Global.cpp
   ${FW_DIR}/src/MEMS.cpp
   ${SHARED_LIB_SRCS}

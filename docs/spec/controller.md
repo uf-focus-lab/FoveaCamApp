@@ -35,6 +35,17 @@ the return for telemetry / homography feeders. Optional `onApplied(volts, actuat
 delivers the v1 awaited readback. When no controller is bound the last predicted value
 is returned (the mirror holds) and nothing is recorded.
 
+### Timestamped and uploaded motion (v2.2.0)
+
+The node does not route the protocol v2.2.0 surfaces yet: `StreamHandle.scheduleAt`
+(CMD_SCHEDULE keyframes) and `Controller.uploadTrajectory` (CMD_TRAJECTORY, MirrorLink)
+are `Controller`-level APIs (`docs/spec/serial-protocol.md#schedule`, `#trajectory`).
+Caveat for a future integration: `mirrorHistory.record` runs only in `update()`, so
+neither a scheduled keyframe nor a trajectory's MCU-side playback lands in mirror
+history — a trajectory's per-frame mirror position comes from its `onFrame`
+outcomes (exposure-averaged, trusted host-ns), and a running trajectory REJects the
+node's stream UPDATEs.
+
 ### Enable lifecycle
 
 Enable on first update against a live disabled controller (tracked `enabledByUs`);

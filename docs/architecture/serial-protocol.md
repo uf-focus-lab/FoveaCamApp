@@ -49,6 +49,31 @@ wedge into a ≤1 s glitch.
   active stream — `Streams::snapshot()` would report the stream target
   rather than the DAC's actual state. A control loop owns its stream
   exclusively while running.
+- **CMD_SCHEDULE (protocol v2.2.0)** — timestamped keyframes on an existing
+  stream: `StreamHandle.scheduleAt(hostNs, pos, { interpolate })` converts the
+  host-steady instant to the MCU clock through the controller's calibrated
+  offset (the inverse of the FIN decode) and sends it fire-and-forget. The
+  firmware applies each keyframe at its MCU time from a 32-deep per-stream ring,
+  optionally ramping linearly between keyframes at DAC write rate, so serial
+  jitter no longer lands in the motion. `update()` still means "now, latest
+  wins" and clears pending keyframes. Spec: `docs/spec/serial-protocol.md#schedule`.
+- **CMD_TRAJECTORY (protocol v2.2.0) — MirrorLink.** For a periodic motion
+  with captures at fixed phases, even timestamped streaming wastes the link:
+  every sample crosses the wire, and each frame needs its own CMD_FRAME round
+  trip whose trigger instant still depends on host scheduling.
+  `Controller.uploadTrajectory({ samples, periodUs, markers })` uploads the
+  table once (ACK-backed, 12-sample DATA chunks pipelined) and the MCU plays it
+  back on its own clock: the DAC follows the table at phase `(t − t_start) mod
+  period` and each marker fires the cameras through the same capture engine as
+  CMD_FRAME (strobe tracking, exposure-averaged positions, timeout) when the
+  phase crosses it. Results come back as pushes (`SYN CMD_TRAJECTORY` →
+  `Device.onPush` → `handle.onFrame`, decoded like `FrameOutcome`), so the
+  steady state is zero bytes host→MCU and one small push per trigger. A running
+  trajectory owns the DAC (stream UPDATE / SCHEDULE are refused); `stop()`
+  holds the last position until the next stream write. Spec:
+  `docs/spec/serial-protocol.md#trajectory`.
+- Both v2.2.0 surfaces are gated on firmware `>= 2.2.0`
+  (`Controller.v22Capable`); older firmware REJects the unknown properties.
 
 ## 4. The actuation path (controller node, push model)
 

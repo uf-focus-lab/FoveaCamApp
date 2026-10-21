@@ -84,6 +84,123 @@ declare module "core/Controller" {
     right: AnalogChannels;
   };
 
+  // ---- v2.2.0: CMD_SCHEDULE / CMD_TRAJECTORY --------------------------------
+  // All times are MCU-clock MICROSECONDS (the SYS_TIMESTAMP / FrameResult
+  // domain). uint64 fields are `bigint` — a `number` would be truncated to 32
+  // bits by the native encoder.
+
+  /** CMD_SCHEDULE SET: one timestamped keyframe on an EXISTING stream. The
+   *  stream target becomes left/right once the MCU clock reaches `t_apply`;
+   *  with `interpolate` it ramps linearly from the previous keyframe. Late
+   *  keyframes apply at once; ones older than the last applied are dropped.
+   *  CMD_STREAM UPDATE clears the schedule. Single-phase (ACK echoes). */
+  export type ScheduleArg = {
+    stream: number;
+    t_apply: bigint;
+    interpolate?: boolean;
+    /** Raw flag bits (OR-ed with `interpolate`); 1 = INTERPOLATE. */
+    flags?: number;
+    left: AnalogChannels;
+    right: AnalogChannels;
+  };
+  export type ScheduleDecoded = {
+    stream: number;
+    flags: number;
+    interpolate: boolean;
+    t_apply: bigint;
+    left: AnalogChannels;
+    right: AnalogChannels;
+  };
+
+  export type TrajectoryOp =
+    | "BEGIN"
+    | "DATA"
+    | "MARK"
+    | "COMMIT"
+    | "START"
+    | "STOP"
+    | "DELETE";
+  /** One table sample: the target `t_offset` µs into the period. */
+  export type TrajectorySampleArg = {
+    t_offset: number;
+    left: AnalogChannels;
+    right: AnalogChannels;
+  };
+  /** CMD_TRAJECTORY SET (op-tagged, variable size). Every op is single-phase
+   *  (ACK/REJ); the ACK echoes the op's fixed header (DATA: no samples). */
+  export type TrajectoryArg =
+    | {
+        op: "BEGIN";
+        id: number; // 0..3
+        sample_count: number; // >= 1, <= 4096 across all tables
+        period: number; // µs, > 0
+        /** Step/hold between samples instead of linear interpolation. */
+        step?: boolean;
+        flags?: number;
+      }
+    | {
+        op: "DATA";
+        id: number;
+        first_index: number;
+        /** 1..12 samples (one COBS frame) — chunk larger tables. */
+        samples: TrajectorySampleArg[];
+      }
+    | {
+        op: "MARK";
+        id: number;
+        marker: number; // 0..7
+        t_offset?: number; // µs into the period, < period
+        /** Omitted/empty = CLEAR this marker (unlike Frame's default). */
+        cameras?: CameraName[] | number;
+        pulse?: number; // trigger pulse width µs, > 0
+      }
+    | {
+        op: "START";
+        id: number;
+        /** MCU µs of phase 0, cycle 0. Omitted/0n = now. */
+        t_start?: bigint;
+        /** Cycles to run; omitted/0 = forever. */
+        cycles?: number;
+      }
+    | { op: "COMMIT" | "STOP" | "DELETE"; id: number };
+  export type TrajectoryDecoded = {
+    op: TrajectoryOp;
+    id: number;
+    sample_count?: number;
+    period?: number;
+    flags?: number;
+    step?: boolean;
+    first_index?: number;
+    count?: number;
+    samples?: TrajectorySampleArg[];
+    marker?: number;
+    t_offset?: number;
+    cameras?: CameraName[];
+    pulse?: number;
+    t_start?: bigint;
+    cycles?: number;
+  };
+  export type TrajectoryStatus =
+    | "OK"
+    | "STROBE_TIMEOUT"
+    | "BUSY"
+    | "CANCELLED"
+    | "ENDED"
+    | "UNKNOWN";
+  /** SYN CMD_TRAJECTORY push (`Device.onPush(Protocol.Command.
+   *  TrajectoryFrame, cb)`): one per marker firing, plus a run-level push
+   *  (`marker: null`) with status ENDED (finite run done; cycle = cycles) or
+   *  CANCELLED (system disabled). `result` is only meaningful for status OK
+   *  (`result.stream` = trajectory id, `frame_id` shared with CMD_FRAME);
+   *  BUSY carries the missed marker's scheduled time in `result.t_trigger`. */
+  export type TrajectoryFrame = {
+    id: number;
+    marker: number | null;
+    cycle: number;
+    status: TrajectoryStatus;
+    result: FrameResult;
+  };
+
   /**
    * Protocol v2 two-phase request:
    * `accepted` resolves on ACK (queued/applied; rejects on REJ) independently
@@ -133,6 +250,13 @@ declare module "core/Controller" {
       readonly Frame: PacketFactory<FrameArg, FrameDecoded>;
       readonly FrameAccepted: PacketFactory<FrameAccepted>;
       readonly FrameResult: PacketFactory<FrameResult>;
+      /** v2.2.0 timestamped keyframe (CMD_SCHEDULE). */
+      readonly Schedule: PacketFactory<ScheduleArg, ScheduleDecoded>;
+      /** v2.2.0 uploaded trajectory ops (CMD_TRAJECTORY SET). */
+      readonly Trajectory: PacketFactory<TrajectoryArg, TrajectoryDecoded>;
+      /** v2.2.0 SYN CMD_TRAJECTORY push decoder (buffer only) — pass to
+       *  `Device.onPush`. */
+      readonly TrajectoryFrame: PacketFactory<never, TrajectoryFrame>;
     };
   };
 
@@ -185,6 +309,16 @@ declare module "core/Controller" {
       arg: FrameArg | BufferLike,
     ): TwoPhase<FrameResult, FrameAccepted>;
 
+    // v2.2.0 single-phase SETs whose decoded shape differs from the argument.
+    set(
+      fn: typeof Protocol.Command.Schedule,
+      arg: ScheduleArg | BufferLike,
+    ): Promise<PacketInstance<ScheduleDecoded>>;
+    set(
+      fn: typeof Protocol.Command.Trajectory,
+      arg: TrajectoryArg | BufferLike,
+    ): Promise<PacketInstance<TrajectoryDecoded>>;
+
     // Single-phase (default): resolves on ACK alone, no `.accepted` —
     // exactly today's (pre-v2) behavior.
     get<T>(fn: PacketFactory<T>): Promise<PacketInstance<T>>;
@@ -200,7 +334,22 @@ declare module "core/Controller" {
      * stream position updates (CMD_STREAM UPDATE, ~1kHz); throws
      * synchronously on a transport/encode failure.
      */
+    fireAndForget(
+      fn: typeof Protocol.Command.Schedule,
+      arg: ScheduleArg | BufferLike,
+    ): void;
     fireAndForget<T>(fn: PacketFactory<T>, arg: T | BufferLike): void;
+
+    /**
+     * v2.2.0: subscribe to the MCU's unsolicited SYN pushes for `fn`'s
+     * property — each push payload is decoded with `fn` and handed to `cb`
+     * on the JS thread. One callback per property (a later call replaces
+     * it); `null` unsubscribes. LOG pushes stay native (not subscribable).
+     */
+    onPush(
+      fn: typeof Protocol.Command.TrajectoryFrame,
+      cb: ((frame: PacketInstance<never, TrajectoryFrame>) => void) | null,
+    ): void;
 
     /** TEST-ONLY (core/test/46): deterministic pressure scripting — force
      *  the outq gauge (`outq`, <0 restores the real ioctl), inject synthetic

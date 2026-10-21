@@ -24,6 +24,12 @@
 //      same-stream frame undeferred; settle 0 switch undeferred.
 //   7. Enable(false) teardown wire ORDER: pending-frame REJ before the
 //      enable ACK; power-down ORDER (MEMS_EN low, bias, FCLK off).
+//   C1-C4 (v2.2.0, between 6 and 7): CMD_SCHEDULE keyframe applied at its
+//      MCU time; INTERPOLATE ramp writes intermediate DAC values (and a
+//      mid-ramp frame reports them); stale/UPDATE-clears semantics;
+//      CMD_TRAJECTORY upload/commit/start -> periodic DAC playback + marker
+//      SYN pushes with sane timestamps; STOP holds position, DAC returns to
+//      the streams.
 //   8. Center camera (V0.1 board): cameras = C|L|R drives all three Line2
 //      triggers and FINs; the default mask (0) is still L|R (C untouched) and
 //      FINs right after a C|L|R frame; an out-of-range mask REJs.
@@ -33,7 +39,9 @@
 //      "stuck at active level" hint; back to active-HIGH, it FINs again.
 //  10. quit -> exit 0.
 
+#include <algorithm>
 #include <cassert>
+#include <cstdint>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -186,6 +194,10 @@ struct Wire {
   COBS::TX tx;
   COBS::RX rx;
   uint16_t seq = 0;
+  // Drained while waiting: high-rate DAC playback (v2.2.0 stages) can fill
+  // the sim's stdout pipe faster than a test step reads it, and a sim blocked
+  // on stdout stops answering on the pty.
+  Sim *sim = nullptr;
 
   uint16_t next() { return ++seq == 0 ? ++seq : seq; }
 
@@ -226,8 +238,10 @@ struct Wire {
       }
       if (Clock::now() >= deadline)
         throw std::runtime_error("timed out waiting for a response packet");
+      if (sim)
+        sim->pump(0);
       pollfd p{fd, POLLIN, 0};
-      ::poll(&p, 1, 20);
+      ::poll(&p, 1, sim ? 2 : 20);
     }
   }
 
@@ -366,6 +380,150 @@ static void streamOp(Wire &wire, Cmd::MirrorStream::Op op, uint8_t id,
   wire.send(setPacket(Protocol::Property::CMD_STREAM, seq, &cmd, sizeof(cmd)));
 }
 
+// ============================================================================
+// v2.2.0 helpers (CMD_SCHEDULE / CMD_TRAJECTORY stages C1-C4)
+// ============================================================================
+
+// One captured MEMS DAC word (`dac cs=<L|R|LR> <hex>`), DECODED so assertions
+// key on (mirror, value) rather than the command bits — the DAC frame set is
+// free to change (e.g. WRITE_IREG x3 + APPLY_IREG per device).
+struct DacWord {
+  bool left = false, right = false;
+  uint8_t cmd = 0, addr = 0;
+  uint16_t value = 0;
+};
+
+static bool parseDac(const std::string &line, DacWord &w) {
+  char cs[8] = {0};
+  unsigned b0, b1, b2;
+  if (std::sscanf(line.c_str(), "dac cs=%7s %2x%2x%2x", cs, &b0, &b1, &b2) !=
+      4)
+    return false;
+  w.left = std::strchr(cs, 'L') != nullptr;
+  w.right = std::strchr(cs, 'R') != nullptr;
+  w.cmd = uint8_t((b0 >> 3) & 7);
+  w.addr = uint8_t(b0 & 7);
+  w.value = uint16_t((b1 << 8) | b2);
+  return true;
+}
+
+// AD5664R commands that carry a channel value (write input reg n, write n +
+// update all, write n + update n) to a single channel (A..D).
+static bool carriesValue(const DacWord &w) {
+  return (w.cmd == 0 || w.cmd == 2 || w.cmd == 3) && w.addr <= 3;
+}
+
+// Channel values written to mirror `side` ('L'/'R') in sim lines [from, to).
+static std::vector<uint16_t> dacValues(const Sim &sim, char side, size_t from,
+                                       size_t to = SIZE_MAX) {
+  std::vector<uint16_t> out;
+  to = std::min(to, sim.lines.size());
+  for (size_t i = from; i < to; i++) {
+    DacWord w;
+    if (!parseDac(sim.lines[i], w) || !carriesValue(w))
+      continue;
+    if ((side == 'L' && w.left) || (side == 'R' && w.right))
+      out.push_back(w.value);
+  }
+  return out;
+}
+
+static bool hasValue(const std::vector<uint16_t> &v, uint16_t x) {
+  return std::find(v.begin(), v.end(), x) != v.end();
+}
+
+// Values of `v` inside [lo, hi] (a channel's private value band).
+static std::vector<uint16_t> inBand(const std::vector<uint16_t> &v,
+                                    uint16_t lo, uint16_t hi) {
+  std::vector<uint16_t> out;
+  for (auto x : v)
+    if (x >= lo && x <= hi)
+      out.push_back(x);
+  return out;
+}
+
+// Drain every control-plane line the sim has emitted so far. The sim's loop
+// runs tick() (DAC words -> stdout) BEFORE handle() (responses -> pty), so
+// once a response has arrived, a drain sees every DAC word emitted up to the
+// MCU instant that request was handled.
+static void drain(Sim &sim) { sim.pump(5); }
+
+static void sleepMs(int ms) { ::poll(nullptr, 0, ms); }
+
+// Next SYN CMD_TRAJECTORY push (LOG pushes skipped); throws on timeout.
+static Cmd::TrajectoryFrame recvTrajectoryFrame(Wire &wire, int timeoutMs) {
+  const auto deadline = Clock::now() + std::chrono::milliseconds(timeoutMs);
+  while (true) {
+    const int left =
+        int(std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - Clock::now())
+                .count());
+    if (left <= 0)
+      throw std::runtime_error("timed out waiting for a TrajectoryFrame push");
+    auto packet = wire.recv(left, true);
+    const auto header = packet.validate();
+    if (Protocol::method(header) == Protocol::Method::SYN &&
+        Protocol::property(header) == Protocol::Property::CMD_TRAJECTORY)
+      return payloadAs<Cmd::TrajectoryFrame>(packet);
+    CHECK(Protocol::method(header) == Protocol::Method::SYN &&
+              Protocol::property(header) == Protocol::Property::LOG,
+          "only LOG / trajectory pushes arrive unsolicited");
+  }
+}
+
+static void sendSchedule(Wire &wire, uint16_t seq, uint8_t stream,
+                         uint64_t tApply, uint8_t flags,
+                         const Cmd::MirrorPosition &l,
+                         const Cmd::MirrorPosition &r) {
+  Cmd::Schedule k{};
+  k.stream = stream;
+  k.flags = flags;
+  k.t_apply = tApply;
+  k.left = l;
+  k.right = r;
+  wire.send(setPacket(Protocol::Property::CMD_SCHEDULE, seq, &k, sizeof(k)));
+}
+
+// Sends one CMD_TRAJECTORY op (fixed header + optional trailing samples) and
+// returns its response (ACK or REJ).
+static Protocol::RawPacket trajectoryOp(Wire &wire, const void *header,
+                                        size_t headerLen,
+                                        const void *tail = nullptr,
+                                        size_t tailLen = 0) {
+  std::vector<uint8_t> body(headerLen + tailLen);
+  std::memcpy(body.data(), header, headerLen);
+  if (tailLen)
+    std::memcpy(body.data() + headerLen, tail, tailLen);
+  const uint16_t s = wire.next();
+  wire.send(setPacket(Protocol::Property::CMD_TRAJECTORY, s, body.data(),
+                      body.size()));
+  auto resp = wire.recv();
+  CHECK(resp.header().sequence == s, "trajectory response sequence");
+  CHECK(Protocol::property(resp.validate()) ==
+            Protocol::Property::CMD_TRAJECTORY,
+        "trajectory response property");
+  return resp;
+}
+
+static void expectOk(const Protocol::RawPacket &resp, const char *what) {
+  if (Protocol::method(resp.validate()) != Protocol::Method::ACK)
+    throw std::runtime_error(std::string("CHECK failed: ") + what +
+                             " (got REJ: " + payloadStr(resp) + ")");
+}
+
+static std::string expectRejected(const Protocol::RawPacket &resp,
+                                  const char *what) {
+  CHECK(Protocol::method(resp.validate()) == Protocol::Method::REJ, what);
+  return payloadStr(resp);
+}
+
+static Cmd::TrajectoryRef trajectoryRef(Cmd::Trajectory::Op op, uint8_t id) {
+  Cmd::TrajectoryRef r{};
+  r.op = op;
+  r.id = id;
+  return r;
+}
+
 int main() {
   Sim sim = spawnSim();
   int rc = 1;
@@ -375,6 +533,7 @@ int main() {
     std::printf("fw-sim-check: sim at %s\n", ptyPath.c_str());
 
     Wire wire;
+    wire.sim = &sim;
     wire.fd = ::open(ptyPath.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
     CHECK(wire.fd >= 0, "open pty slave");
     termios tty{};
@@ -539,6 +698,368 @@ int main() {
       CHECK(zero.fin.t_trigger - t2 < 100'000, "settle 0 fires immediately");
       std::printf("fw-sim-check: 6 settle_time (deferred %llu us) OK\n",
                   static_cast<unsigned long long>(sw.fin.t_trigger - t0));
+    }
+
+    // ==========================================================================
+    // v2.2.0 stages C1-C4 — CMD_SCHEDULE + CMD_TRAJECTORY (workstream C).
+    // State on entry: enabled; stream 1 active with target
+    //   L = (12000, 22000, 32000, 42000), R = (42000, 32000, 22000, 12000);
+    //   strobes armed (L 500/2500, R 700/2500).
+    // DAC assertions decode words to (mirror, value) and give each probed
+    // channel a private value band, so they hold whatever DAC frame set the
+    // MEMS driver uses.
+    // ==========================================================================
+    const auto R0 = pos(42000, 32000, 22000, 12000);
+
+    // C1 — CMD_SCHEDULE: a keyframe applies AT its MCU time, not on arrival
+    {
+      constexpr uint64_t LEAD = 300'000;
+      const size_t mark = sim.lines.size();
+      const uint64_t tApply = mcuNow(wire) + LEAD;
+      const uint16_t s = wire.next();
+      sendSchedule(wire, s, 1, tApply, Cmd::Schedule::NONE,
+                   pos(15151, 22000, 32000, 42000), R0);
+      const auto ack = wire.recv();
+      expectHeader(ack, Protocol::Method::ACK, Protocol::Property::CMD_SCHEDULE,
+                   s, "schedule ACK");
+      const auto echo = payloadAs<Cmd::Schedule>(ack);
+      CHECK(echo.stream == 1 && echo.t_apply == tApply &&
+                echo.left.ch[0] == 15151,
+            "schedule ACK echoes the keyframe");
+
+      // Before t_apply a frame still reports the OLD target (MCU clock).
+      const auto before = runFrame(wire, 1, 2000, 0);
+      CHECK(before.finished, "pre-apply frame completes");
+      CHECK(before.fin.t_exposure < tApply, "pre-apply frame exposed early");
+      CHECK(before.fin.left.ch[0] == 12000, "pre-apply frame: old target");
+
+      // Poll the MCU clock: the keyframe's DAC word is absent at every
+      // reading well before t_apply and present at the first one well after.
+      // Absence is the SOUND direction: a word emitted before reading t is
+      // already in the stdout pipe when t's ACK arrives, so `lastAbsent`
+      // bounds the apply instant from below (presence only bounds it by the
+      // drain time, hence the 20 ms margins).
+      int64_t lastAbsent = 0;
+      while (true) {
+        const uint64_t t = mcuNow(wire);
+        drain(sim);
+        const bool present = hasValue(dacValues(sim, 'L', mark), 15151);
+        if (!present)
+          lastAbsent = int64_t(t) - int64_t(tApply);
+        if (t + 20'000 < tApply)
+          CHECK(!present, "keyframe not applied early (MCU clock)");
+        if (t > tApply + 20'000) {
+          CHECK(present, "keyframe applied by t_apply + 20 ms (MCU clock)");
+          break;
+        }
+        sleepMs(2);
+      }
+      const auto after = runFrame(wire, 1, 2000, 0);
+      CHECK(after.finished && after.fin.t_trigger >= tApply &&
+                after.fin.left.ch[0] == 15151,
+            "post-apply frame reports the keyframe target");
+      std::printf("fw-sim-check: C1 schedule keyframe applied at MCU t_apply "
+                  "(still absent at t_apply %+lld us) OK\n",
+                  static_cast<long long>(lastAbsent));
+    }
+
+    // C2 — INTERPOLATE ramp: intermediate DAC words, an MCU-time-consistent
+    //      mid-ramp frame; seq=0 silence; stale REJ; UPDATE clears schedule
+    {
+      // L ch0 ramps inside its private band [2000, 9000]; the rest holds.
+      const size_t mark = sim.lines.size();
+      const uint64_t t0 = mcuNow(wire);
+      const uint64_t tA = t0 + 50'000, tB = t0 + 250'000;
+      sendSchedule(wire, 0, 1, tA, Cmd::Schedule::NONE,
+                   pos(2000, 22000, 32000, 42000), R0);
+      sendSchedule(wire, 0, 1, tB, Cmd::Schedule::INTERPOLATE,
+                   pos(9000, 22000, 32000, 42000), R0);
+      CHECK(wire.silent(30), "seq=0 keyframes stay silent");
+
+      while (mcuNow(wire) < tA + 100'000)
+        sleepMs(2);
+      const auto mid = runFrame(wire, 1, 2000, 0);
+      CHECK(mid.finished, "mid-ramp frame completes");
+      // Exposure average ~ the ramp at trigger + 1500 us (injected strobe
+      // rise +500, fall +2500).
+      const double frac =
+          double(int64_t(mid.fin.t_trigger + 1500) - int64_t(tA)) /
+          double(tB - tA);
+      const double expected = 2000.0 + 7000.0 * frac;
+      const uint16_t got = mid.fin.left.ch[0];
+      CHECK(got > 2000 && got < 9000, "mid-ramp frame between keyframes");
+      CHECK(std::abs(double(got) - expected) < 350.0,
+            "mid-ramp frame matches the MCU-time lerp");
+      CHECK(mid.fin.left.ch[1] == 22000 && mid.fin.right.ch[0] == 42000,
+            "non-ramping channels hold");
+
+      while (mcuNow(wire) < tB + 20'000)
+        sleepMs(5);
+      drain(sim);
+      const auto band = inBand(dacValues(sim, 'L', mark), 2000, 9000);
+      // The ramp starts on the tick K_A applies (the segment toward K_B is
+      // already interpolating then), so its first word sits just above 2000.
+      CHECK(!band.empty() && band.front() >= 2000 && band.front() < 2050 &&
+                band.back() == 9000,
+            "ramp runs from K_A to exactly K_B");
+      std::vector<uint16_t> inter;
+      for (auto v : band)
+        if (v > 2000 && v < 9000 && !hasValue(inter, v))
+          inter.push_back(v);
+      CHECK(inter.size() >= 20, "ramp writes intermediate DAC values");
+      CHECK(std::is_sorted(band.begin(), band.end()), "ramp is monotonic");
+
+      // Stale: older than the last APPLIED keyframe (tB) -> dropped + REJ.
+      uint16_t s = wire.next();
+      sendSchedule(wire, s, 1, tA, Cmd::Schedule::NONE,
+                   pos(4444, 22000, 32000, 42000), R0);
+      CHECK(expectRej(wire, Protocol::Property::CMD_SCHEDULE, s, "stale REJ")
+                    .find("older") != std::string::npos,
+            "stale keyframe reason");
+      s = wire.next();
+      sendSchedule(wire, s, 9, tB, Cmd::Schedule::NONE, R0, R0);
+      CHECK(expectRej(wire, Protocol::Property::CMD_SCHEDULE, s,
+                      "unknown stream REJ")
+                    .find("Unknown stream") != std::string::npos,
+            "unknown stream reason");
+
+      // UPDATE ("now, latest wins") clears the pending schedule.
+      const size_t mark2 = sim.lines.size();
+      const uint64_t t1 = mcuNow(wire);
+      s = wire.next();
+      sendSchedule(wire, s, 1, t1 + 80'000, Cmd::Schedule::NONE,
+                   pos(7777, 22000, 32000, 42000), R0);
+      expectAck(wire, Protocol::Property::CMD_SCHEDULE, s, "pending keyframe");
+      streamOp(wire, Cmd::MirrorStream::UPDATE, 1,
+               pos(3333, 22000, 32000, 42000), R0, 0);
+      while (mcuNow(wire) < t1 + 120'000)
+        sleepMs(5);
+      drain(sim);
+      const auto v = dacValues(sim, 'L', mark2);
+      CHECK(hasValue(v, 3333) && !hasValue(v, 7777),
+            "UPDATE cleared the pending keyframe");
+      std::printf("fw-sim-check: C2 interpolation (%zu intermediate words, "
+                  "mid-frame %u vs %.0f) + stale/UPDATE semantics OK\n",
+                  inter.size(), unsigned(got), expected);
+    }
+
+    // C3 — CMD_TRAJECTORY: chunked upload, COMMIT validation, START -> DAC
+    //      playback + one marker SYN push per cycle, ENDED push
+    constexpr uint8_t TID = 0;
+    constexpr uint32_t PERIOD = 20'000;
+    constexpr uint32_t MARK_AT = 10'000;
+    {
+      // 25 samples (DATA chunks 12 + 12 + 1), 800 us apart. L ch0 ramps
+      // through its private band [1000, 3400]; every other channel holds.
+      constexpr uint16_t N = 25;
+      CHECK(Cmd::Trajectory::CHUNK_SAMPLES == 12, "DATA chunk size");
+      std::vector<Cmd::TrajectorySample> samples(N);
+      for (uint16_t i = 0; i < N; i++) {
+        samples[i].t_offset = i * 800u;
+        samples[i].left = pos(uint16_t(1000 + 100 * i), 5000, 6000, 7000);
+        samples[i].right = pos(8000, 9000, 10000, 11000);
+      }
+      Cmd::TrajectoryBegin b{};
+      b.op = Cmd::Trajectory::BEGIN;
+      b.id = 9;
+      b.sample_count = N;
+      b.period = PERIOD;
+      CHECK(expectRejected(trajectoryOp(wire, &b, sizeof(b)), "BEGIN id 9")
+                    .find("out of range") != std::string::npos,
+            "table id limit reason");
+      b.id = TID;
+      b.sample_count = 5000;
+      CHECK(expectRejected(trajectoryOp(wire, &b, sizeof(b)), "BEGIN 5000")
+                    .find("4096") != std::string::npos,
+            "sample budget reason");
+      b.sample_count = N;
+      expectOk(trajectoryOp(wire, &b, sizeof(b)), "BEGIN");
+
+      auto chunk = [&](uint16_t first, uint8_t n) {
+        Cmd::TrajectoryData d{};
+        d.op = Cmd::Trajectory::DATA;
+        d.id = TID;
+        d.first_index = first;
+        d.count = n;
+        return trajectoryOp(wire, &d, sizeof(d), &samples[first],
+                            n * sizeof(Cmd::TrajectorySample));
+      };
+      expectOk(chunk(0, 12), "DATA 0..11 (full chunk)");
+      expectOk(chunk(12, 12), "DATA 12..23");
+      expectRejected(chunk(20, 12), "DATA past the end");
+      const auto commit = trajectoryRef(Cmd::Trajectory::COMMIT, TID);
+      CHECK(expectRejected(trajectoryOp(wire, &commit, sizeof(commit)),
+                           "COMMIT incomplete")
+                    .find("incomplete") != std::string::npos,
+            "COMMIT validates every sample is present");
+      Cmd::TrajectoryStart st{};
+      st.op = Cmd::Trajectory::START;
+      st.id = TID;
+      expectRejected(trajectoryOp(wire, &st, sizeof(st)), "START uncommitted");
+      expectOk(chunk(24, 1), "DATA 24");
+
+      Cmd::TrajectoryMark m{};
+      m.op = Cmd::Trajectory::MARK;
+      m.id = TID;
+      m.marker = 0;
+      m.t_offset = PERIOD;
+      m.cameras = Cmd::CAM_L | Cmd::CAM_R;
+      m.pulse = 2000;
+      expectRejected(trajectoryOp(wire, &m, sizeof(m)), "MARK offset >= period");
+      m.t_offset = MARK_AT;
+      expectOk(trajectoryOp(wire, &m, sizeof(m)), "MARK");
+      expectOk(trajectoryOp(wire, &commit, sizeof(commit)), "COMMIT");
+      expectRejected(trajectoryOp(wire, &commit, sizeof(commit)),
+                     "double COMMIT");
+
+      constexpr uint32_t CYCLES = 10;
+      const size_t mark = sim.lines.size();
+      const uint64_t tStart = mcuNow(wire) + 100'000;
+      st.t_start = tStart;
+      st.cycles = CYCLES;
+      expectOk(trajectoryOp(wire, &st, sizeof(st)), "START");
+      // Armed (pre-positioned, before t_start): the trajectory owns the DAC.
+      uint16_t s = wire.next();
+      streamOp(wire, Cmd::MirrorStream::UPDATE, 1, R0, R0, s);
+      CHECK(expectRej(wire, Protocol::Property::CMD_STREAM, s, "UPDATE REJ")
+                    .find("trajectory owns") != std::string::npos,
+            "stream UPDATE refused while a trajectory runs");
+      s = wire.next();
+      sendSchedule(wire, s, 1, tStart, Cmd::Schedule::NONE, R0, R0);
+      CHECK(expectRej(wire, Protocol::Property::CMD_SCHEDULE, s, "SCHEDULE REJ")
+                    .find("trajectory owns") != std::string::npos,
+            "keyframe refused while a trajectory runs");
+      expectRejected(trajectoryOp(wire, &st, sizeof(st)), "double START");
+
+      uint32_t lastFrameId = 0;
+      uint64_t worstLate = 0;
+      for (uint32_t k = 0; k < CYCLES; k++) {
+        const auto f = recvTrajectoryFrame(wire, 2000);
+        CHECK(f.status == Cmd::TrajectoryFrame::OK, "marker capture OK");
+        CHECK(f.id == TID && f.marker == 0 && f.cycle == k,
+              "marker push identity (id, marker, cycle)");
+        CHECK(f.result.stream == TID, "FrameResult.stream = trajectory id");
+        CHECK(f.result.frame_id > lastFrameId, "frame_id monotonic");
+        lastFrameId = f.result.frame_id;
+        const uint64_t due = tStart + uint64_t(k) * PERIOD + MARK_AT;
+        CHECK(f.result.t_trigger >= due, "marker never fires early");
+        CHECK(f.result.t_trigger - due < 5'000, "marker fires at its phase");
+        worstLate = std::max<uint64_t>(worstLate, f.result.t_trigger - due);
+        CHECK(f.result.t_exposure > f.result.t_trigger &&
+                  f.result.t_exposure - f.result.t_trigger < 50'000,
+              "exposure follows the marker trigger");
+        // Exposure-averaged position: the mean of the DAC at strobe rise and
+        // fall. The marker fires right after the tick that drove the table
+        // at the trigger phase, and the ramp only climbs from there until
+        // the band top (the wrap is ~9 ms later), so the average is
+        // bracketed by the table at t_trigger and the band top. (Sim loop
+        // stalls delay strobe edges, so t_exposure is not a tight bound.)
+        auto table = [&](uint64_t t) {
+          return 1000.0 + 100.0 * double((t - tStart) % PERIOD) / 800.0;
+        };
+        const double lo = table(f.result.t_trigger) - 10.0;
+        const double hi = 3400.0;
+        const double got = f.result.left.ch[0];
+        if (!(got >= lo && got <= hi))
+          std::fprintf(stderr, "marker %u: ch0 %.0f outside [%.0f, %.0f]\n", k,
+                       got, lo, hi);
+        CHECK(got >= lo && got <= hi,
+              "marker frame position = table over the exposure window");
+        CHECK(f.result.left.ch[1] == 5000 && f.result.right.ch[0] == 8000,
+              "marker frame: constant channels exact");
+      }
+      const auto end = recvTrajectoryFrame(wire, 2000);
+      CHECK(end.status == Cmd::TrajectoryFrame::ENDED &&
+                end.marker == Cmd::TrajectoryFrame::NO_MARKER &&
+                end.cycle == CYCLES,
+            "ENDED push after the last cycle");
+      CHECK(end.result.t_trigger == tStart + uint64_t(CYCLES) * PERIOD,
+            "ENDED carries the run's end time");
+
+      drain(sim);
+      const auto band = inBand(dacValues(sim, 'L', mark), 1000, 3400);
+      std::vector<uint16_t> distinct;
+      for (auto v : band)
+        if (!hasValue(distinct, v))
+          distinct.push_back(v);
+      unsigned wraps = 0;
+      bool high = false;
+      for (auto v : band) {
+        if (v > 3000)
+          high = true;
+        else if (v < 1500 && high) {
+          wraps++;
+          high = false;
+        }
+      }
+      CHECK(distinct.size() >= 50, "interpolated playback writes many values");
+      CHECK(wraps >= CYCLES - 1, "playback is periodic (one wrap per cycle)");
+      CHECK(!band.empty() && band.back() == 1000,
+            "finite run ends holding phase 0");
+      std::printf("fw-sim-check: C3 trajectory %u cycles, %zu distinct DAC "
+                  "values, %u wraps, %u marker pushes (worst +%llu us) OK\n",
+                  CYCLES, distinct.size(), wraps, CYCLES,
+                  static_cast<unsigned long long>(worstLate));
+    }
+
+    // C4 — HOLD after the run (survives the 1 Hz refresh), STOP mid-run holds
+    //      the last position, control returns to the streams, DELETE
+    {
+      // After ENDED the mirror holds phase 0 across a MEMS refresh: stream 1's
+      // target (L ch1 = 22000) is NOT re-committed.
+      size_t mark = sim.lines.size();
+      sleepMs(1200);
+      drain(sim);
+      auto v = dacValues(sim, 'L', mark);
+      for (auto x : inBand(v, 1000, 3400))
+        CHECK(x == 1000, "HOLD keeps the final trajectory position");
+      CHECK(!hasValue(v, 22000), "HOLD: the stream target is not re-committed");
+
+      // Endless run from now, then STOP mid-run.
+      Cmd::TrajectoryStart st{};
+      st.op = Cmd::Trajectory::START;
+      st.id = TID;
+      st.t_start = 0;
+      st.cycles = 0;
+      const size_t runMark = sim.lines.size();
+      expectOk(trajectoryOp(wire, &st, sizeof(st)), "START (now, forever)");
+      sleepMs(70);
+      const auto stop = trajectoryRef(Cmd::Trajectory::STOP, TID);
+      expectOk(trajectoryOp(wire, &stop, sizeof(stop)), "STOP");
+      drain(sim);
+      const auto ran = inBand(dacValues(sim, 'L', runMark), 1000, 3400);
+      CHECK(ran.size() > 10, "endless run drove the DAC");
+      const uint16_t held = ran.back();
+      mark = sim.lines.size();
+      sleepMs(100);
+      drain(sim);
+      v = dacValues(sim, 'L', mark);
+      for (auto x : inBand(v, 1000, 3400))
+        CHECK(x == held, "STOP holds the last position");
+      CHECK(!hasValue(v, 22000), "STOP does not snap back to the stream");
+
+      // Control returns to the streams on the next stream write.
+      mark = sim.lines.size();
+      uint16_t s = wire.next();
+      streamOp(wire, Cmd::MirrorStream::UPDATE, 1,
+               pos(4321, 22000, 32000, 42000), R0, s);
+      expectAck(wire, Protocol::Property::CMD_STREAM, s, "UPDATE after STOP");
+      bool back = false;
+      for (int i = 0; i < 100 && !back; i++) {
+        drain(sim);
+        back = hasValue(dacValues(sim, 'L', mark), 4321);
+      }
+      CHECK(back, "stream UPDATE drives the DAC again after STOP");
+
+      const auto del = trajectoryRef(Cmd::Trajectory::DELETE, TID);
+      expectOk(trajectoryOp(wire, &del, sizeof(del)), "DELETE");
+      CHECK(expectRejected(trajectoryOp(wire, &st, sizeof(st)),
+                           "START deleted")
+                    .find("Unknown trajectory") != std::string::npos,
+            "deleted table is gone");
+      std::printf("fw-sim-check: C4 HOLD/STOP (held %u) + DAC hand-back + "
+                  "DELETE OK\n",
+                  unsigned(held));
     }
 
     // 7 — Enable(false) teardown wire order: pending-frame REJ, THEN the ACK

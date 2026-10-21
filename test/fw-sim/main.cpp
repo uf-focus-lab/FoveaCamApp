@@ -5,10 +5,11 @@
 // -------------------------------------------------------
 //
 // fovea-fw-sim: a host binary running the REAL firmware translation units — firmware/src/{Protocol,
-// Streams,Capture,Global,MEMS}.cpp — behind the thin HAL shim (hal.cpp /
+// Streams,Trajectory,Capture,Global,MEMS}.cpp — behind the thin HAL shim (hal.cpp /
 // shim/*.h). Owns a pty pair (prints `pty <slave-path>` on stdout; core's
 // Device opens the slave), and its main loop mirrors Firmware.cpp's exactly:
-// time.update → Streams::tick → Capture::tick → Protocol::tick → drain COBS
+// time.update → Streams::tick → Trajectory::tick → Capture::tick →
+// Protocol::tick → drain COBS
 // rx → handle(). The dispatch switch below is a verbatim copy of
 // Firmware.cpp's handle() (the one piece the sim replaces, per the proposal).
 //
@@ -73,6 +74,7 @@
 #include "Capture.h"
 #include "Global.h"
 #include "Streams.h"
+#include "Trajectory.h"
 
 #include "sim.h"
 
@@ -353,6 +355,8 @@ void handle(const Protocol::RawPacket &&packet) {
     CASE_GET_PAYLOAD(Command::Frame);
     CASE_SET(Command::Actuate);
     CASE_SET(Command::Trigger);
+    CASE_SET(Command::Schedule);   // v2.2.0
+    CASE_SET(Command::Trajectory); // v2.2.0 (op-tagged, variable size)
   case Protocol::INVALID: {
     auto packet = Packet::reject("Bad packet");
     if (COBS::tx.encode(packet))
@@ -421,6 +425,7 @@ int main(int argc, char **argv) {
     Global::time.update();
     Streams::housekeeping(); // M1 periodic MEMS config re-assertion (~1 Hz)
     Streams::tick();
+    Trajectory::tick(); // v2.2.0: DAC playback + marker triggers
     Capture::tick();
     Protocol::tick();
     for (int available = Serial.available(); available > 0; available--) {

@@ -14,6 +14,7 @@
 #include "Global.h"
 #include "MEMS.h"
 #include "Streams.h"
+#include "Trajectory.h"
 #include "convert.h"
 
 void Protocol::send(Protocol::RawPacket &packet) {
@@ -318,6 +319,12 @@ HANDLE_SET(Command::MirrorStream) {
     reject(seq, "Cannot perform action: system is not enabled");
     return;
   }
+  // v2.2.0: a running trajectory owns the DAC — stream targets are refused.
+  // spec: docs/spec/serial-protocol.md#trajectory
+  if (payload.op == Payload::UPDATE && Trajectory::running()) {
+    reject(seq, "A trajectory owns the DAC (STOP it first)");
+    return;
+  }
   bool ok;
   const char *reason;
   switch (payload.op) {
@@ -365,6 +372,119 @@ HANDLE_GET_PAYLOAD(Command::Frame) {
   }
   auto packet = Create::ACK(seq);
   packet.setData(&accepted, sizeof(accepted));
+  send(packet);
+}
+
+// ---- v2.2.0 CMD_SCHEDULE: timestamped keyframes --------------------------------
+// spec: docs/spec/serial-protocol.md#schedule
+HANDLE_SET(Command::Schedule) {
+  if (!Global::system_enabled) {
+    reject(seq, "Cannot perform action: system is not enabled");
+    return;
+  }
+  if (Trajectory::running()) {
+    reject(seq, "A trajectory owns the DAC (STOP it first)");
+    return;
+  }
+  switch (Streams::schedule(payload.stream, payload.t_apply, payload.flags,
+                            payload.left, payload.right)) {
+  case Streams::ScheduleResult::OK:
+    break;
+  case Streams::ScheduleResult::UNKNOWN_STREAM:
+    reject(seq, "Unknown stream id");
+    return;
+  case Streams::ScheduleResult::FULL:
+    reject(seq, "Schedule full (32 pending keyframes per stream)");
+    return;
+  case Streams::ScheduleResult::STALE:
+    reject(seq, "Keyframe older than the last applied one (dropped)");
+    return;
+  }
+  auto packet = Create::ACK(seq);
+  deflate(payload, packet);
+  send(packet);
+}
+
+// ---- v2.2.0 CMD_TRAJECTORY: uploaded periodic trajectories --------------------
+// spec: docs/spec/serial-protocol.md#trajectory
+// Not a FixedSizePacket (op-tagged, variable size), so no HANDLE_SET macro.
+// Inside this member `Trajectory` names the packet class; the firmware engine
+// is `::Trajectory`, the packet namespace `::Packet`.
+void Packet::Command::Trajectory::SET(const Protocol::Sequence &seq,
+                                      Inflated payload) {
+  const uint8_t op = payload.op();
+  const size_t header = headerSize(op);
+  if (header == 0) {
+    reject(seq, "Unknown trajectory operation");
+    return;
+  }
+  if (payload.size < header) {
+    reject(seq, "Trajectory packet too short for its operation");
+    return;
+  }
+  using namespace ::Packet::Command;
+  const char *reason = nullptr;
+  switch (op) {
+  case BEGIN: {
+    if (payload.size != header) {
+      reject(seq, "Bad BEGIN length");
+      return;
+    }
+    const auto p = payload.as<TrajectoryBegin>();
+    reason = ::Trajectory::begin(p.id, p.sample_count, p.period, p.flags);
+    break;
+  }
+  case DATA: {
+    const auto p = payload.as<TrajectoryData>();
+    if (payload.size != header + size_t(p.count) * sizeof(TrajectorySample)) {
+      reject(seq, "Bad DATA length (header + count x 20-byte samples)");
+      return;
+    }
+    reason = ::Trajectory::data(p.id, p.first_index, p.count,
+                                payload.data + header);
+    break;
+  }
+  case MARK: {
+    if (payload.size != header) {
+      reject(seq, "Bad MARK length");
+      return;
+    }
+    const auto p = payload.as<TrajectoryMark>();
+    reason = ::Trajectory::mark(p.id, p.marker, p.t_offset, p.cameras, p.pulse);
+    break;
+  }
+  case START: {
+    if (payload.size != header) {
+      reject(seq, "Bad START length");
+      return;
+    }
+    if (!Global::system_enabled) {
+      reject(seq, "Cannot perform action: system is not enabled");
+      return;
+    }
+    const auto p = payload.as<TrajectoryStart>();
+    reason = ::Trajectory::start(p.id, p.t_start, p.cycles);
+    break;
+  }
+  default: { // COMMIT / STOP / DELETE
+    if (payload.size != header) {
+      reject(seq, "Bad trajectory packet length");
+      return;
+    }
+    const uint8_t id = payload.id();
+    reason = op == COMMIT ? ::Trajectory::commit(id)
+             : op == STOP ? ::Trajectory::stop(id)
+                          : ::Trajectory::remove(id);
+    break;
+  }
+  }
+  if (reason) {
+    reject(seq, reason);
+    return;
+  }
+  // ACK echoes the op's fixed header (DATA: without its samples).
+  auto packet = Create::ACK(seq);
+  packet.setData(payload.data, header);
   send(packet);
 }
 

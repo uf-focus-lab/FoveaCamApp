@@ -14,6 +14,7 @@
 #include "Capture.h"
 #include "Global.h"
 #include "Streams.h"
+#include "Trajectory.h" // v2.2.0 marker seam: completion sink
 
 namespace Capture {
 
@@ -99,6 +100,10 @@ struct Request {
   Microseconds pulse;
   Microseconds settle_time; // v2.0 trigger hold, applied only on a switch
   uint32_t frame_id; // stable capture identity (see frameCounter)
+  // v2.2.0 marker seam: origin. Host requests keep the defaults; a marker
+  // request (enqueueMarker) carries stream = Streams::INVALID_ID, seq = 0.
+  bool fromMarker = false;
+  MarkerOrigin marker{};
 };
 
 // Monotonic capture counter: one id assigned per accepted CMD_FRAME request,
@@ -256,7 +261,7 @@ template <unsigned I> static void onStrobe() {
   onStrobeEdge(static_cast<uint8_t>(1u << I), Board::camera[I].strobe.number);
 }
 
-static void sendResult(const Request &req) {
+static FrameResult buildResult(const Request &req) {
   // 2-point exposure average (start latch + finish latch). If no finish was
   // latched (should not happen on the success path — exposure-over requires
   // every requested camera to have fallen), fall back to the start value.
@@ -266,14 +271,45 @@ static void sendResult(const Request &req) {
   MirrorPosition right =
       exposureFinishValid ? averagePosition(exposureRight, exposureFinishRight)
                           : exposureRight;
-  FrameResult result{req.stream,       req.frame_id, triggerStart,
+  return FrameResult{req.stream,       req.frame_id, triggerStart,
                      exposureLatchTime, left,         right};
+}
+
+static void sendResult(const Request &req) {
+  FrameResult result = buildResult(req);
   auto packet = Frame::Create::FIN(req.seq);
   packet.setData(&result, sizeof(result));
   Protocol::send(packet);
 }
 
+// v2.2.0 marker seam: set by cancelAll() so a cancelled marker capture
+// reports CANCELLED rather than STROBE_TIMEOUT.
+static bool cancelling = false;
+
 static void finishActive(const char *rejectReason) {
+  // ---- v2.2.0 marker seam: marker captures complete as a SYN push ----------
+  if (active.fromMarker) {
+    using Packet::Command::TrajectoryFrame;
+    FrameResult result{};
+    uint8_t status = TrajectoryFrame::OK;
+    if (rejectReason) {
+      // Keep what was latched (trigger edge; exposure start if any).
+      result.t_trigger = triggerStart;
+      result.t_exposure = exposureLatchTranslated ? exposureLatchTime : 0;
+      status = cancelling ? TrajectoryFrame::CANCELLED
+                          : TrajectoryFrame::STROBE_TIMEOUT;
+    } else {
+      result = buildResult(active);
+    }
+    result.stream = active.marker.id;
+    result.frame_id = active.frame_id;
+    Trajectory::push(active.marker.id, active.marker.marker,
+                     active.marker.cycle, status, result);
+    busy = false;
+    awaitingSettle = false;
+    return;
+  }
+  // ---- end marker seam ----------------------------------------------------
   Streams::setPendingFrame(active.stream, false);
   if (rejectReason)
     Frame::reject(active.seq, rejectReason);
@@ -318,10 +354,15 @@ static void startNext() {
   // read BEFORE we re-point it, vs this request's stream. A change — including
   // the first request after INVALID_ID — means the mirror is about to move to
   // a new location. Same-stream consecutive frames are NOT a switch.
-  const bool isSwitch = Streams::active() != active.stream;
+  // v2.2.0 marker seam: a marker capture never re-points the DAC (the running
+  // trajectory owns it) and is never a switch (no settle hold).
+  const bool isSwitch =
+      !active.fromMarker && Streams::active() != active.stream;
 
-  Streams::activate(active.stream);
-  Streams::tick(); // commit the target before the trigger fires
+  if (!active.fromMarker) {
+    Streams::activate(active.stream);
+    Streams::tick(); // commit the target before the trigger fires
+  }
 
   if (isSwitch && active.settle_time > 0) {
     // Mirror committed above; DEFER the trigger. tick() asserts it once the
@@ -425,13 +466,33 @@ void tick() {
 void cancelAll(const char *reason) {
   if (busy) {
     writeTrigger(active.cameras, LOW);
+    cancelling = true; // v2.2.0 marker seam (CANCELLED status)
     finishActive(reason);
+    cancelling = false;
   }
   while (!queue.empty()) {
     auto req = queue.pop();
     Streams::setPendingFrame(req.stream, false);
     Frame::reject(req.seq, reason);
   }
+}
+
+// ---- v2.2.0 trajectory-marker seam (CMD_TRAJECTORY) -------------------------
+
+bool camerasSupported(uint8_t cameras) {
+  return cameras != 0 && (cameras & ~SUPPORTED_CAMERAS) == 0;
+}
+
+bool enqueueMarker(const MarkerOrigin &origin, uint8_t cameras,
+                   Microseconds pulse) {
+  if (busy || !queue.empty() || !camerasSupported(cameras))
+    return false;
+  Request req{0, Streams::INVALID_ID, cameras, pulse, 0, ++frameCounter};
+  req.fromMarker = true;
+  req.marker = origin;
+  queue.push(req);
+  startNext(); // trigger edge NOW — the marker's phase is this tick
+  return true;
 }
 
 } // namespace Capture

@@ -49,7 +49,8 @@ void snapshot(MirrorPosition &left, MirrorPosition &right);
 // Marks the active stream dirty so tick() re-commits its (possibly unchanged)
 // target to the DAC on the next loop. Used after a MEMS re-init/refresh
 // (SYS_RESET MEMS recovery, periodic housekeeping) so the mirror reloads the
-// live targets. No-op when no stream is active.
+// live targets. No-op when no stream is active. While a trajectory owns (or
+// holds) the DAC, re-commits the driven position instead.
 void touch();
 
 // Call every loop() tick, BEFORE tick(): periodic config re-assertion. While
@@ -64,6 +65,61 @@ void housekeeping();
 void tick();
 
 // Terminates every stream unconditionally (e.g. on System::Enable(false)).
+// Also empties every schedule and returns DAC ownership to the streams.
 void clear();
+
+// ---- v2.2.0 CMD_SCHEDULE: timestamped keyframes ----------------------------
+// spec: docs/spec/serial-protocol.md#schedule
+//
+// Each stream owns a time-ordered keyframe ring (SCHEDULE_DEPTH deep). tick()
+// pops every keyframe whose t_apply <= now into the stream's target (latest
+// wins) and, while the head keyframe carries Schedule::INTERPOLATE, writes the
+// linear interpolation between the previous keyframe (the "anchor") and the
+// head into the target each tick. update() (CMD_STREAM UPDATE) and
+// terminate() clear the stream's ring.
+
+using Packet::Command::Timestamp;
+
+constexpr uint8_t SCHEDULE_DEPTH = 32;
+
+enum class ScheduleResult : uint8_t {
+  OK,
+  UNKNOWN_STREAM,
+  FULL,  // ring holds SCHEDULE_DEPTH pending keyframes (counted as dropped)
+  STALE, // t_apply older than the last applied keyframe (dropped + counted)
+};
+
+ScheduleResult schedule(uint8_t id, Timestamp t_apply, uint8_t flags,
+                        const MirrorPosition &left,
+                        const MirrorPosition &right);
+
+// Cumulative dropped-keyframe counters (since boot). tick() also reports
+// growth in a WARN log, rate-limited to one line per DROP_LOG_PERIOD_US.
+uint32_t droppedStale();
+uint32_t droppedFull();
+
+// ---- v2.2.0 DAC ownership (CMD_TRAJECTORY) ---------------------------------
+// spec: docs/spec/serial-protocol.md#trajectory
+//
+// STREAMS:    normal — tick() commits the active stream's target.
+// TRAJECTORY: the trajectory engine drives the DAC via drive(); tick() and
+//             schedules leave it alone (CMD_STREAM UPDATE / CMD_SCHEDULE are
+//             REJected by the handlers).
+// HOLD:       after a trajectory STOP — the mirror holds the last driven
+//             position until a fresh stream write (UPDATE, CREATE taking the
+//             DAC, an applied keyframe, activate()) reclaims it.
+// snapshot() reports the driven position whenever the owner is not STREAMS,
+// so Capture's exposure latches see what the DAC actually holds.
+enum class Owner : uint8_t { STREAMS, TRAJECTORY, HOLD };
+
+Owner owner();
+// Trajectory takes the DAC (pending stream writes are discarded; the next
+// drive() always writes).
+void claim();
+// Writes `left`/`right` to the DAC if they changed (or a touch() is pending).
+// No-op unless owner() == TRAJECTORY.
+void drive(const MirrorPosition &left, const MirrorPosition &right);
+// Trajectory STOP: TRAJECTORY -> HOLD (no-op otherwise).
+void release();
 
 } // namespace Streams
