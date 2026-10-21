@@ -22,7 +22,14 @@
 //      same-stream frame undeferred; settle 0 switch undeferred.
 //   7. Enable(false) teardown wire ORDER: pending-frame REJ before the
 //      enable ACK.
-//   8. quit -> exit 0.
+//   8. Center camera (V0.1 board): cameras = C|L|R drives all three Line2
+//      triggers and FINs; the default mask (0) is still L|R (C untouched) and
+//      FINs right after a C|L|R frame; an out-of-range mask REJs.
+//   9. Strobe polarity contract: lines idle at the released level (LOW for
+//      the default active-HIGH Board::STROBE_ACTIVE_LEVEL); an active-LOW
+//      (opto-shaped) injected waveform times out against it with the
+//      "stuck at active level" hint; back to active-HIGH, it FINs again.
+//  10. quit -> exit 0.
 
 #include <cassert>
 #include <cerrno>
@@ -269,10 +276,11 @@ struct FrameOutcome {
 };
 
 static FrameOutcome runFrame(Wire &wire, uint8_t stream, uint32_t pulse,
-                             uint32_t settle, int timeoutMs = 5000) {
+                             uint32_t settle, int timeoutMs = 5000,
+                             uint8_t cameras = Cmd::CAM_L | Cmd::CAM_R) {
   Cmd::Frame req{};
   req.stream = stream;
-  req.cameras = Cmd::CAM_L | Cmd::CAM_R;
+  req.cameras = cameras;
   req.pulse = pulse;
   req.settle_time = settle;
   const uint16_t s = wire.next();
@@ -514,7 +522,7 @@ int main() {
             "cancel reason");
       expectAck(wire, Protocol::Property::SYS_ENABLE, disableSeq,
                 "enable ACK arrives AFTER the cancels");
-      sim.waitLine("pin 15 0"); // enable rail dropped
+      sim.waitLine("pin 6 0"); // enable rail (Board::enable) dropped
 
       // Stream table cleared: re-enable, then stream 1 must be unknown.
       System::Enable on{};
@@ -532,7 +540,99 @@ int main() {
       std::printf("fw-sim-check: 7 teardown order + stream clear OK\n");
     }
 
-    // 8 — clean shutdown
+    // Board::camera trigger (Line2) pins, as the sim's `pin` lines report them
+    // (firmware/include/Board.h: C = 18, L = 22, R = 14).
+    const std::string TRIG_C = "pin 18 ", TRIG_L = "pin 22 ", TRIG_R = "pin 14 ";
+    const auto seen = [&](const std::string &prefix, size_t from) {
+      for (size_t i = from; i < sim.lines.size(); i++)
+        if (sim.lines[i].rfind(prefix, 0) == 0)
+          return true;
+      return false;
+    };
+
+    // 8 — center camera: C|L|R FIN, default mask stays L|R, bad mask REJ
+    {
+      uint16_t s = wire.next();
+      streamOp(wire, Cmd::MirrorStream::CREATE, 3, pos(5000, 6000, 7000, 8000),
+               pos(8000, 7000, 6000, 5000), s);
+      expectAck(wire, Protocol::Property::CMD_STREAM, s, "stream 3 CREATE");
+      sim.ctl("strobe C 300 2000");
+      sim.ctl("strobe L 500 2500");
+      sim.ctl("strobe R 700 2500");
+
+      size_t mark = sim.lines.size();
+      const auto all = runFrame(wire, 3, 2000, 0, 5000,
+                                Cmd::CAM_C | Cmd::CAM_L | Cmd::CAM_R);
+      CHECK(all.accepted, "C|L|R frame ACKed (no center-camera REJ)");
+      CHECK(all.finished, "C|L|R frame FINs");
+      CHECK(all.fin.t_exposure > all.fin.t_trigger, "C|L|R exposure after trigger");
+      sim.waitLine(TRIG_C + "1", 1000, mark);
+      sim.waitLine(TRIG_L + "1", 1000, mark);
+      sim.waitLine(TRIG_R + "1", 1000, mark);
+      sim.waitLine("strobe C 1", 1000, mark); // C's injected exposure
+      sim.waitLine(TRIG_C + "0", 1000, mark); // ...and its trigger released
+      CHECK(all.fin.left.ch[0] == 5000 && all.fin.right.ch[0] == 8000,
+            "C|L|R FIN positions = stream 3 target");
+
+      // cameras = 0 -> firmware default L|R. Also proves a camera outside the
+      // request (C's edges from the frame above) cannot block completion.
+      mark = sim.lines.size();
+      const auto dflt = runFrame(wire, 3, 2000, 0, 5000, 0);
+      CHECK(dflt.finished, "default-mask frame FINs right after a C|L|R frame");
+      sim.waitLine(TRIG_L + "1", 1000, mark);
+      sim.waitLine(TRIG_R + "1", 1000, mark);
+      CHECK(!seen(TRIG_C, mark), "default mask leaves the C trigger untouched");
+
+      const auto bad = runFrame(wire, 3, 2000, 0, 5000, 0x08);
+      CHECK(!bad.accepted && bad.rejReason.find("Invalid camera mask") !=
+                                 std::string::npos,
+            "mask outside C|L|R REJs synchronously");
+      std::printf("fw-sim-check: 8 center camera C|L|R + default L|R OK\n");
+    }
+
+    // 9 — strobe polarity contract (Board::STROBE_ACTIVE_LEVEL = HIGH)
+    {
+      const auto level = [&](const std::string &cam) {
+        const size_t from = sim.lines.size();
+        sim.ctl("read " + cam);
+        const auto line = sim.waitLine("level " + cam + " ", 1000, from);
+        return line.substr(line.rfind(' ') + 1);
+      };
+      for (const char *cam : {"C", "L", "R"})
+        CHECK(level(cam) == "0",
+              std::string("strobe ") + cam +
+                  " idles at the released level (LOW, active-HIGH line)");
+
+      // Opto-shaped waveform: idles HIGH, exposure pulls LOW. Against the
+      // active-HIGH firmware the idle reads as "asserted", so the request can
+      // never see a release after its rise and must time out — the contract
+      // that polarity is a board constant, not something the line can flip.
+      sim.ctl("polarity L low");
+      sim.ctl("polarity R low");
+      CHECK(level("L") == "1" && level("R") == "1",
+            "active-LOW line idles at the pull-up (HIGH)");
+      sim.ctl("strobe L 500 2500");
+      sim.ctl("strobe R 700 2500");
+      const auto inverted = runFrame(wire, 3, 2000, 0);
+      CHECK(inverted.accepted && !inverted.finished,
+            "active-LOW strobe vs active-HIGH firmware: ACK then REJ");
+      CHECK(inverted.rejReason.rfind("Strobe timeout", 0) == 0,
+            "inverted-polarity REJ is a strobe timeout");
+      CHECK(inverted.rejReason.find("stuck at active level") != std::string::npos,
+            "timeout names the line stuck at the active level");
+
+      // Honest V0.1 waveform again -> FIN.
+      sim.ctl("polarity L high");
+      sim.ctl("polarity R high");
+      CHECK(level("L") == "0" && level("R") == "0",
+            "back to active-HIGH: lines idle LOW again");
+      const auto honest = runFrame(wire, 3, 2000, 0);
+      CHECK(honest.finished, "active-HIGH strobe FINs");
+      std::printf("fw-sim-check: 9 strobe polarity contract (\"%s\") OK\n",
+                  inverted.rejReason.c_str());
+    }
+
+    // 10 — clean shutdown
     sim.ctl("quit");
     int status = 0;
     CHECK(::waitpid(sim.pid, &status, 0) == sim.pid, "waitpid");

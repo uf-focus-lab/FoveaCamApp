@@ -433,8 +433,9 @@ try {
 
     // Physical teardown: active-frame trigger pins released, MEMS driven back
     // to bias, enable rail dropped after the MEMS traffic.
+    // Board.h V0.1 Line2 trigger pins: L = camera[1] (22), R = camera[2] (14).
     await sim.waitLine((l) => l === "pin 22 0", mark, 1000, "L trigger released");
-    await sim.waitLine((l) => l === "pin 18 0", mark, 1000, "R trigger released");
+    await sim.waitLine((l) => l === "pin 14 0", mark, 1000, "R trigger released");
     const disableDac = await sim.waitLine((l) => l === "dac cs=LR 1F7530", mark, 1000, "MEMS disable bias");
     const rail = await sim.waitLine((l) => l === "pin 15 0", mark, 1000, "enable rail drop");
     assert(disableDac.index < rail.index, "MEMS parked before the enable rail drops");
