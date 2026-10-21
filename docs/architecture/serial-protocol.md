@@ -36,9 +36,13 @@ wedge into a ≤1 s glitch.
 
 - **CMD_STREAM** — a named, continuously-updatable mirror-position target
   (64 slots, `Streams::CAPACITY`). CREATE/TERMINATE are ACK-backed;
-  **UPDATE is fire-and-forget** (seq=0, no response, ~kHz-safe). Host-side
-  `StreamHandle.update()` suppresses identical targets and enforces a 1 ms
-  min interval.
+  **UPDATE is fire-and-forget** (seq=0, no response, multi-kHz-safe).
+  Host-side `StreamHandle.update()` suppresses identical targets and enforces
+  a min interval (default 0.2 ms, the live `Controller.streamMinIntervalMs`;
+  the native sink's `minIntervalUs`) — derivation in
+  `docs/spec/serial-protocol.md#rate-limits`. Requests are pipelined (many in
+  flight, matched by seq; nothing waits for a previous ACK —
+  `docs/spec/serial-protocol.md#pipelining`).
 - **CMD_FRAME** — a triggered capture request on a stream. Two-phase:
   `.accepted` resolves on ACK (queue position; rejects on REJ), the request
   itself resolves on **FIN** carrying `frame_id`, MCU trigger/exposure

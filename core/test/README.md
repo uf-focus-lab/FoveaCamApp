@@ -82,4 +82,5 @@ Everything else (00, 06–48). Three families, all self-contained:
   `48`).
 - **PTY-serial controller tests** — open a pseudo-terminal `Device` (a scripted
   serial peer, **not** real hardware) to test the compose/sink chain, the serial
-  rate governor, and the firmware simulation (`45`, `46`, `47`).
+  rate governor, the firmware simulation, and request pipelining (`45`, `46`,
+  `47`, `51`).

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <limits>
 #include <map>
 #include <optional>
 
@@ -1076,6 +1077,12 @@ extern int SerialOpen(const Napi::CallbackInfo &info) noexcept;
 // ::write on the fd holds `mtx`, so frames from the two writers can never
 // interleave. `open` flips false in DeviceObject::destroy BEFORE the fd
 // closes — a sink write after disconnect is a counted no-op, never a race.
+//
+// PIPELINING (spec: docs/spec/serial-protocol.md#pipelining): `mtx` is held
+// for ONE non-blocking ::write (plus any tail flush) and NEVER across a wait
+// for a response. A request's wait is its own PendingRequest future, matched
+// by seq on the rx thread — any number of requests may be in flight, and a
+// seq-0 stream UPDATE never queues behind an unanswered request.
 struct SerialWriteSeam : Shared<SerialWriteSeam> {
   explicit SerialWriteSeam(int fd) : fd(fd) {}
   const int fd;
@@ -1188,37 +1195,80 @@ struct SerialWriteSeam : Shared<SerialWriteSeam> {
   // ---- framing-safe writes --------------------------------------------------
   // The fd is O_NONBLOCK: a PARTIAL ::write would leave a truncated COBS
   // frame on the wire — the next frame's bytes then concatenate into it and
-  // BOTH are lost to the checksum (silent 2-packet corruption). Now every
-  // writer goes through writeBytes(): a short write saves the unwritten
-  // REMAINDER, and the next write attempt flushes that tail FIRST — the
+  // BOTH are lost to the checksum (silent 2-packet corruption). Every writer
+  // goes through writeBytes(): a short write saves the unwritten REMAINDER in
+  // the TX tail, and every later write attempt flushes that tail FIRST — the
   // in-flight frame always COMPLETES (framing integrity) before any new frame
-  // starts; a frame that cannot even start (EAGAIN at byte 0 / stuck tail) is
-  // dropped whole. Every EAGAIN/short-write bumps `txSoftFail`. Bounded,
-  // non-blocking — never stalls a link delivery thread on drain.
-  std::vector<uint8_t> tail_; // unwritten remainder of the last frame (mtx)
+  // starts. Every EAGAIN/short-write bumps `txSoftFail`. Never blocks: a
+  // caller (JS thread, link delivery thread) never waits for the fd to drain.
+  //
+  // Two policies decide what happens when the kernel queue is full:
+  //   - LatestWins (seq-0 fire-and-forget, stream UPDATEs): a frame that
+  //     cannot even start is DROPPED whole — the next tick carries a fresher
+  //     pose, and the drop is the governor's backoff signal.
+  //   - Reliable (ACK-backed requests): the WHOLE frame is appended to the
+  //     tail (bounded by kTailCap) instead of failing the request. The rx
+  //     thread polls POLLOUT while the tail is non-empty and drains it, so a
+  //     queued request completes even if nothing else is ever written (before
+  //     this, a tailed remainder only flushed on the NEXT write attempt — a
+  //     lone request could sit half-written until its 30 s sweep). Wire order
+  //     stays FIFO: a LatestWins frame never overtakes a queued request.
+  enum class Policy { LatestWins, Reliable };
+  static constexpr size_t kTailCap = 256 * 1024; // bytes of queued requests
+  std::vector<uint8_t> tail_; // unwritten bytes, whole frames after the first (mtx)
+  size_t tailHead_ = 0;       // flushed prefix of tail_ (mtx)
+  bool tailHardError_ = false; // last flush failed with a non-EAGAIN errno (mtx)
+  // Unflushed tail bytes — read lock-free by the rx thread's POLLOUT decision
+  // and Device.stats (`txQueuedBytes`).
+  std::atomic<size_t> tailBytes{0};
+
+  static bool transient(int err) {
+    return err == EAGAIN || err == EWOULDBLOCK || err == EINTR;
+  }
+  void publishTailLocked() {
+    tailBytes.store(tail_.size() - tailHead_, std::memory_order_release);
+  }
 
   /** Flush the pending tail (mtx held). True = tail empty. */
   bool flushTailLocked() {
-    while (!tail_.empty()) {
-      const ssize_t n = ::write(fd, tail_.data(), tail_.size());
-      if (n <= 0)
-        return false; // EAGAIN / error — retry on the next write attempt
-      tail_.erase(tail_.begin(), tail_.begin() + n);
+    while (tailHead_ < tail_.size()) {
+      const ssize_t n =
+          ::write(fd, tail_.data() + tailHead_, tail_.size() - tailHead_);
+      if (n <= 0) {
+        tailHardError_ = n < 0 && !transient(errno);
+        publishTailLocked();
+        return false; // EAGAIN / error — retry on the next attempt / POLLOUT
+      }
+      tailHead_ += static_cast<size_t>(n);
     }
+    tail_.clear();
+    tailHead_ = 0;
+    tailHardError_ = false;
+    publishTailLocked();
     return true;
   }
 
   enum class WriteResult { Written, Queued, Dropped, Closed };
 
   /** Write one complete COBS frame. `Written` = fully on the wire; `Queued` =
-   *  partially written, remainder tailed (WILL complete — framing intact);
-   *  `Dropped` = frame never started (no corruption). (mtx taken here.) */
-  WriteResult writeBytes(const uint8_t *data, size_t len) {
+   *  (partially) tailed — WILL complete, framing intact; `Dropped` = frame
+   *  never started (no corruption; a Reliable frame only drops on a hard fd
+   *  error or past kTailCap). (mtx taken here.) */
+  WriteResult writeBytes(const uint8_t *data, size_t len,
+                         Policy policy = Policy::LatestWins) {
     std::scoped_lock lk(mtx);
     if (!open.load(std::memory_order_acquire))
       return WriteResult::Closed;
+    auto enqueue = [&](size_t from) {
+      tail_.insert(tail_.end(), data + from, data + len);
+      publishTailLocked();
+      return WriteResult::Queued;
+    };
     if (!flushTailLocked()) {
       txSoftFail.fetch_add(1, std::memory_order_relaxed);
+      if (policy == Policy::Reliable && !tailHardError_ &&
+          (tail_.size() - tailHead_) + len <= kTailCap)
+        return enqueue(0); // FIFO behind the stuck tail
       return WriteResult::Dropped; // old frame still stuck — coalesce this one
     }
     const ssize_t n = ::write(fd, data, len);
@@ -1226,12 +1276,21 @@ struct SerialWriteSeam : Shared<SerialWriteSeam> {
       return WriteResult::Written;
     if (n <= 0) {
       txSoftFail.fetch_add(1, std::memory_order_relaxed);
+      if (policy == Policy::Reliable && (n == 0 || transient(errno)) &&
+          len <= kTailCap)
+        return enqueue(0);
       return WriteResult::Dropped; // frame never started — framing intact
     }
-    // Partial: tail the remainder so the frame completes on the next attempt.
-    tail_.assign(data + n, data + len);
+    // Partial: tail the remainder so the frame completes (next write / POLLOUT).
     txSoftFail.fetch_add(1, std::memory_order_relaxed);
-    return WriteResult::Queued;
+    return enqueue(static_cast<size_t>(n));
+  }
+
+  /** rx-thread drain hook: flush the tail once poll() reports POLLOUT. */
+  void drainTail() {
+    std::scoped_lock lk(mtx);
+    if (open.load(std::memory_order_acquire))
+      (void)flushTailLocked();
   }
 
   // Encode + write one CMD_STREAM UPDATE (seq 0, fire-and-forget). Returns
@@ -1383,10 +1442,21 @@ private:
   } counters;
   // Napi::FunctionReference __tx__;
   uint16_t __sequence__ = 0;
+  /** Next free request sequence (1..65535; 0 is fire-and-forget). With many
+   *  requests in flight the 16-bit counter can wrap onto an entry that is
+   *  still pending (a parked two-phase request, or a zombie awaiting the
+   *  30 s sweep) — reusing it would overwrite that entry and hand ITS late
+   *  response to the new request. Skip in-use values; 0 = all 65535 busy
+   *  (the caller throws). JS thread only. */
   inline uint16_t sequence() {
-    if (__sequence__ == 0)
-      __sequence__ = 1;
-    return __sequence__++;
+    auto p = pending.ref();
+    for (uint32_t tries = 0; tries < 0xFFFF; tries++) {
+      if (++__sequence__ == 0)
+        __sequence__ = 1;
+      if (!p->has(__sequence__))
+        return __sequence__;
+    }
+    return 0;
   }
 
   // Safe-by-default: stays
@@ -1415,6 +1485,12 @@ private:
     obj.Set("txSoftFail",
             Napi::Number::New(
                 env, static_cast<double>(seam_->txSoftFail.load())));
+    // Pipelining view: requests awaiting their ACK/FIN right now, and request
+    // bytes queued in the seam tail behind a full kernel queue.
+    obj.Set("inFlight", Napi::Number::New(env, seam_->pendingCount.load()));
+    obj.Set("txQueuedBytes",
+            Napi::Number::New(
+                env, static_cast<double>(seam_->tailBytes.load())));
     const auto rtt = seam_->rttStats();
     auto r = Napi::Object::New(env);
     r.Set("p50", Napi::Number::New(env, rtt.p50));
@@ -1503,6 +1579,20 @@ private:
                 sequence, convert<std::string>(method).c_str(),
                 convert<std::string>(property).c_str(), retire ? 1 : 0,
                 pendingSequences(*p).c_str());
+        if (retire) {
+          // Retire BEFORE dispatching the settle task (the task holds its own
+          // `pr` ref), so by the time JS observes the promise settle the
+          // pending view — stats.inFlight, the fairness atomics — no longer
+          // counts it.
+          p->erase(sequence);
+          // Release the pending guard BEFORE the bookkeeping —
+          // notePendingChanged() re-acquires the same non-recursive mutex;
+          // calling it under `p` self-deadlocked the rx thread after the
+          // first retired response (caught by the fw-sim harness, test 47:
+          // every subsequent get()/set() then blocked the JS main thread).
+          p.release();
+          notePendingChanged(); // fairness reserve bookkeeping (Part 2)
+        }
         Dispatcher::dispatch(env, [pr, method, property, sequence,
                                    packet = std::move(packet)](napi_env env) {
           auto payload = ArrayBuffer::New(env, packet.dataSize());
@@ -1550,16 +1640,6 @@ private:
                            .Value());
           }
         });
-        if (retire) {
-          p->erase(sequence);
-          // Release the pending guard BEFORE the bookkeeping —
-          // notePendingChanged() re-acquires the same non-recursive mutex;
-          // calling it under `p` self-deadlocked the rx thread after the
-          // first retired response (caught by the fw-sim harness, test 47:
-          // every subsequent get()/set() then blocked the JS main thread).
-          p.release();
-          notePendingChanged(); // fairness reserve bookkeeping (Part 2)
-        }
       } else if (method == Method::SYN && property == Property::LOG) {
         // Unsolicited log packet
         std::string log_msg((char *)packet.data(), packet.dataSize());
@@ -1669,14 +1749,21 @@ private:
       // Sleep in poll(2) until bytes (or error/hangup) arrive — the loop no
       // longer spins on the O_NONBLOCK fd. A timeout wake doubles as the
       // idle tick for the pending-map sweep.
-      pollfd pfd{fd, POLLIN, 0};
+      // While the write seam holds queued (Reliable) request bytes, also
+      // wait for POLLOUT and drain them here — the writer side never blocks
+      // or waits for the fd, so this is what completes a queued request
+      // when nothing else is written after it.
+      const bool wantOut =
+          seam_->tailBytes.load(std::memory_order_acquire) > 0;
+      pollfd pfd{fd, static_cast<short>(POLLIN | (wantOut ? POLLOUT : 0)), 0};
       const int ready = ::poll(&pfd, 1, RX_POLL_TIMEOUT_MS);
       if (flag_term)
         break;
-      if (ready == 0) {
-        sweepPending();
+      // Self-throttled (1 s period) — run on every wake, not only on idle
+      // timeouts, so sustained rx traffic can't starve the sweep.
+      sweepPending();
+      if (ready == 0)
         continue;
-      }
       if (ready < 0) {
         if (errno == EINTR)
           continue;
@@ -1684,6 +1771,13 @@ private:
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         continue;
       }
+      if (pfd.revents & POLLOUT)
+        seam_->drainTail();
+      if (!(pfd.revents & (POLLIN | POLLERR | POLLHUP)))
+        continue; // writable-only wake
+      // POLLERR/POLLHUP with an empty queue: the read below reports the
+      // error and paces the retry (a queued tail is retried, never spun on:
+      // POLLOUT is only requested while bytes are queued).
       auto count = ::read(fd, bytes.data(), bytes.size());
       if (count < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
@@ -1712,6 +1806,11 @@ private:
 
   Napi::Value send(uint16_t sequence, Property property,
                    const Napi::Function &factory, Protocol::RawPacket &packet) {
+    // sequence() returns 0 only when all 65535 request slots are in flight;
+    // a seq-0 packet would be silently fire-and-forget — refuse instead.
+    if (sequence == 0)
+      JS_THROW(Error, "No free request sequence (65535 requests in flight)",
+               env.Null());
     try {
       if (tx.encode(packet.finalize())) {
         // CMD_FRAME's ACK (FrameAccepted) and FIN (FrameResult) payloads
@@ -1756,18 +1855,38 @@ private:
                 v2_capable ? 1 : 0, tx.size());
         VERBOSE("send %u bytes: %s", tx.size(),
                 hexFormat(tx.data(), tx.size()).c_str());
-        // Framing-safe seam write: a short write TAILS the remainder (the
-        // frame still completes — keep the request pending); a frame that
-        // never started is a clean drop → throws to the caller.
-        const auto wr = seam_->writeBytes(tx.data(), tx.size());
+        // Framing-safe seam write, RELIABLE policy: a full kernel queue
+        // QUEUES the frame in the seam tail (drained by the rx thread on
+        // POLLOUT) instead of failing the request — a pipelined burst never
+        // turns EAGAIN into a failed request. Only a hard fd error / closed
+        // seam / tail overflow drops → the returned promise REJECTS. No wait
+        // here: the caller's wait is the returned per-request promise.
+        const auto wr = seam_->writeBytes(tx.data(), tx.size(),
+                                          SerialWriteSeam::Policy::Reliable);
         if (wr == SerialWriteSeam::WriteResult::Dropped ||
             wr == SerialWriteSeam::WriteResult::Closed) {
+          const int err = errno;
           pending.ref()->erase(sequence);
           notePendingChanged();
-          JS_THROW(Error,
-                   "Failed to write to serial port: " +
-                       std::string(std::strerror(errno)),
-                   env.Undefined());
+          // REJECT the request's own promise rather than throwing: a
+          // synchronous throw here was silently EATEN — `pr` is still alive,
+          // and ~PendingRequest's timeout Reject (Napi::Error::New with an
+          // exception pending) fetched-and-cleared the pending JS exception,
+          // so the caller got a bare `undefined` (no promise, no error) for
+          // every request past a full kernel queue. Settling `pr` first makes
+          // its destructor a no-op and surfaces the failure on the promise.
+          const std::string reason =
+              wr == SerialWriteSeam::WriteResult::Closed
+                  ? std::string("serial port closed")
+              : seam_->tailBytes.load(std::memory_order_acquire) > 0
+                  ? "TX queue full (" +
+                        std::to_string(seam_->tailBytes.load()) +
+                        " bytes queued)"
+                  : std::string(std::strerror(err));
+          pr->Reject(Napi::Error::New(env, "Failed to write to serial port: " +
+                                               reason)
+                         .Value());
+          return completed;
         }
         recordTx(static_cast<ssize_t>(tx.size()));
         return completed;
@@ -1823,8 +1942,10 @@ private:
 
   // Protocol::Sequence == 0 fire-and-forget: the firmware performs the SET but
   // sends no ACK/FIN/REJ at all —
-  // used for high-rate stream position updates (CMD_STREAM UPDATE, ~1kHz).
-  // No pending-map entry, no promise; a write failure throws synchronously.
+  // used for high-rate stream position updates (CMD_STREAM UPDATE, multi-kHz
+  // — see STREAM_MIN_UPDATE_INTERVAL_MS). No pending-map entry, no promise,
+  // and nothing to wait for: it is written immediately, never behind an
+  // unanswered request. A write failure throws synchronously.
   FN(fireAndForget) {
     auto env = info.Env();
     if (info.Length() < 1)
@@ -1847,10 +1968,11 @@ private:
       VERBOSE("trace tx seq=0 SET:%s two_phase=0 v2_capable=%d bytes=%u",
               convert<std::string>(property).c_str(), v2_capable ? 1 : 0,
               tx.size());
-      // Framing-safe seam write: Dropped = the frame never
-      // started (framing intact) → throws; Queued = tailed,
-      // completes on the next write attempt (fire-and-forget: success).
-      const auto wr = seam_->writeBytes(tx.data(), tx.size());
+      // Framing-safe seam write, LATEST-WINS policy: Dropped = the frame
+      // never started (framing intact) → throws; Queued = tailed, completes
+      // on the next write / rx-thread POLLOUT drain (fire-and-forget: success).
+      const auto wr = seam_->writeBytes(tx.data(), tx.size(),
+                                        SerialWriteSeam::Policy::LatestWins);
       if (wr == SerialWriteSeam::WriteResult::Dropped ||
           wr == SerialWriteSeam::WriteResult::Closed)
         JS_THROW(Error,
@@ -1953,7 +2075,8 @@ private:
 // Native mirror POSITION SINK: the controller's `pos_in` port. Accepts FINAL
 // volts off a port link's
 // delivery thread and performs, natively, exactly what the JS
-// StreamHandle.update path did: the stream-update GATE (1 ms min interval +
+// StreamHandle.update path did: the stream-update GATE (min interval —
+// GovernorParams::minIntervalUs, JS STREAM_MIN_UPDATE_INTERVAL_MS parity — +
 // dedupe on the input volts), volt→DAC conversion (the @lib/controller-codec
 // `channels()` math, ported verbatim), and the CMD_STREAM UPDATE
 // fire-and-forget write through the shared SerialWriteSeam. Each ACCEPTED
@@ -2006,24 +2129,46 @@ static int64_t sinkSteadyNs() {
 
 // AIMD governor knobs. All NAPI-settable via
 // MirrorSink.setGovernor; `enabled: false` pins the fixed-gate behavior
-// exactly.
+// (minIntervalUs + dedupe, no pressure feedback) exactly.
+//
+// Defaults re-derived for the V0.1 board (spec:
+// docs/spec/serial-protocol.md#rate-limits). The old 1 kHz ceiling / 1 ms
+// floor were sized for a 2 MHz shared SPI bus (~150 µs per committed
+// position); the dual 10–20 MHz buses commit one in ~10 µs and the firmware
+// costs ~3–5 µs to decode one 24-byte UPDATE, ~15 µs all-in per committed
+// update (~65 kHz sustained). The 200 µs floor keeps the MCU loop ≤ ~8 %
+// busy with updates — half the old 1 kHz × 150 µs duty — and the firmware
+// coalesces anything faster (Streams::tick latest-wins), so the governor's
+// job is the USB/tty queue, not the DAC.
 struct GovernorParams {
   bool enabled = true;
-  double ceilingHz = 1000; // = the fixed 1 ms gate; session sets the
-                           // prediction_rate_hz REQUESTED rate here
+  double ceilingHz = 5000; // = 1e6 / minIntervalUs; the session lowers it to
+                           // the prediction_rate_hz REQUESTED rate
   double floorHz = 60;
-  double stepHz = 25;       // additive climb per evaluation
+  double stepHz = 125;      // additive climb per evaluation (halving from the
+                            // ceiling recovers in ~20 evals = 2 s, as before)
   int64_t evalMs = 100;     // control-loop cadence (orders slower than emit)
   uint32_t outqLow = 256;   // bytes — climb only while under this
   uint32_t outqHigh = 1024; // bytes — backoff above this
   double rttInflation = 2.0; // p95 gate vs the connect-time baseline
-  int64_t fairnessMs = 5;    // defer UPDATEs behind a pending request this old
+  // Fairness reserve: defer UPDATEs while ANY request has been pending at
+  // least this long (0 = OFF, the default). OFF because the link is a FIFO:
+  // a request is already on the wire (or queued in the seam tail, ahead of
+  // every later frame) when it becomes "pending", so UPDATEs written after
+  // it cannot delay it or its response (full-duplex) — while
+  // deferring them froze the mirror for up to maxDeferMs behind every
+  // two-phase CMD_FRAME awaiting its FIN (trigger-sync capture keeps one in
+  // flight almost continuously). Kept settable for bench A/B comparison.
+  int64_t fairnessMs = 0;
   int64_t maxDeferMs = 100;  // deferral cap (a timed-out request can't starve)
+  // Emission floor: no two UPDATEs closer than this (the fixed gate; the
+  // governed interval is max(this, 1/effectiveRate)). Was a hard 1 ms.
+  int64_t minIntervalUs = 200;
 };
 
 struct MirrorSink : Shared<MirrorSink> {
-  static constexpr int64_t kMinIntervalNs = 1'000'000; // 1 ms (JS gate parity)
-  static constexpr size_t kHistoryCapacity = 4096;     // ≈4 s at the 1 kHz cap
+  // ≈3.3 s at the 5 kHz default ceiling (≈16 s at the session's ≤1 kHz).
+  static constexpr size_t kHistoryCapacity = 16384;
 
   SerialWriteSeam::Ptr seam;
   uint8_t streamId = 0;
@@ -2047,7 +2192,7 @@ struct MirrorSink : Shared<MirrorSink> {
   // the write path at `evalMs` cadence — a lock-free-ish emission: one branch +
   // rare O(window) percentile copy every ~100 ms).
   GovernorParams gov;             // mtx
-  double effRateHz_ = 1000;       // mtx
+  double effRateHz_ = GovernorParams{}.ceilingHz; // mtx (optimistic start)
   int govState_ = -1;             // -1 off, 0 steady, 1 seeking, 2 backoff (mtx)
   int64_t lastEvalNs_ = 0;        // mtx
   uint64_t lastSoftFail_ = 0;     // mtx — delta detection per evaluation
@@ -2117,7 +2262,7 @@ struct MirrorSink : Shared<MirrorSink> {
     double lx = 0, ly = 0, rx = 0, ry = 0;
   };
 
-  // Gate + history state (one mutex — the write path is ≤1 kHz).
+  // Gate + history state (one mutex — held for a few compares per push).
   std::mutex mtx;
   bool hasLast = false;
   double lastLx = 0, lastLy = 0, lastRx = 0, lastRy = 0; // input volts (dedupe)
@@ -2131,11 +2276,11 @@ struct MirrorSink : Shared<MirrorSink> {
       return;
     received.fetch_add(1, std::memory_order_relaxed);
     const int64_t now = sinkSteadyNs();
-    // FAIRNESS RESERVE (Part 2): while a two-phase request has been pending
-    // longer than fairnessMs, UPDATEs are DEFERRED (coalesced, never queued —
-    // the next tick carries a fresher pose anyway) so requests never sit
-    // behind a stream burst. maxDeferMs caps the deferral so a timed-out /
-    // lost request can't starve the stream.
+    // FAIRNESS RESERVE (Part 2, OFF by default — see GovernorParams::
+    // fairnessMs): while ANY request has been pending longer than
+    // fairnessMs, UPDATEs are DEFERRED (coalesced, never queued — the next
+    // tick carries a fresher pose anyway). maxDeferMs caps the deferral so a
+    // timed-out / lost request can't starve the stream.
     {
       const int64_t oldest =
           seam->oldestPendingNs.load(std::memory_order_acquire);
@@ -2143,7 +2288,7 @@ struct MirrorSink : Shared<MirrorSink> {
           seam->newestPendingNs.load(std::memory_order_acquire);
       if (oldest > 0) {
         std::scoped_lock lk(mtx);
-        if (gov.enabled) {
+        if (gov.enabled && gov.fairnessMs > 0) {
           const int64_t lo = gov.fairnessMs * 1'000'000;
           const int64_t hi = gov.maxDeferMs * 1'000'000;
           const int64_t ageOld = now - oldest;
@@ -2167,13 +2312,14 @@ struct MirrorSink : Shared<MirrorSink> {
         deduped.fetch_add(1, std::memory_order_relaxed);
         return;
       }
-      // Effective emission interval: the 1 ms floor, opened up to the
-      // governor's discovered rate (governor off = exactly the fixed gate).
+      // Effective emission interval: the minIntervalUs floor, opened up to
+      // the governor's discovered rate (governor off = exactly the fixed gate).
+      const int64_t floorNs = gov.minIntervalUs * 1'000;
       const int64_t minIntervalNs =
           gov.enabled
-              ? std::max(kMinIntervalNs,
+              ? std::max(floorNs,
                          static_cast<int64_t>(1e9 / std::max(1.0, effRateHz_)))
-              : kMinIntervalNs;
+              : floorNs;
       if (hasLast && now - lastSentNs < minIntervalNs) {
         throttled.fetch_add(1, std::memory_order_relaxed);
         return;
@@ -2191,6 +2337,11 @@ struct MirrorSink : Shared<MirrorSink> {
     // serializes the fd) — a slow write never blocks a probe.
     if (!seam->writeMirrorUpdate(streamId, chL, chR)) {
       errors.fetch_add(1, std::memory_order_relaxed);
+      // The pose never reached the wire (latest-wins drop): forget it for
+      // DEDUPE (NaN never compares equal) so a resting target is re-sent on
+      // the next push; lastSentNs stays, so the min-interval paces the retry.
+      std::scoped_lock lk(mtx);
+      lastLx = lastLy = lastRx = lastRy = std::numeric_limits<double>::quiet_NaN();
       return;
     }
     written.fetch_add(1, std::memory_order_relaxed);
@@ -2356,6 +2507,8 @@ public:
         o.Set("effectiveRateHz",
               Napi::Number::New(env, c->gov.enabled ? c->effRateHz_ : 0));
         o.Set("ceilingHz", Napi::Number::New(env, c->gov.ceilingHz));
+        o.Set("minIntervalUs",
+              Napi::Number::New(env, static_cast<double>(c->gov.minIntervalUs)));
         const int gs = c->gov.enabled ? (c->govState_ < 0 ? 0 : c->govState_)
                                       : -1;
         o.Set("governorState",
@@ -2421,6 +2574,9 @@ public:
       tmp = static_cast<double>(p.maxDeferMs);
       num("maxDeferMs", tmp, 1, 60000);
       p.maxDeferMs = static_cast<int64_t>(tmp);
+      tmp = static_cast<double>(p.minIntervalUs);
+      num("minIntervalUs", tmp, 0, 1e6);
+      p.minIntervalUs = static_cast<int64_t>(tmp);
       if (p.floorHz > p.ceilingHz)
         throw std::invalid_argument(
             "setGovernor: `floorHz` must be <= `ceilingHz`");

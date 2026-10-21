@@ -11,8 +11,9 @@
 //      V = V_pid + J·(p_pred − p_meas); feedForward=false and a coasted miss
 //      hold the baseline; every rebase emits the baseline FLOOR.
 //   2. GATE — the native stream-update gate replicates the JS
-//      StreamUpdateGate: dedupe (same pose → no write) + 1 ms min interval
-//      (counted, never blocking the link delivery thread).
+//      StreamUpdateGate: dedupe (same pose → no write) + min interval
+//      (minIntervalUs, pinned to 1 ms for the throttle probe; counted, never
+//      blocking the link delivery thread).
 //   3. WIRE — UPDATE frames actually land on the serial fd (a PTY pair —
 //      `__serialTestPty`; the Device opens the slave, the test reads the
 //      master) and decode to CMD_STREAM UPDATE packets with the exact
@@ -64,6 +65,7 @@ type Sink = {
   historyLatest(): { tNs: bigint; left: XY; right: XY } | null;
   historyAt(tNs: bigint): { left: XY; right: XY; ageNs: bigint; interpolated: boolean } | null;
   historyQuery(fromNs: bigint, toNs: bigint): Array<{ tNs: bigint }>;
+  setGovernor(p: object): void;
   release(): void;
 };
 
@@ -288,7 +290,10 @@ function channels(p: XY, bias: number, dv: number): number[] {
   // Deterministic proof: PREDICTION ticks carry their center IN the event, so
   // 20 distinct predictions through FIFO links (pred + volt — lossless, back-
   // to-back on the delivery threads) MUST produce distinct sub-ms volts, and
-  // the second-and-later ones MUST hit the 1 ms gate.
+  // the second-and-later ones MUST hit the 1 ms gate. The emission floor is
+  // a tunable (GovernorParams.minIntervalUs, default 200 µs since the V0.1
+  // board): pin it to 1 ms here so "sub-ms apart" deterministically throttles.
+  sink.setGovernor({ minIntervalUs: 1000, ceilingHz: 1000 });
   {
     const fifoVolt = compose.volt_out.pipe(sink.pos_in, { type: "fifo", depth: 32 });
     const src = T.createTestPredictionSource("test/45/throttle-src");
