@@ -73,7 +73,14 @@ export function controllerSession(): ServerSession<typeof controller> {
       if (probeTimer) clearInterval(probeTimer);
       probeTimer = null;
       prevStats = null;
-      s.telemetry({ serialRate: ZERO_RATE, serialPressure: ZERO_PRESSURE, streams: [] });
+      s.telemetry({
+        serialRate: ZERO_RATE,
+        serialPressure: ZERO_PRESSURE,
+        streams: [],
+        // An open trajectory survives a disconnect as `detached` — keep
+        // reporting it so the renderer sees why MirrorLink stopped.
+        trajectory: controllerNode().trajectorySnapshot(),
+      });
     }
 
     function startProbe(): void {
@@ -121,6 +128,7 @@ export function controllerSession(): ServerSession<typeof controller> {
           serialRate,
           serialPressure,
           streams: c.streamSnapshot(dtSec),
+          trajectory: controllerNode().trajectorySnapshot(),
         });
         // PROBE PING: keep ackRttMs live even when no user traffic flows — the
         // device-loop-saturation proxy. A SYS_TIMESTAMP GET (the clock-ping

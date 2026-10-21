@@ -9,7 +9,11 @@
 // controller session connects/disconnects. Absorbs the actuation loop as a push
 // model (openPosition inputs → MCU CMD_STREAM v2 / paced loop v1), owns the
 // enable-iff-we-enabled lifecycle, and schedules round-robin trigger capture
-// forwarding FINs to sink nodes. Native-free by construction (injected seams).
+// forwarding FINs to sink nodes. Also the single owner of the protocol v2.2.0
+// surfaces: timestamped input pushes (`updateAt` → CMD_SCHEDULE) and the ONE
+// uploaded trajectory (`openTrajectory` → CMD_TRAJECTORY, MirrorLink), whose OK
+// pushes feed the same FIN sinks + mirror history. Native-free by construction
+// (injected seams; type-only controller imports).
 // spec: docs/spec/controller.md#controller-node
 
 import type { Pos } from "@lib/controller-codec";
@@ -18,8 +22,12 @@ import type {
   FrameOutcome,
   NativeMirrorSinkHandle,
   StreamHandle,
+  TrajectoryFrameOutcome,
+  TrajectoryHandle,
+  TrajectorySpec,
 } from "./controller.js";
 import type { StreamType } from "@lib/orchestrator/graph-contract.js";
+import type { TrajectoryStat } from "@lib/orchestrator/contracts.js";
 import { nodeId } from "@lib/orchestrator/graph-contract.js";
 import {
   registerGraphWiring,
@@ -68,11 +76,79 @@ export interface PositionInput {
    *  trajectory (ONE place) and returns the predicted volts synchronously; the
    *  MCU stream (v2) / paced loop (v1) applies it. When no controller is bound
    *  the last predicted value is returned (the mirror holds) and nothing is
-   *  recorded. */
+   *  recorded. While an uploaded trajectory RUNS the push is held locally
+   *  (not sent — the firmware would REJ it; nothing recorded; the last
+   *  predicted value is returned) and re-asserted when the run ends. A push
+   *  that follows pending `updateAt` keyframes supersedes them (the firmware
+   *  clears the stream's schedule on UPDATE): mirror history drops the
+   *  not-yet-due keyframe samples, then records this pose at send time. */
   update(pos: PositionPair): PositionPair;
+  /** v2.2.0 timestamped push (CMD_SCHEDULE): apply `pos` at host-steady
+   *  `hostNs` instead of on arrival; `interpolate` ramps linearly from the
+   *  previous keyframe (or, into an empty schedule, from the current target
+   *  starting now). Records the prediction into mirror history AT `hostNs`
+   *  (a late keyframe — `hostNs` already past — at send time, which is when
+   *  the firmware applies it). Push keyframes in time order: one older than
+   *  the newest recorded sample is still sent but NOT recorded (the history
+   *  is monotonic). Falls back to `update()` (immediate, counted in
+   *  `scheduleFallbacks`) when the bound controller is not `v22Capable`, the
+   *  input's MCU stream does not exist yet (first push creates it), or a
+   *  native input owns the wire. Held like `update()` while a trajectory
+   *  runs. Returns the predicted volts. */
+  updateAt(
+    hostNs: bigint,
+    pos: PositionPair,
+    opts?: { interpolate?: boolean },
+  ): PositionPair;
+  /** Pushes `updateAt` routed to `update()` instead (see updateAt). */
+  readonly scheduleFallbacks: number;
   /** Terminate the MCU stream, retire the graph edge, and — if this was the
    *  last open input and the node enabled the controller — disable it. */
   close(): Promise<void>;
+}
+
+/** Lifecycle of the node's uploaded trajectory:
+ *  `uploading` (open/reupload in flight) → `ready` (committed, stopped) ⇄
+ *  `running` (START sent until STOP / ENDED / run-level CANCELLED) →
+ *  `detached` (controller unbound or swapped: pushes stop, the MCU table is
+ *  gone with the old device — `reupload()` or `close()`) → `closed`. */
+export type NodeTrajectoryState = TrajectoryStat["state"];
+
+export interface OpenTrajectoryOptions {
+  /** The node-input name: the graph edge port into `controller` (like a
+   *  position input's name) and the stats row's label. */
+  name: string;
+}
+
+/** The controller node's handle on THE uploaded trajectory (at most one open).
+ *  @remarks spec: docs/spec/controller.md#trajectory-ownership */
+export interface NodeTrajectory {
+  readonly name: string;
+  /** MCU table id (null while detached / uploading). */
+  readonly id: number | null;
+  readonly state: NodeTrajectoryState;
+  /** START at host-steady `atHostNs` (default: now on the MCU) for `cycles`
+   *  (default 0 = forever). Holds every position input from this call until
+   *  the run ends. Throws when detached/closed or already running. */
+  start(atHostNs?: bigint, cycles?: number): Promise<void>;
+  /** STOP (no-op unless running); position inputs then re-take the DAC. */
+  stop(): Promise<void>;
+  /** STOP if running, DELETE the table (best-effort), retire the graph input,
+   *  and disable iff the node enabled the controller and nothing else is
+   *  open. Idempotent. */
+  close(): Promise<void>;
+  /** Every push for this table (OK and non-OK). OK pushes ALSO reach the
+   *  node's FIN sinks and mirror history. Stops firing once detached. */
+  onFrame(cb: (frame: TrajectoryFrameOutcome) => void): () => void;
+  /** State transitions. `controllerAvailable` is true on a `detached`
+   *  notification when a v2.2 controller is bound again — the cue for the
+   *  session to decide whether to `reupload()` (never automatic). */
+  onStateChange(
+    cb: (state: NodeTrajectoryState, detail: { controllerAvailable: boolean }) => void,
+  ): () => void;
+  /** Re-upload the same spec to the currently bound v2.2 controller (only
+   *  from `detached`); back to `ready` on success, `detached` on failure. */
+  reupload(): Promise<void>;
 }
 
 /** Native position input: a session pipes a native volts producer (compose brick
@@ -102,7 +178,8 @@ export interface NativePositionInput {
 
 /** An injected FIN-outcome sink (no native imports): the anchor enrichment
  *  node registers one, and `startTriggerCapture` forwards every completed
- *  exposure to it (pairing-nodes). */
+ *  exposure to it (pairing-nodes). An OK push of the node's uploaded
+ *  trajectory is forwarded too, tagged with `outcome.trajectory`. */
 export type FinSink = (outcome: FrameOutcome) => void;
 
 export interface TriggerCaptureOptions {
@@ -121,6 +198,49 @@ export interface TriggerCaptureOptions {
 }
 
 const V1_INTERVAL_MS = 1;
+/** Non-OK trajectory pushes log at most once per status per this window. */
+const TRAJECTORY_LOG_INTERVAL_MS = 1000;
+/** Graph node id of the (single) uploaded-trajectory input. */
+export const trajectoryNodeId = (): string => `${nodeId.controller()}/trajectory`;
+const TRAJECTORY_STREAM: StreamType = { kind: "analysis", schema: "trajectory" };
+
+/** Expected host-ns trigger instant of `marker` in `cycle` of a run started
+ *  at `startHostNs`: start + cycle·period + marker offset (µs → ns). */
+export function expectedTriggerNs(
+  startHostNs: bigint,
+  cycle: number,
+  periodUs: number,
+  markerOffsetUs: number,
+): bigint {
+  return (
+    startHostNs +
+    BigInt(cycle) * BigInt(periodUs) * 1000n +
+    BigInt(markerOffsetUs) * 1000n
+  );
+}
+
+/** At most one line per key per `intervalMs`; the next line after a quiet
+ *  window carries how many were suppressed. Injected sink/clock for tests. */
+export class RateLimitedLog {
+  private readonly last = new Map<string, { at: number; suppressed: number }>();
+  constructor(
+    private readonly intervalMs = TRAJECTORY_LOG_INTERVAL_MS,
+    private readonly sink: (msg: string) => void = (m) => console.warn(m),
+    private readonly now: () => number = () => Date.now(),
+  ) {}
+
+  note(key: string, msg: string): void {
+    const t = this.now();
+    const entry = this.last.get(key);
+    if (entry && t - entry.at < this.intervalMs) {
+      entry.suppressed++;
+      return;
+    }
+    const suffix = entry?.suppressed ? ` (+${entry.suppressed} suppressed)` : "";
+    this.last.set(key, { at: t, suppressed: 0 });
+    this.sink(msg + suffix);
+  }
+}
 
 export class ControllerNode {
   private controller: Controller | null = null;
@@ -140,6 +260,10 @@ export class ControllerNode {
 
   // Trigger mode: FIN outcomes fan out to registered sinks (anchor enrichment).
   private readonly finListeners = new Set<FinSink>();
+
+  // THE uploaded trajectory (v2.2.0) — at most one open: the firmware runs one
+  // at a time, and a second owner would fight over the DAC + pushes.
+  private trajectory: NodeTrajectoryImpl | null = null;
 
   // Topology: ONE stable wiring registered at construction (stays first in the
   // registration Set, so its declared `controller` node wins over any
@@ -166,8 +290,13 @@ export class ControllerNode {
    *  serial meter into the node's stats. Streams recreate lazily on the next
    *  update; the v1 loop (re)starts if inputs are open. */
   bindController(c: Controller): void {
+    // A swap without an unbind still strands the trajectory on the old device.
+    const t = this.trajectory;
+    if (t?.owner && t.owner !== c) t.detach();
     this.controller = c;
     this.wiringNode.statsKey = `controller:${c.port}`;
+    // Report (never auto-reupload) that a detached trajectory could come back.
+    if (t?.state === "detached") t.notifyRebind(!!c.v22Capable);
     if (this.inputs.size > 0 && !c.v2Capable) this.ensureV1Loop();
     // Native inputs attach lazily against the fresh controller (v2 only).
     for (const input of this.nativeInputs) input.sync();
@@ -182,6 +311,9 @@ export class ControllerNode {
     delete this.wiringNode.statsKey;
     this.enabledByUs = false;
     this.v1Running = false;
+    // The trajectory's MCU table went with the device: detach (pushes stop,
+    // no wire traffic — the device may already be gone).
+    this.trajectory?.detach();
     if (gone) {
       for (const input of this.inputs) await input.dropStream();
       // Native inputs detach (link released via onDetach, sink dropped;
@@ -261,6 +393,122 @@ export class ControllerNode {
     for (const sink of this.finListeners) sink(outcome);
   }
 
+  // --- uploaded trajectory (v2.2.0 CMD_TRAJECTORY, MirrorLink) ---------------
+
+  /** Upload `spec` to the bound controller and own it as THE node trajectory.
+   *  Requires a bound v2.2 controller; refuses a second open (one trajectory
+   *  at a time — close the first). Enables the controller if it is disabled
+   *  (disabled again on the last close iff the node enabled it). Resolves
+   *  once the table is committed (`ready`).
+   *  @remarks spec: docs/spec/controller.md#trajectory-ownership */
+  async openTrajectory(
+    spec: TrajectorySpec,
+    opts: OpenTrajectoryOptions,
+  ): Promise<NodeTrajectory> {
+    if (this.trajectory)
+      throw new Error(
+        `A trajectory ("${this.trajectory.name}") is already open on the controller node — close it first (the firmware runs one at a time)`,
+      );
+    const c = this.controller;
+    if (!c) throw new Error("openTrajectory requires a bound controller");
+    if (!c.v22Capable)
+      throw new Error(
+        "openTrajectory requires firmware >= 2.2.0 (CMD_TRAJECTORY unavailable)",
+      );
+    // Reserve the slot SYNCHRONOUSLY so a concurrent open is refused too.
+    const t = new NodeTrajectoryImpl(this, opts.name, spec);
+    this.trajectory = t;
+    this.wiring.nodes.push(t.wiringNode);
+    this.wiring.edges.push({
+      from: trajectoryNodeId(),
+      to: nodeId.controller(),
+      port: opts.name,
+      type: TRAJECTORY_STREAM,
+    });
+    try {
+      await t.upload(c);
+    } catch (error) {
+      await t.discard();
+      throw error;
+    }
+    return t;
+  }
+
+  /** The open trajectory's stats row (null when none) — published in the
+   *  controller session telemetry. */
+  trajectorySnapshot(): TrajectoryStat | null {
+    return this.trajectory?.snapshot() ?? null;
+  }
+
+  /** Node-level stats: per position input (held / schedule counters) + the
+   *  trajectory row. */
+  statsSnapshot(): {
+    inputs: Array<ReturnType<PositionInputImpl["stats"]>>;
+    trajectory: TrajectoryStat | null;
+  } {
+    return {
+      inputs: [...this.inputs].map((i) => i.stats()),
+      trajectory: this.trajectorySnapshot(),
+    };
+  }
+
+  /** @internal — an input held a push during the run (trajectory stats). */
+  noteHeldPush(): void {
+    this.trajectory?.noteHeldPush();
+  }
+
+  /** @internal — true while THE trajectory runs on `c`: position inputs hold
+   *  their pushes (the firmware REJects stream writes meanwhile). */
+  trajectoryOwnsDac(c: Controller): boolean {
+    const t = this.trajectory;
+    return !!t && t.state === "running" && t.owner === c;
+  }
+
+  /** @internal — the run ended (STOP / ENDED / run-level CANCELLED / close):
+   *  every position input re-takes the DAC with its latest pose. */
+  resumeInputs(): void {
+    for (const input of this.inputs) input.resume();
+  }
+
+  /** @internal — a run is starting: pending scheduled keyframes no longer move
+   *  the mirror (the trajectory owns the DAC; resume supersedes them), so
+   *  their future history samples are dropped. */
+  noteTrajectoryStart(): void {
+    mirrorHistory.truncateAfter(hostNowNs());
+    for (const input of this.inputs) input.clearSchedule();
+  }
+
+  /** @internal — an OK trajectory push: the exposure-averaged position at its
+   *  exposure time is the only trustworthy mirror position while the MCU owns
+   *  the DAC → mirror history; then the FIN sinks (tagged outcome). */
+  forwardTrajectoryFrame(f: TrajectoryFrameOutcome): void {
+    mirrorHistory.record(f.tExposure, f.left, f.right);
+    this.emitFin({
+      frameId: f.frameId,
+      stream: f.trajectoryId,
+      tTrigger: f.tTrigger,
+      tExposure: f.tExposure,
+      left: f.left,
+      right: f.right,
+      trajectory: { id: f.trajectoryId, marker: f.marker ?? -1, cycle: f.cycle },
+    });
+  }
+
+  /** @internal — release the trajectory slot + graph input; disable iff the
+   *  node enabled the controller and nothing else is open. */
+  async retireTrajectory(t: NodeTrajectoryImpl): Promise<void> {
+    if (this.trajectory !== t) return;
+    this.trajectory = null;
+    const n = this.wiring.nodes.indexOf(t.wiringNode);
+    if (n >= 0) this.wiring.nodes.splice(n, 1);
+    const e = this.wiring.edges.findIndex(
+      (x) => x.from === trajectoryNodeId() && x.to === nodeId.controller(),
+    );
+    if (e >= 0) this.wiring.edges.splice(e, 1);
+    if (this.inputs.size === 0 && this.nativeInputs.size === 0)
+      await this.disableIfLast();
+  }
+
   // --- internals shared with PositionInputImpl -------------------------------
 
   /** @internal */ get liveController(): Controller | null {
@@ -270,6 +518,38 @@ export class ControllerNode {
   /** @internal — record the trusted-time trajectory ONCE per update. */
   recordTrajectory(predicted: PositionPair): void {
     mirrorHistory.record(hostNowNs(), predicted.left, predicted.right);
+  }
+
+  /** @internal — an immediate push superseded pending scheduled keyframes:
+   *  drop their not-yet-due samples, then record `predicted` now. */
+  supersedeSchedule(predicted: PositionPair): void {
+    const now = hostNowNs();
+    mirrorHistory.truncateAfter(now);
+    mirrorHistory.record(now, predicted.left, predicted.right);
+  }
+
+  /** @internal — record a scheduled keyframe at its apply time. Returns the
+   *  recorded instant, or null when it was out of order (not recorded).
+   *  A keyframe due in the past applies on arrival → recorded now. Into an
+   *  empty schedule (newest sample already past) the firmware anchors at the
+   *  arrival instant, so a hold sample is recorded at now first; a STEP
+   *  keyframe (no interpolate) also holds the previous position until its
+   *  instant, so `mirrorAt` shows a step, not a ramp. */
+  recordScheduled(
+    hostNs: bigint,
+    predicted: PositionPair,
+    interpolate: boolean,
+  ): bigint | null {
+    const now = hostNowNs();
+    const t = hostNs > now ? hostNs : now;
+    const newest = mirrorHistory.newest();
+    if (newest && t < newest.hostNs) return null;
+    if (newest && t > now) {
+      if (newest.hostNs < now) mirrorHistory.record(now, newest.left, newest.right);
+      if (!interpolate) mirrorHistory.record(t, newest.left, newest.right);
+    }
+    mirrorHistory.record(t, predicted.left, predicted.right);
+    return t;
   }
 
   /** @internal — remember the freshest pose + which input drove it (v1 loop). */
@@ -295,7 +575,7 @@ export class ControllerNode {
       (e) => e.to === nodeId.controller() && e.port === input.name && e.from === input.from,
     );
     if (idx >= 0) this.wiring.edges.splice(idx, 1);
-    if (this.inputs.size === 0 && this.nativeInputs.size === 0)
+    if (this.inputs.size === 0 && this.nativeInputs.size === 0 && !this.trajectory)
       await this.disableIfLast();
   }
 
@@ -322,7 +602,7 @@ export class ControllerNode {
   /** @internal — native-input retire: same disable-iff-last discipline. */
   async retireNativeInput(input: NativePositionInputImpl): Promise<void> {
     this.nativeInputs.delete(input);
-    if (this.inputs.size === 0 && this.nativeInputs.size === 0)
+    if (this.inputs.size === 0 && this.nativeInputs.size === 0 && !this.trajectory)
       await this.disableIfLast();
   }
 
@@ -373,6 +653,8 @@ export class ControllerNode {
   /** Retire the node entirely (test/teardown). */
   dispose(): void {
     this.v1Running = false;
+    this.trajectory?.detach();
+    this.trajectory = null;
     this.finListeners.clear();
     this.unregisterWiring();
   }
@@ -388,6 +670,16 @@ class PositionInputImpl implements PositionInput {
   private closed = false;
   private lastPredicted: PositionPair;
   private latest: PositionPair;
+  // A push arrived while a trajectory owned the DAC (held, not sent).
+  private held = false;
+  private heldPushes = 0;
+  // Latest recorded scheduled-keyframe instant still in the future (host ns),
+  // or null: while set, an immediate push SUPERSEDES the schedule.
+  private scheduledHorizonNs: bigint | null = null;
+  private scheduled = 0;
+  private fallbacks = 0;
+  private scheduleDrops = 0;
+  private historyOutOfOrder = 0;
 
   constructor(
     private readonly node: ControllerNode,
@@ -406,6 +698,10 @@ class PositionInputImpl implements PositionInput {
     return this.stream?.id ?? null;
   }
 
+  get scheduleFallbacks(): number {
+    return this.fallbacks;
+  }
+
   update(pos: PositionPair): PositionPair {
     if (this.closed) return this.lastPredicted;
     this.latest = pos;
@@ -414,10 +710,24 @@ class PositionInputImpl implements PositionInput {
     const c = this.node.liveController;
     if (!c) return this.lastPredicted; // no device — mirror holds, nothing recorded
 
+    // An uploaded trajectory owns the DAC: the firmware would REJ the UPDATE.
+    // Hold the pose (`latest`) — nothing sent, nothing recorded — and
+    // re-assert it when the run ends (resume()).
+    if (this.node.trajectoryOwnsDac(c)) {
+      this.held = true;
+      this.heldPushes++;
+      this.node.noteHeldPush();
+      return this.lastPredicted;
+    }
+
     const predicted = c.predictVolts({ left: pos.left, right: pos.right });
     this.lastPredicted = predicted;
+    // Pending updateAt keyframes: this push supersedes them only once it is
+    // actually on the wire, so the history write moves after the send.
+    const superseding = this.schedulePending();
     // ONE place for the trusted-time trajectory (unified-time).
-    this.node.recordTrajectory(predicted);
+    if (!superseding) this.node.recordTrajectory(predicted);
+    let cleared = true; // a dropped / recreated stream has no schedule left
 
     if (c.v2Capable) {
       // Keep `c.pos` live under streaming (no readback) so calibrate voltage
@@ -430,15 +740,121 @@ class PositionInputImpl implements PositionInput {
       // held from before the attach began; the native path owns the wire.
       if (this.node.nativeEngaged()) {
         if (this.stream) void this.dropStream();
+        if (superseding) this.supersede(predicted);
         return predicted;
       }
       if (this.streamOwner && this.streamOwner !== c) void this.dropStream();
-      if (this.stream && this.streamOwner === c) this.stream.update(pos);
+      if (this.stream && this.streamOwner === c)
+        cleared = this.stream.update(pos) !== false;
       else this.ensureStream(c);
     } else {
       this.node.ensureV1Loop();
     }
+    // A gated/dropped UPDATE never reached the MCU: the schedule still runs
+    // (and its history stands).
+    if (superseding && cleared) this.supersede(predicted);
     return predicted;
+  }
+
+  updateAt(
+    hostNs: bigint,
+    pos: PositionPair,
+    opts: { interpolate?: boolean } = {},
+  ): PositionPair {
+    if (this.closed) return this.lastPredicted;
+    const c = this.node.liveController;
+    const s = this.stream;
+    if (c && this.node.trajectoryOwnsDac(c)) return this.update(pos); // held
+    if (
+      !c ||
+      !c.v22Capable ||
+      !s ||
+      this.streamOwner !== c ||
+      this.node.nativeEngaged()
+    ) {
+      // v2.1 firmware / stream not created yet / native owns the wire / no
+      // device: immediate semantics (update() creates the stream lazily).
+      this.fallbacks++;
+      return this.update(pos);
+    }
+    this.latest = pos;
+    this.node.noteUpdate(this, pos);
+    const predicted = c.predictVolts({ left: pos.left, right: pos.right });
+    this.lastPredicted = predicted;
+    const interpolate = opts.interpolate ?? false;
+    try {
+      s.scheduleAt(hostNs, pos, { interpolate });
+    } catch {
+      // Latest-wins drop under back-pressure: never reached the MCU, so it is
+      // not recorded either. (`c.pos` is not touched for a future keyframe.)
+      this.scheduleDrops++;
+      return predicted;
+    }
+    this.scheduled++;
+    const t = this.node.recordScheduled(hostNs, predicted, interpolate);
+    if (t === null) this.historyOutOfOrder++;
+    else if (this.scheduledHorizonNs === null || t > this.scheduledHorizonNs)
+      this.scheduledHorizonNs = t;
+    return predicted;
+  }
+
+  /** True while a recorded scheduled keyframe is still in the future. */
+  private schedulePending(): boolean {
+    if (this.scheduledHorizonNs === null) return false;
+    if (this.scheduledHorizonNs > hostNowNs()) return true;
+    this.scheduledHorizonNs = null; // everything scheduled has come due
+    return false;
+  }
+
+  private supersede(predicted: PositionPair): void {
+    this.scheduledHorizonNs = null;
+    this.node.supersedeSchedule(predicted);
+  }
+
+  /** @internal — a trajectory run starts: pending keyframes are moot. */
+  clearSchedule(): void {
+    this.scheduledHorizonNs = null;
+  }
+
+  /** @internal — the trajectory run ended: re-take the DAC with the latest
+   *  pose (held during the run, or the pre-run target when the input has a
+   *  stream). FORCED past the stream gate — the pose may equal the last one
+   *  sent, yet the firmware holds the trajectory's last position until the
+   *  next stream write. Recorded at now (it applies on arrival). */
+  resume(): void {
+    const wasHeld = this.held;
+    this.held = false;
+    if (this.closed) return;
+    const c = this.node.liveController;
+    if (!c || (!wasHeld && !this.stream)) return;
+    const pos = this.latest;
+    const predicted = c.predictVolts({ left: pos.left, right: pos.right });
+    this.lastPredicted = predicted;
+    this.scheduledHorizonNs = null;
+    if (c.v2Capable) {
+      c.applyStreamedPos?.(predicted);
+      if (!this.node.nativeEngaged()) {
+        if (this.streamOwner && this.streamOwner !== c) void this.dropStream();
+        if (this.stream && this.streamOwner === c)
+          this.stream.update(pos, { force: true });
+        else this.ensureStream(c);
+      }
+    }
+    this.node.supersedeSchedule(predicted);
+  }
+
+  /** @internal — stats row (ControllerNode.statsSnapshot). */
+  stats() {
+    return {
+      name: this.name,
+      streamId: this.streamId,
+      held: this.held,
+      heldPushes: this.heldPushes,
+      scheduled: this.scheduled,
+      scheduleFallbacks: this.fallbacks,
+      scheduleDrops: this.scheduleDrops,
+      historyOutOfOrder: this.historyOutOfOrder,
+    };
   }
 
   /** Lazily CREATE the MCU stream (guarded against concurrent creates). */
@@ -576,6 +992,283 @@ class NativePositionInputImpl implements NativePositionInput {
     this.closed = true;
     await this.drop();
     await this.node.retireNativeInput(this);
+  }
+}
+
+/** THE node trajectory — see {@link NodeTrajectory}. All async transitions
+ *  reconcile against unbind/swap/close mid-await (the ensureStream idiom). */
+class NodeTrajectoryImpl implements NodeTrajectory {
+  private _state: NodeTrajectoryState = "uploading";
+  private handle: TrajectoryHandle | null = null;
+  /** The controller the uploaded table lives on (null while detached). */
+  owner: Controller | null = null;
+  private unsubscribe: (() => void) | null = null;
+  private readonly frameListeners = new Set<(f: TrajectoryFrameOutcome) => void>();
+  private readonly stateListeners = new Set<
+    (state: NodeTrajectoryState, detail: { controllerAvailable: boolean }) => void
+  >();
+  private readonly log = new RateLimitedLog();
+  // Run + lifetime stats.
+  private startHostNs: bigint | null = null;
+  private startExact = false;
+  private cyclesSeen = 0;
+  private lastMarker: number | null = null;
+  private lastCycle: number | null = null;
+  private lastLatenessUs: number | null = null;
+  private readonly statusCounts: Record<string, number> = {};
+  private heldPushes = 0;
+
+  readonly wiringNode: WiredNode = {
+    id: trajectoryNodeId(),
+    kind: "trajectory",
+    output: TRAJECTORY_STREAM,
+    transport: "native",
+  };
+
+  constructor(
+    private readonly node: ControllerNode,
+    readonly name: string,
+    private readonly spec: TrajectorySpec,
+  ) {}
+
+  get id(): number | null {
+    return this.handle?.id ?? null;
+  }
+
+  get state(): NodeTrajectoryState {
+    return this._state;
+  }
+
+  /** Unnarrowed state probe (the state changes across awaits). */
+  private isState(state: NodeTrajectoryState): boolean {
+    return this._state === state;
+  }
+
+  private setState(state: NodeTrajectoryState, controllerAvailable = false): void {
+    this._state = state;
+    for (const cb of this.stateListeners) {
+      try {
+        cb(state, { controllerAvailable });
+      } catch {
+        // a session listener fault must not wedge the node
+      }
+    }
+  }
+
+  /** @internal — upload to `c` (open / reupload). Enables first (START needs
+   *  an enabled system; enable-iff-we-enabled bookkeeping is the node's). */
+  async upload(c: Controller): Promise<void> {
+    this.setState("uploading");
+    await this.node.ensureEnabled(c);
+    const h = await c.uploadTrajectory(this.spec);
+    if (this._state !== "uploading" || this.node.liveController !== c) {
+      // Closed / unbound / swapped while uploading — the table is orphaned.
+      try {
+        await h.dispose();
+      } catch {
+        // best-effort — the device may already be gone
+      }
+      throw new Error(
+        this._state === "closed"
+          ? "trajectory closed during upload"
+          : "controller changed during trajectory upload",
+      );
+    }
+    this.handle = h;
+    this.owner = c;
+    this.unsubscribe = h.onFrame((f) => this.onPush(f));
+    this.setState("ready");
+  }
+
+  /** @internal — a failed open: free the slot without wire traffic beyond
+   *  what upload() already cleaned up. */
+  async discard(): Promise<void> {
+    this._state = "closed";
+    this.unsubscribe?.();
+    this.unsubscribe = null;
+    this.handle = null;
+    this.owner = null;
+    await this.node.retireTrajectory(this);
+  }
+
+  async start(atHostNs?: bigint, cycles = 0): Promise<void> {
+    if (this._state === "detached")
+      throw new Error(
+        `Trajectory "${this.name}" is detached (controller unbound or swapped) — reupload() or close() it`,
+      );
+    if (this._state === "closed") throw new Error(`Trajectory "${this.name}" is closed`);
+    if (this._state === "uploading")
+      throw new Error(`Trajectory "${this.name}" is still uploading`);
+    if (this._state === "running")
+      throw new Error(`Trajectory "${this.name}" is already running — stop() it first`);
+    const h = this.handle!;
+    // Per-run stats. t_start = 0 ("now" on the MCU) leaves only a host-side
+    // estimate of the start instant — lateness is then approximate.
+    this.startHostNs = atHostNs ?? hostNowNs();
+    this.startExact = atHostNs !== undefined;
+    this.cyclesSeen = 0;
+    this.lastMarker = null;
+    this.lastCycle = null;
+    this.lastLatenessUs = null;
+    // Hold inputs BEFORE START goes out: no stream write may race it.
+    this.setState("running");
+    this.node.noteTrajectoryStart();
+    try {
+      await h.start(atHostNs, cycles);
+    } catch (error) {
+      if (this.isState("running")) {
+        this.setState("ready");
+        this.node.resumeInputs();
+      }
+      throw error;
+    }
+  }
+
+  async stop(): Promise<void> {
+    if (this._state !== "running") return;
+    await this.handle!.stop();
+    this.endRun();
+  }
+
+  /** Run over (STOP ack / ENDED / run-level CANCELLED): inputs re-take the DAC. */
+  private endRun(): void {
+    if (this._state !== "running") return;
+    this.setState("ready");
+    this.node.resumeInputs();
+  }
+
+  async close(): Promise<void> {
+    if (this._state === "closed") return;
+    const wasRunning = this._state === "running";
+    const h = this.handle;
+    this.unsubscribe?.();
+    this.unsubscribe = null;
+    this.handle = null;
+    this.owner = null;
+    this.setState("closed");
+    this.frameListeners.clear();
+    if (h) {
+      try {
+        if (wasRunning) await h.stop();
+      } catch {
+        // best-effort — DELETE stops a running table anyway
+      }
+      try {
+        await h.dispose(); // DELETE
+      } catch {
+        // best-effort — the device may already be gone
+      }
+    }
+    if (wasRunning) this.node.resumeInputs();
+    this.stateListeners.clear();
+    await this.node.retireTrajectory(this);
+  }
+
+  onFrame(cb: (frame: TrajectoryFrameOutcome) => void): () => void {
+    this.frameListeners.add(cb);
+    return () => {
+      this.frameListeners.delete(cb);
+    };
+  }
+
+  onStateChange(
+    cb: (state: NodeTrajectoryState, detail: { controllerAvailable: boolean }) => void,
+  ): () => void {
+    this.stateListeners.add(cb);
+    return () => {
+      this.stateListeners.delete(cb);
+    };
+  }
+
+  async reupload(): Promise<void> {
+    if (this._state !== "detached")
+      throw new Error(`Trajectory "${this.name}" is ${this._state}, not detached`);
+    const c = this.node.liveController;
+    if (!c) throw new Error("reupload requires a bound controller");
+    if (!c.v22Capable)
+      throw new Error("reupload requires firmware >= 2.2.0 (CMD_TRAJECTORY unavailable)");
+    try {
+      await this.upload(c);
+    } catch (error) {
+      if (this.isState("uploading")) this.setState("detached");
+      throw error;
+    }
+  }
+
+  /** @internal — the controller went away (unbind / swap / node dispose):
+   *  stop listening, forget the table (it lived on that device), no wire. */
+  detach(): void {
+    if (this._state === "closed" || this._state === "detached") return;
+    this.unsubscribe?.();
+    this.unsubscribe = null;
+    this.handle = null;
+    this.owner = null;
+    this.setState("detached");
+  }
+
+  /** @internal — a position-input push was held during this run. */
+  noteHeldPush(): void {
+    this.heldPushes++;
+  }
+
+  /** @internal — a controller bound while detached: report, never reupload. */
+  notifyRebind(controllerAvailable: boolean): void {
+    if (this._state === "detached") this.setState("detached", controllerAvailable);
+  }
+
+  private onPush(f: TrajectoryFrameOutcome): void {
+    if (this._state === "closed" || this._state === "detached") return;
+    this.statusCounts[f.status] = (this.statusCounts[f.status] ?? 0) + 1;
+    if (f.marker !== null) {
+      this.lastMarker = f.marker;
+      this.lastCycle = f.cycle;
+      if (f.cycle + 1 > this.cyclesSeen) this.cyclesSeen = f.cycle + 1;
+    }
+    if (f.status === "OK" && f.marker !== null) {
+      const marker = this.spec.markers?.[f.marker];
+      if (marker && this.startHostNs !== null)
+        this.lastLatenessUs =
+          Number(
+            f.tTrigger -
+              expectedTriggerNs(this.startHostNs, f.cycle, this.spec.periodUs, marker.tOffsetUs),
+          ) / 1000;
+      this.node.forwardTrajectoryFrame(f);
+    } else {
+      this.log.note(
+        f.status,
+        `controller: trajectory "${this.name}" (id ${f.trajectoryId}) push ${f.status}` +
+          (f.marker === null ? " (run-level)" : ` at marker ${f.marker}, cycle ${f.cycle}`),
+      );
+      // Run-level end: the MCU no longer owns the DAC (ENDED → HOLD at phase
+      // 0; CANCELLED → system disabled).
+      if (f.marker === null && (f.status === "ENDED" || f.status === "CANCELLED"))
+        this.endRun();
+    }
+    for (const cb of this.frameListeners) {
+      try {
+        cb(f);
+      } catch (error) {
+        console.error("trajectory onFrame listener threw:", error);
+      }
+    }
+  }
+
+  snapshot(): TrajectoryStat {
+    return {
+      name: this.name,
+      id: this.id,
+      state: this._state,
+      running: this._state === "running",
+      periodUs: this.spec.periodUs,
+      markers: this.spec.markers?.length ?? 0,
+      cyclesSeen: this.cyclesSeen,
+      statusCounts: { ...this.statusCounts },
+      lastMarker: this.lastMarker,
+      lastCycle: this.lastCycle,
+      lastLatenessUs: this.lastLatenessUs,
+      latenessExact: this.startExact,
+      heldPushes: this.heldPushes,
+    };
   }
 }
 
