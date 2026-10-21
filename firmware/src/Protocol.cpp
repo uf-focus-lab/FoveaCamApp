@@ -297,6 +297,9 @@ HANDLE_SET(Command::Trigger) {
     reject(seq, "A trigger request is already pending");
     return;
   }
+  // Legacy all-camera pulse: asserts every camera's `trigger` (Line2 on the
+  // V0.1 board — C, L and R are all cabled). Never touches `strobe` (Line3 =
+  // VAUX) or the opto pair; those Pins are inputs and cannot be written.
   for (auto &cam : Board::camera)
     cam.trigger.write(HIGH);
   trigger.start(seq, payload, Global::time.now() + payload.duration);
@@ -378,7 +381,7 @@ void Protocol::tick() {
   now = Global::time.now();
   if (trigger.ready(now)) {
     trigger.clear();
-    for (auto &cam : Board::camera)
+    for (auto &cam : Board::camera) // release every Line2 trigger (C, L, R)
       cam.trigger.write(LOW);
     trigger.result.timestamp = now;
     auto packet = ::Packet::Command::Trigger::Create::FIN(trigger.seq);
