@@ -206,6 +206,22 @@ public:
     arv_camera_set_string(get(), name, value, &Error::error);
     Error::check("arv_camera_set_string");
   }
+  inline void set_feature_int(const char *name, int64_t value) const {
+    arv_camera_set_integer(get(), name, static_cast<gint64>(value),
+                           &Error::error);
+    Error::check("arv_camera_set_integer");
+  }
+  /* Boolean GenICam node access (e.g. LineInverter, an ArvGcBoolean that
+   * `arv_camera_set_string` refuses with "Not a ArvGcString"). */
+  inline bool get_feature_bool(const char *name) const {
+    auto ret = arv_camera_get_boolean(get(), name, &Error::error);
+    Error::check("arv_camera_get_boolean");
+    return ret;
+  }
+  inline void set_feature_bool(const char *name, bool value) const {
+    arv_camera_set_boolean(get(), name, value ? TRUE : FALSE, &Error::error);
+    Error::check("arv_camera_set_boolean");
+  }
   inline void execute_feature(const char *name) const {
     arv_camera_execute_command(get(), name, &Error::error);
     Error::check("arv_camera_execute_command");
