@@ -40,6 +40,15 @@ describe("frameRequestFromBudget (engage-site scheduler target)", () => {
     // Explicit mask (an absent mask NAPI-encodes to 0, not CAM_L|CAM_R).
     expect(target.cameras).toEqual(["L", "R"]);
   });
+
+  it("takes an explicit mask including the center camera (V0.1 board cables CAM_C)", () => {
+    const budget = pairTriggerBudget({ exposureUsL: 10000, exposureUsR: 10000 });
+    const cameras = ["C", "L", "R"] as const;
+    const target = frameRequestFromBudget(budget, 2, 0, cameras);
+    expect(target.cameras).toEqual(["C", "L", "R"]);
+    // A copy: the scheduler target never aliases the caller's array.
+    expect(target.cameras).not.toBe(cameras);
+  });
 });
 
 const READY = {

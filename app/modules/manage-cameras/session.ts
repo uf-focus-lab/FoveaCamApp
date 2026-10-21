@@ -112,6 +112,18 @@ export default function manageCamerasSession(): ServerSession<typeof manageCamer
       return { left: byRole.L[0], right: byRole.R[0] };
     }
 
+    /** The one camera holding the Wide Angle (C) role, or null when none or
+     *  several do — the trigger self-test's optional center leg. */
+    function centerEntry(): Entry | null {
+      let found: Entry | null = null;
+      for (const e of entries.values())
+        if (e.role === "C") {
+          if (found) return null;
+          found = e;
+        }
+      return found;
+    }
+
     /** Why the pair link is BLOCKED despite fovea roles being claimed — the
      *  duplicate-role case must be actionable in the UI, not a silent
      *  panel-vanish. Null = linked or simply unclaimed. */
@@ -397,13 +409,14 @@ export default function manageCamerasSession(): ServerSession<typeof manageCamer
       } finally {
         await restoreFreeRun(e);
       }
-      // HARDWARE leg: one real MCU pulse via Line0, only if a controller is up.
+      // HARDWARE leg: one real MCU pulse on camera Line2, only if a controller
+      // is up (CMD_TRIGGER pulses every camera's trigger line, C included).
       // A dead probe means neither leg can observe frames — same verdict.
       const controller = activeController();
       if (verdict.sw === "unavailable") verdict.hw = "unavailable";
       else if (controller?.connected) {
         try {
-          await enableHardwareTrigger(e.lease); // Line0 in / Line1 ExposureActive
+          await enableHardwareTrigger(e.lease); // Line2 in / Line3 ExposureActive
           // CMD_TRIGGER duration is MICROSECONDS on the wire (verified: firmware
           // `Trigger.duration` is Microseconds; `Controller.trigger` forwards it
           // verbatim — NEVER ×1000). Cover the exposure, 5 ms floor for a clean
@@ -435,8 +448,9 @@ export default function manageCamerasSession(): ServerSession<typeof manageCamer
             ? "trigger wiring (software ok, hardware pulse produced no frame)"
             : null;
       const parts: string[] = [];
-      for (const side of ["L", "R"] as const) {
-        const msg = interpret(r[side]);
+      for (const side of ["L", "R", "C"] as const) {
+        const v = r[side];
+        const msg = v ? interpret(v) : null;
         if (msg) parts.push(`${side}: ${msg}`);
       }
       if (parts.length)
@@ -540,7 +554,10 @@ export default function manageCamerasSession(): ServerSession<typeof manageCamer
               // Sequential (never overlap two reconfigure flows / triggers).
               const L = await testTriggerCamera(pair.left);
               const R = await testTriggerCamera(pair.right);
-              const result: TriggerTestResult = { at: Date.now(), L, R };
+              // Center leg iff a Wide Angle camera is assigned (V0.1 cables it).
+              const center = centerEntry();
+              const C = center ? await testTriggerCamera(center) : undefined;
+              const result: TriggerTestResult = { at: Date.now(), L, R, ...(C && { C }) };
               s.telemetry({ trigger_test: result });
               reportTriggerTestFailures(result);
             } finally {

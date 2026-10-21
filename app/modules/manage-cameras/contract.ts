@@ -82,9 +82,9 @@ export type FoveaPairView = {
 
 /** One camera's trigger self-test verdict (§Trigger test): the SOFTWARE leg
  *  (camera → convert-pipe frame path, `TriggerSource=Software` + a software
- *  trigger) and the HARDWARE leg (one real MCU pulse via `Line0` — proves the
- *  trigger INPUT chain only; the strobe RETURN line is only proven by a live
- *  trigger-sync engage). `sw: "fail"` indicts the camera/stream path;
+ *  trigger) and the HARDWARE leg (one real MCU pulse on camera `Line2` —
+ *  proves the trigger INPUT chain only; the `Line3` strobe RETURN line is only
+ *  proven by a live trigger-sync engage). `sw: "fail"` indicts the camera/stream path;
  *  `sw: "ok"` + `hw: "fail"` isolates the trigger wiring; `"no-controller"` =
  *  the hardware leg could not run; `"unavailable"` = the convert producer's
  *  frame probe is dead (pipe parked) — not a pass or a fail. */
@@ -94,11 +94,15 @@ export type TriggerTestVerdict = {
 };
 
 /** Latest fovea-pair trigger self-test result, or null (never run / reset on
- *  idle). `at` = completion epoch ms. */
+ *  idle). `at` = completion epoch ms. `C` is present when exactly one camera
+ *  holds the Wide Angle role: the V0.1 board cables the center camera's
+ *  trigger too, and CMD_TRIGGER pulses every camera's trigger line, so the
+ *  same test checks its wiring. */
 export type TriggerTestResult = {
   at: number;
   L: TriggerTestVerdict;
   R: TriggerTestVerdict;
+  C?: TriggerTestVerdict;
 };
 
 export const manageCameras = defineContract({
@@ -135,8 +139,9 @@ export const manageCameras = defineContract({
      *  onto the other camera — the explicit divergence resolution. */
     unifyPair: cmd<{ source: string }>(),
     /** Run the fovea-pair trigger self-test (§Trigger test): fires a real
-     *  software then hardware trigger on BOTH fovea cameras, restoring free-run,
-     *  and publishes `trigger_test`. No-op unless the pair is linked. */
+     *  software then hardware trigger on BOTH fovea cameras (and the center
+     *  camera, when one holds the Wide Angle role), restoring free-run, and
+     *  publishes `trigger_test`. No-op unless the pair is linked. */
     testTrigger: cmd(),
     /** Reset a camera to auto defaults and clear its stored config. */
     reset: cmd<{ serial: string }>(),

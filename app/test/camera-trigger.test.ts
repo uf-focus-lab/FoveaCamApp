@@ -7,23 +7,38 @@
 // Camera hardware-trigger config (spec disparity-scope §trigger-sync): both
 // directions ride `lease.reconfigure()`, enable programs the trigger source
 // + the strobe line, disable clears — driven with a fake lease (no native core).
+// Defaults follow the V0.1 board (docs/hardware/rig.md §Cameras): trigger on
+// camera Line2, ExposureActive strobe on camera Line3, not inverted.
 
 import { describe, expect, it, vi } from "vitest";
 import {
   disableHardwareTrigger,
   enableHardwareTrigger,
+  enableSoftwareTrigger,
+  readTriggerConfig,
 } from "@orchestrator/camera-trigger";
 import type { CameraLease } from "@orchestrator/registry";
 
-function makeFakeLease() {
+function makeFakeLease(opts: { triggerSourceOptions?: string[] } = {}) {
+  /** Every write in call order: setFeature + setTrigger + setFeatureBool. */
+  const writes: string[] = [];
   const features: Record<string, string> = {};
-  const camera = {
-    setTrigger: vi.fn(),
+  const camera: Record<string, any> = {
+    setTrigger: vi.fn((source: string) => {
+      writes.push(`setTrigger=${source}`);
+    }),
     clearTriggers: vi.fn(),
     setFeature: vi.fn((name: string, value: string) => {
+      writes.push(`${name}=${value}`);
       features[name] = value;
     }),
+    getFeature: vi.fn((name: string) => {
+      if (!(name in features)) throw new Error(`[${name}] Not found`);
+      return features[name];
+    }),
   };
+  if (opts.triggerSourceOptions)
+    camera.trigger_source_options = opts.triggerSourceOptions;
   const lease = {
     camera,
     reconfigure: vi.fn(async (mutate: () => void | Promise<void>) => {
@@ -31,34 +46,124 @@ function makeFakeLease() {
     }),
     release: vi.fn(),
   };
-  return { lease: lease as unknown as CameraLease, raw: lease, camera, features };
+  return {
+    lease: lease as unknown as CameraLease,
+    raw: lease,
+    camera,
+    features,
+    writes,
+  };
 }
 
+/** The writes after `setTrigger` (the strobe-line block). */
+const strobeWrites = (writes: string[]) =>
+  writes.slice(writes.findIndex((w) => w.startsWith("setTrigger=")) + 1);
+
 describe("enableHardwareTrigger", () => {
-  it("programs the trigger SOURCE + ExposureActive strobe through reconfigure", async () => {
-    const { lease, raw, camera, features } = makeFakeLease();
-    await enableHardwareTrigger(lease);
+  it("triggers on Line2 and programs the Line3 ExposureActive strobe through reconfigure", async () => {
+    const { lease, raw, camera, writes } = makeFakeLease();
+    const result = await enableHardwareTrigger(lease);
     expect(raw.reconfigure).toHaveBeenCalledTimes(1);
     // setTrigger takes the SOURCE (arv_camera_set_trigger semantics — Aravis
     // sets TriggerMode/TriggerSelector itself). Passing "FrameStart" is wrong;
     // pin the source argument.
-    expect(camera.setTrigger).toHaveBeenCalledWith("Line0");
-    expect(features).toEqual({
-      LineSelector: "Line1",
-      LineMode: "Output",
-      LineSource: "ExposureActive",
-    });
+    expect(camera.setTrigger).toHaveBeenCalledTimes(1);
+    expect(camera.setTrigger).toHaveBeenCalledWith("Line2");
+    // The full GenICam sequence: trigger line forced to Input first, then the
+    // source, then the strobe line LineSelector → LineMode → LineSource →
+    // LineInverter (the firmware's active-HIGH assumption).
+    expect(writes).toEqual([
+      "LineSelector=Line2",
+      "LineMode=Input",
+      "setTrigger=Line2",
+      "LineSelector=Line3",
+      "LineMode=Output",
+      "LineSource=ExposureActive",
+      "LineInverter=false",
+    ]);
+    expect(result).toEqual({ lineInverter: null });
     expect(camera.clearTriggers).not.toHaveBeenCalled();
   });
 
-  it("honors explicit trigger/strobe line names", async () => {
-    const { lease, camera, features } = makeFakeLease();
-    await enableHardwareTrigger(lease, {
-      triggerSource: "Line2",
-      lineSelector: "Line3",
+  it("selects the strobe line BEFORE its line-scoped writes (LineMode/LineSource/LineInverter)", async () => {
+    const { lease, writes } = makeFakeLease();
+    await enableHardwareTrigger(lease);
+    expect(strobeWrites(writes)).toEqual([
+      "LineSelector=Line3",
+      "LineMode=Output",
+      "LineSource=ExposureActive",
+      "LineInverter=false",
+    ]);
+  });
+
+  it("prefers a native boolean writer for LineInverter when the binding has one", async () => {
+    const { lease, camera, writes } = makeFakeLease();
+    camera.setFeatureBool = vi.fn((name: string, value: boolean) => {
+      writes.push(`${name}:bool=${value}`);
     });
+    await enableHardwareTrigger(lease);
+    expect(camera.setFeatureBool).toHaveBeenCalledWith("LineInverter", false);
+    expect(writes.at(-1)).toBe("LineInverter:bool=false");
+    expect(camera.setFeature).not.toHaveBeenCalledWith("LineInverter", expect.anything());
+  });
+
+  it("reports (does not throw) a LineInverter write the binding cannot do", async () => {
+    const { lease, camera } = makeFakeLease();
+    const base = camera.setFeature.getMockImplementation()!;
+    camera.setFeature.mockImplementation((name: string, value: string) => {
+      if (name === "LineInverter")
+        throw new Error("[LineInverter:ArvGcBoolean] Not a ArvGcString\nmore");
+      base(name, value);
+    });
+    const result = await enableHardwareTrigger(lease);
+    expect(result.lineInverter).toBe("[LineInverter:ArvGcBoolean] Not a ArvGcString");
     expect(camera.setTrigger).toHaveBeenCalledWith("Line2");
-    expect(features.LineSelector).toBe("Line3");
+  });
+
+  it("keeps the opto pair selectable as a bench fallback, with the inverter", async () => {
+    const { lease, camera, writes } = makeFakeLease();
+    await enableHardwareTrigger(lease, {
+      triggerSource: "Line0",
+      lineSelector: "Line1",
+      lineInverter: true,
+    });
+    expect(camera.setTrigger).toHaveBeenCalledWith("Line0");
+    // Line0/Line1 are fixed-direction opto lines: no LineMode=Input write on
+    // the trigger side.
+    expect(writes).toEqual([
+      "setTrigger=Line0",
+      "LineSelector=Line1",
+      "LineMode=Output",
+      "LineSource=ExposureActive",
+      "LineInverter=true",
+    ]);
+  });
+
+  it("refuses one line as both trigger and strobe", async () => {
+    const { lease, raw } = makeFakeLease();
+    await expect(
+      enableHardwareTrigger(lease, { triggerSource: "Line3", lineSelector: "Line3" }),
+    ).rejects.toThrow("both Line3");
+    expect(raw.reconfigure).not.toHaveBeenCalled();
+  });
+
+  it("refuses a source missing from trigger_source_options, naming the offered list", async () => {
+    const { lease, camera } = makeFakeLease({
+      triggerSourceOptions: ["Line0", "Software"],
+    });
+    await expect(enableHardwareTrigger(lease)).rejects.toThrow(
+      "TriggerSource 'Line2' not offered by this camera (options: Line0, Software)",
+    );
+    expect(camera.setTrigger).not.toHaveBeenCalled();
+    expect(camera.setFeature).not.toHaveBeenCalled();
+  });
+
+  it("accepts a source the camera offers", async () => {
+    const { lease, camera } = makeFakeLease({
+      triggerSourceOptions: ["Line0", "Line2", "Line3", "Software"],
+    });
+    await enableHardwareTrigger(lease);
+    expect(camera.setTrigger).toHaveBeenCalledWith("Line2");
   });
 
   it("propagates a feature-write failure (caller reverts + surfaces it)", async () => {
@@ -72,6 +177,22 @@ describe("enableHardwareTrigger", () => {
   });
 });
 
+describe("enableSoftwareTrigger", () => {
+  it("uses the Software source and still programs the Line3 strobe", async () => {
+    const { lease, camera, writes } = makeFakeLease();
+    await enableSoftwareTrigger(lease);
+    expect(camera.setTrigger).toHaveBeenCalledWith("Software");
+    // No line to force to Input for a software source.
+    expect(writes).toEqual([
+      "setTrigger=Software",
+      "LineSelector=Line3",
+      "LineMode=Output",
+      "LineSource=ExposureActive",
+      "LineInverter=false",
+    ]);
+  });
+});
+
 describe("disableHardwareTrigger", () => {
   it("clears triggers through reconfigure (back to free-run)", async () => {
     const { lease, raw, camera } = makeFakeLease();
@@ -79,5 +200,18 @@ describe("disableHardwareTrigger", () => {
     expect(raw.reconfigure).toHaveBeenCalledTimes(1);
     expect(camera.clearTriggers).toHaveBeenCalledTimes(1);
     expect(camera.setTrigger).not.toHaveBeenCalled();
+  });
+});
+
+describe("readTriggerConfig", () => {
+  it("snapshots LineInverter alongside the line config, per-node errors isolated", async () => {
+    const { lease } = makeFakeLease();
+    await enableHardwareTrigger(lease);
+    const snap = readTriggerConfig(lease);
+    expect(snap.LineSelector).toBe("Line3");
+    expect(snap.LineSource).toBe("ExposureActive");
+    expect(snap.LineInverter).toBe("false");
+    // A node the fake never wrote reads as an error string, not a throw.
+    expect(snap.TriggerActivation).toMatch(/^<error: /);
   });
 });
