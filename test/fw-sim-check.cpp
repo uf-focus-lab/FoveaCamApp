@@ -30,7 +30,7 @@
 //      CMD_TRAJECTORY upload/commit/start -> periodic DAC playback + marker
 //      SYN pushes with sane timestamps; STOP holds position, DAC returns to
 //      the streams.
-//   D. Pipelining (workstream D, runs between 6 and 7): N requests in
+//   D. Pipelining (runs between 6 and 7): N requests in
 //      flight answered in seq order at ~one round trip; seq=0 UPDATEs
 //      interleaved silently (latest wins); requests behind a pending
 //      two-phase FRAME are not gated by its FIN.
@@ -706,7 +706,7 @@ int main() {
     }
 
     // ===================================================================
-    // v2.2.0 stages C1-C4 — CMD_SCHEDULE + CMD_TRAJECTORY (workstream C).
+    // v2.2.0 stages C1-C4 — CMD_SCHEDULE + CMD_TRAJECTORY.
     // State on entry: enabled; stream 1 active with target
     //   L = (12000, 22000, 32000, 42000), R = (42000, 32000, 22000, 12000);
     //   strobes armed (L 500/2500, R 700/2500).
@@ -1066,7 +1066,7 @@ int main() {
                   "DELETE OK\n",
                   unsigned(held));
     }
-    // ==== STAGE D — serial pipelining (workstream D) ==========================
+    // ==== STAGE D — serial pipelining =========================================
     // The firmware side of "no ACK serialisation": loop() drains every
     // available byte per iteration and every handler answers synchronously, so
     // requests need no one-in-flight discipline on the host. Self-contained

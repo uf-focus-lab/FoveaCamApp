@@ -31,7 +31,7 @@ Read in this order:
 4. [`windows.md`](./windows.md) — window taxonomy, manager, stable window identity.
 5. [`metering.md`](./metering.md) — workload meters, native probes, the profiler.
 6. [`recorder.md`](./recorder.md) — the `.fcap` MCAP container (legacy `.fovea` readable), the standalone viewer, Python access.
-7. [`serial-protocol.md`](./serial-protocol.md) — MEMS controller protocol (v1 + v2 streams/frames).
+7. [`serial-protocol.md`](./serial-protocol.md) — MEMS controller protocol (v1 + v2 streams/frames, v2.2 timestamped keyframes and uploaded trajectories).
 
 ## Invariant glossary
 

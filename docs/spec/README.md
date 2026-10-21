@@ -24,5 +24,6 @@ file names and heading anchors stable when editing.
 - [Orchestrator protocol](./orchestrator-protocol.md) · [Orchestrator runtime](./orchestrator-runtime.md)
 - [Capture & recording](./capture-recording.md) — capture nodes, the recorder sink, `.fcap` writing.
 - [Controller](./controller.md) · [Serial protocol](./serial-protocol.md) — MEMS mirror control and the wire protocol.
+- [Controller board V0.1 migration](./board-v0.1-migration.md) — decisions, status and bench checklist for the DuoController V0.1 adaptation (firmware 2.2.0).
 - [Store](./store.md) — the config/document store.
 - [Vision](./vision.md) — vision workers and predictors.

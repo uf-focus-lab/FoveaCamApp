@@ -66,7 +66,6 @@
 #include <termios.h>
 
 #include <Arduino.h>
-#include <SPI.h>
 
 #include <Protocol/Packet.h>
 #include <Protocol/Protocol.h>
@@ -405,7 +404,6 @@ int main(int argc, char **argv) {
 
   // --- setup(): mirrors Firmware.cpp::setup() --------------------------------
   Serial.begin(115200);
-  SPI.begin();
   Board::init();
   Board::fclk.freq(Global::lpf_frequency);
   Capture::init();

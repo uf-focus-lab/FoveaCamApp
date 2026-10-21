@@ -28,7 +28,7 @@
 //      settles exactly once (pre-fix, the failed ones returned `undefined`).
 //
 // Spec: docs/spec/serial-protocol.md#pipelining.
-// Run UNSANDBOXED: node core/test/51-serial-pipelining.ts
+// Run UNSANDBOXED: node core/test/52-serial-pipelining.ts
 
 import assert from "node:assert/strict";
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
@@ -176,7 +176,7 @@ try {
         `sequential ${seqMs.toFixed(2)} ms)`,
     );
     console.log(
-      `51-serial-pipelining: §1 ${N} GETs in flight at once; pipelined ${pipeMs.toFixed(2)} ms ` +
+      `52-serial-pipelining: §1 ${N} GETs in flight at once; pipelined ${pipeMs.toFixed(2)} ms ` +
         `(~${(pipeMs / rttMs).toFixed(1)} RTT) vs sequential ${seqMs.toFixed(2)} ms ` +
         `(RTT ${rttMs.toFixed(3)} ms); MCU span ${stamps[N - 1] - stamps[0]} µs OK.`,
     );
@@ -247,7 +247,7 @@ try {
     await sim.ctl("strobe L 500 2500");
     await sim.ctl("strobe R 700 2500");
     console.log(
-      "51-serial-pipelining: §2 seq-0 UPDATEs never wait behind a pending GET / two-phase FRAME OK.",
+      "52-serial-pipelining: §2 seq-0 UPDATEs never wait behind a pending GET / two-phase FRAME OK.",
     );
   }
 
@@ -283,7 +283,7 @@ try {
     assert.equal(dev.stats.txQueuedBytes, 0, "TX tail drained");
     assert.equal(dev.stats.inFlight, 0, "pending map drained");
     console.log(
-      `51-serial-pipelining: §3 ${n}-request burst queued (peak tail ${queuedPeak} B, ` +
+      `52-serial-pipelining: §3 ${n}-request burst queued (peak tail ${queuedPeak} B, ` +
         `txSoftFail ${dev.stats.txSoftFail}) and drained without a follow-up write OK.`,
     );
   }
@@ -321,7 +321,7 @@ try {
     assert.equal(dev.stats.inFlight, 0, "pending map drained");
     assert.equal(dev.stats.txQueuedBytes, 0, "TX tail drained");
     console.log(
-      `51-serial-pipelining: §3b ${N}-request burst: ${order.length} resolved in order, ` +
+      `52-serial-pipelining: §3b ${N}-request burst: ${order.length} resolved in order, ` +
         `${rejected.length} rejected "TX queue full" (none lost) OK.`,
     );
   }
@@ -336,7 +336,7 @@ try {
     const [code] = (await withTimeout(exited, 5000, "sim exit")) as [number | null];
     assert.equal(code, 0, "sim exits 0 on quit");
   }
-  console.log("51-serial-pipelining: ALL OK");
+  console.log("52-serial-pipelining: ALL OK");
   process.exit(0);
 } finally {
   if (frozen) sim.proc.kill("SIGCONT");

@@ -42,7 +42,7 @@ endforeach()
 # ------------------------------------------------------------------------------
 # fovea-fw-sim — firmware-in-the-loop simulator: the REAL firmware translation
 # units compiled for the host behind the thin HAL shim in fw-sim/shim
-# (Arduino/SPI/core_pins stand-ins). Firmware.cpp is NOT compiled — the sim's
+# (Arduino/core_pins stand-ins). Firmware.cpp is NOT compiled — the sim's
 # main.cpp provides the pump + a verbatim copy of its dispatch switch.
 # Exceptions stay ON (host default): lib/crash.h's CRASH throws like it does
 # in core; the firmware's extern crash() is declared by the shim <Arduino.h>

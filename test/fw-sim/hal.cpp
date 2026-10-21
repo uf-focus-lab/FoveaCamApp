@@ -22,7 +22,6 @@
 #include <unistd.h>
 
 #include <Arduino.h>
-#include <SPI.h>
 #include <core_pins.h>
 
 #include "sim.h"
@@ -199,10 +198,6 @@ size_t HostSerial::println(const char *s) {
   const uint8_t crlf[2] = {'\r', '\n'};
   return n + write(crlf, 2);
 }
-
-// --- SPI library stub ------------------------------------------------------------
-
-SPIClass SPI; // inert — see shim SPI.h
 
 // --- Fast-GPIO port model + MEMS bus decoder --------------------------------------
 

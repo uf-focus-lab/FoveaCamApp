@@ -118,7 +118,7 @@ is per-packet latency, not bits:
     follow-up, not needed for the limits below.
 - **DAC commit** (once per loop iteration, latest-wins):
   - Old bus: 9 words × 32 clocks at 2 MHz is 144 µs, so **about 150 µs**.
-  - V0.1 (workstream A): 4 frames × 24 clocks per device, with both buses
+  - V0.1 dual-bus driver: 4 frames × 24 clocks per device, with both buses
     concurrent, is 96 clocks: **about 10 µs** at 10 MHz and about 5 µs at
     20 MHz.
 
@@ -168,7 +168,7 @@ share of the MCU loop spent on updates, which sets the timing jitter of
   - N requests are answered in seq order at about one RTT.
   - seq-0 UPDATEs interleaved with requests stay silent, and the last one wins.
   - Requests behind a pending two-phase FRAME are not held until its FIN.
-- `core/test/51-serial-pipelining.ts` (core `Device` against the sim, which is
+- `core/test/52-serial-pipelining.ts` (core `Device` against the sim, which is
   frozen with SIGSTOP so in-flight counts are deterministic):
   - `stats.inFlight === N` while the sim is frozen, and all N resolve in seq
     order at about one RTT rather than N.
