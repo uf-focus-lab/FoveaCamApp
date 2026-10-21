@@ -121,6 +121,14 @@ export class StreamUpdateGate {
     this.lastSentAt = now;
     return true;
   }
+
+  /** The accepted pose never reached the wire (a latest-wins drop under
+   *  back-pressure): forget it for DEDUPE so the next push — even the same
+   *  pose — is sent, while the min-interval still paces the retry. */
+  forgetLast(): void {
+    this.lastLeft = { x: NaN, y: NaN };
+    this.lastRight = { x: NaN, y: NaN };
+  }
 }
 
 /** A CMD_STREAM handle: a named,
@@ -482,12 +490,21 @@ export class Controller {
       update: (next) => {
         if (closed) throw new Error(`Stream ${id} is closed`);
         if (!gate.accept(next)) return;
-        this.device.fireAndForget(Protocol.Command.MirrorStream, {
-          op: "UPDATE",
-          id,
-          left: channels(next.left, this.bias, this.dv),
-          right: channels(next.right, this.bias, this.dv),
-        });
+        try {
+          this.device.fireAndForget(Protocol.Command.MirrorStream, {
+            op: "UPDATE",
+            id,
+            left: channels(next.left, this.bias, this.dv),
+            right: channels(next.right, this.bias, this.dv),
+          });
+        } catch {
+          // Latest-wins drop (full kernel queue / requests queued ahead —
+          // counted natively in txSoftFail, the governor's signal). Never
+          // throw into the caller's hot path (native-sink parity); re-arm the
+          // dedupe so a resting target is re-sent on the next push.
+          gate.forgetLast();
+          return;
+        }
         // The ~kHz-capable stream hot path — `emit` is an O(1) counter bump,
         // never a gate on the fire-and-forget write.
         this.serialMeter.emit("packets");

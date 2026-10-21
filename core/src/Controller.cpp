@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <limits>
 #include <optional>
 
 #include <napi.h>
@@ -1941,6 +1942,11 @@ struct MirrorSink : Shared<MirrorSink> {
     // serializes the fd) — a slow write never blocks a probe.
     if (!seam->writeMirrorUpdate(streamId, chL, chR)) {
       errors.fetch_add(1, std::memory_order_relaxed);
+      // The pose never reached the wire (latest-wins drop): forget it for
+      // DEDUPE (NaN never compares equal) so a resting target is re-sent on
+      // the next push; lastSentNs stays, so the min-interval paces the retry.
+      std::scoped_lock lk(mtx);
+      lastLx = lastLy = lastRx = lastRy = std::numeric_limits<double>::quiet_NaN();
       return;
     }
     written.fetch_add(1, std::memory_order_relaxed);

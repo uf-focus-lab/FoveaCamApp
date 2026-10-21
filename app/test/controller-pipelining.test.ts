@@ -3,7 +3,8 @@
 // writing the next. A fake `Device` whose awaited requests stay UNANSWERED
 // until the test releases them proves (1) the connect-time config sequence
 // is written back-to-back in wire order, (2) a fire-and-forget stream update
-// goes out while awaited requests are still pending, and (3) the stream
+// goes out while awaited requests are still pending, (3) a latest-wins drop
+// never throws into the hot path and re-arms the dedupe, and (4) the stream
 // min-interval is a live per-controller tunable shared with native sinks.
 
 import { describe, expect, it, vi } from "vitest";
@@ -14,7 +15,8 @@ const h = vi.hoisted(() => {
   const calls: Call[] = [];
   const parked: Array<() => void> = [];
   const sinkGovernor: unknown[] = [];
-  return { calls, parked, sinkGovernor };
+  const ff = { failNext: false };
+  return { calls, parked, sinkGovernor, ff };
 });
 
 vi.mock("core/Controller", () => {
@@ -28,6 +30,10 @@ vi.mock("core/Controller", () => {
     verifyVersion = vi.fn(async () => ({ major: 2, minor: 2, patch: 0, compatible: true }));
     release = vi.fn();
     fireAndForget = vi.fn((prop: string, arg: unknown) => {
+      if (h.ff.failNext) {
+        h.ff.failNext = false;
+        throw new Error("Failed to write to serial port: Resource temporarily unavailable");
+      }
       h.calls.push({ method: "fireAndForget", prop, arg });
     });
     get = vi.fn((prop: string) => {
@@ -102,6 +108,27 @@ describe("Controller request pipelining", () => {
     expect(h.calls.map((c) => c.method)).toEqual(["get", "set", "fireAndForget"]);
     await releaseAll();
     await Promise.all([pendingA, pendingB]);
+    ctrl.release();
+  });
+
+  it("a latest-wins drop never throws into the caller and the pose is re-sent", async () => {
+    const ctrl = new Controller({ path: "/dev/fake-pipelining-4" } as never);
+    await flush();
+    await releaseAll();
+    await ctrl.ready;
+    ctrl.streamMinIntervalMs = 0;
+    const created = ctrl.createStream(pose(0));
+    await releaseAll();
+    const stream = await created;
+    h.calls.length = 0;
+    h.ff.failNext = true; // the kernel queue is full for this one write
+    expect(() => stream.update(pose(7))).not.toThrow();
+    expect(h.calls).toEqual([]);
+    // The SAME resting pose is re-sent on the next push (dedupe re-armed).
+    stream.update(pose(7));
+    expect(h.calls.map((c) => c.method)).toEqual(["fireAndForget"]);
+    stream.update(pose(7)); // ...and dedupes normally once it landed
+    expect(h.calls.length).toBe(1);
     ctrl.release();
   });
 
