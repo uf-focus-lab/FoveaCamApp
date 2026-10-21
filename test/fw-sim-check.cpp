@@ -22,6 +22,10 @@
 //      same-stream frame undeferred; settle 0 switch undeferred.
 //   7. Enable(false) teardown wire ORDER: pending-frame REJ before the
 //      enable ACK.
+//   D. Pipelining (workstream D, runs between 6 and 7): N requests in
+//      flight answered in seq order at ~one round trip; seq=0 UPDATEs
+//      interleaved silently (latest wins); requests behind a pending
+//      two-phase FRAME are not gated by its FIN.
 //   8. quit -> exit 0.
 
 #include <cassert>
@@ -484,6 +488,184 @@ int main() {
       std::printf("fw-sim-check: 6 settle_time (deferred %llu us) OK\n",
                   static_cast<unsigned long long>(sw.fin.t_trigger - t0));
     }
+
+    // ==== STAGE D — serial pipelining (workstream D) ==========================
+    // The firmware side of "no ACK serialisation": loop() drains every
+    // available byte per iteration and every handler answers synchronously, so
+    // requests need no one-in-flight discipline on the host. Self-contained
+    // (helpers are local lambdas) so the other workstreams' stages merge
+    // around it. Spec: docs/spec/serial-protocol.md#pipelining.
+    //   D1 — N GETs written back-to-back WITHOUT reading: all N ACK, in send
+    //        (seq) order, and the batch costs far less than N awaited round
+    //        trips.
+    //   D2 — seq=0 UPDATEs interleaved between awaited GETs in one burst:
+    //        only the GETs answer (in order) and the LAST update wins.
+    //   D3 — GETs issued while a two-phase CMD_FRAME is pending (FIN ~60 ms
+    //        away) ACK BEFORE that FIN — a pending request never gates
+    //        unrelated ones.
+    {
+      auto frameBytes = [&](Protocol::RawPacket &&packet,
+                            std::vector<uint8_t> &out) {
+        CHECK(wire.tx.encode(packet.finalize()), "COBS encode (burst)");
+        out.insert(out.end(), wire.tx.data(), wire.tx.data() + wire.tx.size());
+      };
+      auto writeAll = [&](const std::vector<uint8_t> &bytes) {
+        size_t off = 0;
+        while (off < bytes.size()) {
+          const ssize_t n =
+              ::write(wire.fd, bytes.data() + off, bytes.size() - off);
+          if (n > 0) {
+            off += size_t(n);
+            continue;
+          }
+          CHECK(n < 0 && (errno == EAGAIN || errno == EINTR), "burst write");
+          pollfd p{wire.fd, POLLOUT, 0};
+          ::poll(&p, 1, 100);
+        }
+      };
+      auto getTs = [&](uint16_t s, std::vector<uint8_t> &out) {
+        frameBytes({Protocol::Method::GET, Protocol::Property::SYS_TIMESTAMP, s},
+                   out);
+      };
+      auto msSince = [](Clock::time_point t0) {
+        return std::chrono::duration<double, std::milli>(Clock::now() - t0)
+            .count();
+      };
+
+      // D1 — sequential baseline vs one pipelined burst.
+      constexpr int N = 128;
+      auto t0 = Clock::now();
+      for (int i = 0; i < N; i++)
+        (void)mcuNow(wire);
+      const double seqMs = msSince(t0);
+
+      std::vector<uint16_t> seqs;
+      std::vector<uint8_t> burst;
+      for (int i = 0; i < N; i++) {
+        seqs.push_back(wire.next());
+        getTs(seqs.back(), burst);
+      }
+      t0 = Clock::now();
+      writeAll(burst);
+      uint64_t prevUs = 0, firstUs = 0;
+      for (int i = 0; i < N; i++) {
+        const auto ack = wire.recv();
+        expectHeader(ack, Protocol::Method::ACK,
+                     Protocol::Property::SYS_TIMESTAMP, seqs[size_t(i)],
+                     "pipelined ACK in seq order");
+        const uint64_t us = payloadAs<System::Timestamp>(ack).microseconds;
+        CHECK(us >= prevUs, "pipelined requests handled in send order");
+        if (i == 0)
+          firstUs = us;
+        prevUs = us;
+      }
+      const double pipeMs = msSince(t0);
+      CHECK(pipeMs * 2 < seqMs,
+            "pipelined batch costs well under N sequential round trips");
+      std::printf("fw-sim-check: D1 %d GETs pipelined %.2f ms vs sequential "
+                  "%.2f ms (%.1fx; MCU handled all within %llu us) OK\n",
+                  N, pipeMs, seqMs, seqMs / pipeMs,
+                  static_cast<unsigned long long>(prevUs - firstUs));
+
+      // D2 — fire-and-forget UPDATEs interleaved with awaited GETs. Stream 1
+      // is the ACTIVE stream after stage 6 (its settle-0 frame re-activated it).
+      const size_t dacMark = sim.lines.size();
+      constexpr int U = 16;
+      seqs.clear();
+      burst.clear();
+      for (int k = 0; k < U; k++) {
+        Cmd::MirrorStream cmd{};
+        cmd.op = Cmd::MirrorStream::UPDATE;
+        cmd.id = 1;
+        cmd.left = pos(uint16_t(0x5A00 + k), 0x1111, 0x2222, 0x3333);
+        cmd.right = pos(0x4444, 0x5555, 0x6666, 0x7777);
+        frameBytes(setPacket(Protocol::Property::CMD_STREAM, 0, &cmd,
+                             sizeof(cmd)),
+                   burst);
+        if (k % 4 == 3) {
+          seqs.push_back(wire.next());
+          getTs(seqs.back(), burst);
+        }
+      }
+      writeAll(burst);
+      for (const auto s : seqs) {
+        const auto ack = wire.recv();
+        expectHeader(ack, Protocol::Method::ACK,
+                     Protocol::Property::SYS_TIMESTAMP, s,
+                     "interleaved GET ACK (updates stay silent)");
+      }
+      CHECK(wire.silent(100), "no response to any seq=0 UPDATE in the burst");
+      char last[8];
+      std::snprintf(last, sizeof(last), "%04X", 0x5A00 + U - 1);
+      // Format-agnostic DAC match (the dual-bus shim may change the word's
+      // command nibble / cs split): a left-mirror word ending in the value.
+      auto leftWordEndsWith = [](const std::string &l, const char *hex,
+                                 size_t n) {
+        return l.rfind("dac cs=L", 0) == 0 && l.size() >= 4 &&
+               l.compare(l.size() - 4, n, hex, n) == 0;
+      };
+      const bool lastLanded = [&] {
+        const auto deadline = Clock::now() + std::chrono::milliseconds(2000);
+        while (Clock::now() < deadline) {
+          for (size_t i = dacMark; i < sim.lines.size(); i++)
+            if (leftWordEndsWith(sim.lines[i], last, 4))
+              return true;
+          sim.pump(20);
+        }
+        return false;
+      }();
+      CHECK(lastLanded, "last UPDATE of the burst reached the left DAC");
+      size_t landed = 0;
+      for (size_t i = dacMark; i < sim.lines.size(); i++)
+        if (leftWordEndsWith(sim.lines[i], "5A", 2))
+          landed++;
+      std::printf("fw-sim-check: D2 %d seq=0 UPDATEs + %zu GETs in one burst: "
+                  "GET ACKs in order, updates silent, latest wins (%zu/%d "
+                  "targets reached the DAC — Streams::tick coalesces) OK\n",
+                  U, seqs.size(), landed, U);
+
+      // D3 — unrelated requests are not gated by a pending two-phase FRAME.
+      sim.ctl("strobe L 500 60000");
+      sim.ctl("strobe R 700 60000");
+      Cmd::Frame req{};
+      req.stream = 1;
+      req.cameras = Cmd::CAM_L | Cmd::CAM_R;
+      req.pulse = 58'000; // strobe falls (60 ms) inside pulse + REJ margin
+      req.settle_time = 0;
+      const uint16_t frameSeq = wire.next();
+      burst.clear();
+      {
+        Protocol::RawPacket packet(Protocol::Method::GET,
+                                   Protocol::Property::CMD_FRAME, frameSeq);
+        packet.setData(&req, sizeof(req));
+        frameBytes(std::move(packet), burst);
+      }
+      seqs.clear();
+      for (int i = 0; i < 8; i++) {
+        seqs.push_back(wire.next());
+        getTs(seqs.back(), burst);
+      }
+      t0 = Clock::now();
+      writeAll(burst);
+      expectAck(wire, Protocol::Property::CMD_FRAME, frameSeq, "D3 frame ACK");
+      for (const auto s : seqs) {
+        const auto ack = wire.recv();
+        expectHeader(ack, Protocol::Method::ACK,
+                     Protocol::Property::SYS_TIMESTAMP, s,
+                     "GET behind a pending FRAME ACKs before its FIN");
+      }
+      const double getsMs = msSince(t0);
+      const auto fin = wire.recv();
+      expectHeader(fin, Protocol::Method::FIN, Protocol::Property::CMD_FRAME,
+                   frameSeq, "pending FRAME FINs after the GETs");
+      const double finMs = msSince(t0);
+      sim.ctl("strobe L 500 2500");
+      sim.ctl("strobe R 700 2500");
+      std::printf("fw-sim-check: D3 8 GETs ACKed %.2f ms after a FRAME whose "
+                  "FIN took %.2f ms — no head-of-line blocking OK\n",
+                  getsMs, finMs);
+    }
+    // ==== end STAGE D =========================================================
 
     // 7 — Enable(false) teardown wire order: pending-frame REJ, THEN the ACK
     {
