@@ -193,7 +193,10 @@ Teensy DMAMEM, 80 KB, first-fit), `MAX_MARKERS = 8` per table.
   a CREATE that takes the DAC, or a CMD_FRAME activation — takes the DAC back.
 - While a trajectory runs (armed or playing) it owns the DAC: `CMD_STREAM UPDATE`
   and `CMD_SCHEDULE` are REJected (`A trajectory owns the DAC (STOP it first)`;
-  silent for seq 0). `DELETE` stops a running table first; deleting a free id is a
+  silent for seq 0). A host `CMD_FRAME` is still accepted: it cannot re-point the
+  DAC, so it exposes at the trajectory's current position (and reports it), and
+  any marker crossing while it is in flight pushes `BUSY`. `DELETE` stops a
+  running table first; deleting a free id is a
   no-op ACK. `System::Enable(false)` halts the run (`CANCELLED` push) and cancels
   an in-flight marker capture (`CANCELLED`); uploaded tables survive.
 
