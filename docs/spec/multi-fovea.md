@@ -113,7 +113,8 @@ frames' deviceTimestamps; the recorder's per-frame notices build dts→seq maps 
 recorded raw12p streams, so a FRESH pair (`PAIR_FRESH_MS` = 1000) for the target's controller
 stream re-keys to recorded sequences. FREE-RUN / stale → explicit `left:null, right:null`. The
 center pointer is the NEAREST recorded center frame by timestamp and is explicitly
-UNSYNCHRONIZED (CAM0 GPIO uncabled — no hardware trigger on the wide camera).
+UNSYNCHRONIZED (multi-fovea free-runs the wide camera by choice; the V0.1 board
+cables its trigger, see `hardware/rig.md`).
 
 **Per-frame extras**: the L/R fovea streams answer `onFrame` with the matched anchor's payload
 (volts / V2A angles / H, unpacked from the enrichment node's opaque doubles — `anchorExtras`,

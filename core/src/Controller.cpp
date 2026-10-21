@@ -378,7 +378,8 @@ inline Napi::Array mirrorPositionToArray(
 
 // CameraMask <-> JS: a number (raw bitmask) or an array of camera-name
 // strings ("C"/"L"/"R"); undefined/omitted means "firmware default"
-// (CAM_L | CAM_R — C is REJected until it has a strobe cable).
+// (CAM_L | CAM_R; C is captured only when asked for — it is cabled on the
+// V0.1 board).
 inline uint8_t parseCameraMask(Napi::Value const &val) {
   if (val.IsUndefined() || val.IsNull())
     return 0;

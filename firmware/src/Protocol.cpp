@@ -108,6 +108,11 @@ static void cancelPendingTrigger(const char *reason) {
   if (!trigger.pending)
     return;
   trigger.clear();
+  // The pulse was asserted on every camera's Line2 by the handler; a cancel
+  // (System::Disable) must release them too or a trigger line stays HIGH
+  // until the next legacy Trigger FINs.
+  for (auto &cam : Board::camera)
+    cam.trigger.write(LOW);
   Packet::Command::Trigger::reject(trigger.seq, reason);
 }
 

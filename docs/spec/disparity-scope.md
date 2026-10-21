@@ -484,9 +484,9 @@ telemetry `trigger: null`. On CONTROLLER DETACH the intent stays latched: camera
 return to free-run, `trigger_blocked` reads "controller detached", and the retry tick
 re-engages when a v2 controller re-attaches.
 
-**Passive fault gate.** A correctly-configured pair (TriggerMode On / Line0 /
-RisingEdge, Line1 ExposureActive out) whose trigger pulse never reaches the cameras'
-opto inputs storms `REJ "Strobe timeout"` every ~pulse+5 ms with ZERO FINs and zero
+**Passive fault gate.** A correctly-configured pair (TriggerMode On / Line2 /
+RisingEdge, Line3 ExposureActive out — V0.1 board, `hardware/rig.md`) whose trigger
+pulse never reaches the cameras' trigger inputs storms `REJ "Strobe timeout"` every ~pulse+5 ms with ZERO FINs and zero
 exposures — a deterministic, firmware-named signature. `TriggerFaultDetector`
 (`@lib/trigger-sync`) watches the scheduler outcomes: `TRIGGER_FAULT_STREAK` = 10
 consecutive identical-reason failures (reject OR timeout) with no FIN in between trips
@@ -522,8 +522,8 @@ exposure cannot false-fail. A dead probe row (producer parked) verdicts
 (reset on idle; the command holds a server-side in-flight latch); a software fail
 indicts the camera/stream path, a software-pass + hardware-fail isolates the trigger
 wiring — the same fault the passive gate trips at engage. The hardware leg proves the
-trigger INPUT chain only (MCU→Line0→exposure→frame); the strobe RETURN line
-(Line1→MCU) is only proven by a live CMD_FRAME engage.
+trigger INPUT chain only (MCU→Line2→exposure→frame); the strobe RETURN line
+(Line3→MCU) is only proven by a live CMD_FRAME engage.
 
 **Teardown invariant.** `disableHardwareTrigger` rides `lease.reconfigure()`, so the
 idle-path disengage is AWAITED at the top of `idleSession`, strictly BEFORE
