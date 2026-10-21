@@ -24,7 +24,21 @@ type PortInfo = Awaited<ReturnType<typeof SerialPort.list>>[number];
 
 // Streams::CAPACITY, firmware/include/Streams.h — fixed-size table on the MCU.
 export const STREAM_CAPACITY = 64;
-export const STREAM_MIN_UPDATE_INTERVAL_MS = 1;
+/** Default host-side floor between two CMD_STREAM UPDATEs on one stream (ms)
+ *  — the JS `StreamUpdateGate` and, via `createNativeMirrorSink`, the native
+ *  MirrorSink's `minIntervalUs`. Tunable per controller
+ *  (`Controller.streamMinIntervalMs`); this is only the default.
+ *
+ *  Derivation (docs/spec/serial-protocol.md#rate-limits): the old 1 ms was
+ *  sized for the 2 MHz shared DAC bus (~150 µs per committed position). The
+ *  V0.1 board's two concurrent 10–20 MHz buses commit one in ~10 µs; with
+ *  ~3–5 µs of firmware COBS decode + handler per 24-byte UPDATE the MCU
+ *  sustains ~65 kHz of DAC-committed updates. 0.2 ms (5 kHz) keeps the MCU
+ *  loop ≤ ~8 % busy with updates — half of the old 1 kHz × 150 µs — and the
+ *  firmware coalesces anything faster (latest wins per loop iteration), so
+ *  the device loop stays protected; the serial governor still backs off on
+ *  USB/tty pressure. */
+export const STREAM_MIN_UPDATE_INTERVAL_MS = 0.2;
 
 // Minimum firmware/protocol version exposing the targeted MEMS-recovery reset
 // (System::Reset MEMS type). Older firmware REJects the unknown enum, so
@@ -84,9 +98,11 @@ export class StreamUpdateGate {
   private lastRight: Pos;
   private lastSentAt: number;
 
+  /** `minIntervalMs` is a number or a live getter (a controller's tunable
+   *  `streamMinIntervalMs`, read on every `accept`). */
   constructor(
     initial: { left: Pos; right: Pos },
-    private readonly minIntervalMs = STREAM_MIN_UPDATE_INTERVAL_MS,
+    private readonly minIntervalMs: number | (() => number) = STREAM_MIN_UPDATE_INTERVAL_MS,
     now = performance.now(),
   ) {
     this.lastLeft = clonePos(initial.left);
@@ -97,7 +113,9 @@ export class StreamUpdateGate {
   accept(next: { left: Pos; right: Pos }, now = performance.now()): boolean {
     if (samePos(next.left, this.lastLeft) && samePos(next.right, this.lastRight))
       return false;
-    if (now - this.lastSentAt < this.minIntervalMs) return false;
+    const minIntervalMs =
+      typeof this.minIntervalMs === "function" ? this.minIntervalMs() : this.minIntervalMs;
+    if (now - this.lastSentAt < minIntervalMs) return false;
     this.lastLeft = clonePos(next.left);
     this.lastRight = clonePos(next.right);
     this.lastSentAt = now;
@@ -107,8 +125,10 @@ export class StreamUpdateGate {
 
 /** A CMD_STREAM handle: a named,
  *  continuously-updatable mirror-position target. `update()` is fire-and-
- *  forget (seq=0, ~1kHz-safe) — it never resolves/rejects, matching the
- *  protocol's design (the firmware sends no response for it at all). */
+ *  forget (seq=0, multi-kHz-safe — see STREAM_MIN_UPDATE_INTERVAL_MS) — it
+ *  never resolves/rejects, matching the protocol's design (the firmware
+ *  sends no response for it at all), and is written immediately: it never
+ *  waits behind an awaited request. */
 export interface StreamHandle {
   readonly id: number;
   update(pos: { left: Pos; right: Pos }): void;
@@ -176,6 +196,10 @@ export class Controller {
     this.clockOffsetNs = offsetNs;
   }
   private _enabled = false;
+  /** Host-side floor between two UPDATEs on one stream (ms): the JS
+   *  `StreamUpdateGate` reads it live on every update; native sinks take it
+   *  as `minIntervalUs` at creation. Default STREAM_MIN_UPDATE_INTERVAL_MS. */
+  streamMinIntervalMs = STREAM_MIN_UPDATE_INTERVAL_MS;
   // Firmware version resolved by verifyVersion() during `ready` — retained so
   // version-gated surfaces finer than v2Capable (e.g. recoverMems, >= 2.1.0)
   // can compare minor/patch. null until `ready` resolves, or if verifyVersion
@@ -223,10 +247,17 @@ export class Controller {
       // Retain the resolved version for the finer-grained recover gate
       // (v21Capable). `?? null` tolerates a device/fake that resolves nothing.
       this.firmwareVersion = (await device.verifyVersion()) ?? null;
-      await this.disable();
-      await this.setBias(bias);
-      await this.setLPF(lpf);
-      await this.setLogLevel(log_level);
+      // Pipelined: requests are matched by seq and the firmware handles them
+      // in wire order, so the disable → bias → LPF → log-level sequence is
+      // written back-to-back (one round trip, not four). Each call writes
+      // synchronously, so the wire order is the call order (Bias is REJected
+      // while enabled — Enable(false) still lands first).
+      await Promise.all([
+        this.disable(),
+        this.setBias(bias),
+        this.setLPF(lpf),
+        this.setLogLevel(log_level),
+      ]);
     })();
   }
 
@@ -444,7 +475,7 @@ export class Controller {
       throw error;
     }
     this.streamStats.set(id, { count: 0, left: pos.left, right: pos.right });
-    const gate = new StreamUpdateGate(pos);
+    const gate = new StreamUpdateGate(pos, () => this.streamMinIntervalMs);
     let closed = false;
     return {
       id,
@@ -503,6 +534,8 @@ export class Controller {
       dv: this.dv,
       nodeId,
     });
+    // One tunable for both update paths: the native gate's emission floor.
+    sink.setGovernor?.({ minIntervalUs: Math.round(this.streamMinIntervalMs * 1000) });
     let closed = false;
     return {
       sink,
