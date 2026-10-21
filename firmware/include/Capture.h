@@ -46,4 +46,28 @@ void tick();
 // callers that also want to clear streams should call Streams::clear().
 void cancelAll(const char *reason);
 
+// ---- v2.2.0 trajectory-marker seam (CMD_TRAJECTORY) -------------------------
+// A request's ORIGIN is either a host CMD_FRAME (seq) or a trajectory marker.
+// Marker captures run through the very same trigger/strobe state machine
+// (strobe tracking, exposure-averaged positions, STROBE_MARGIN_US timeout) but
+// never re-point the DAC (the running trajectory owns it), never settle, and
+// complete through Trajectory::push() — a `SYN CMD_TRAJECTORY` TrajectoryFrame
+// (status OK / STROBE_TIMEOUT / CANCELLED) — instead of FIN/REJ on a seq.
+// spec: docs/spec/serial-protocol.md#trajectory
+struct MarkerOrigin {
+  uint8_t id;     // trajectory table id (reported as FrameResult::stream)
+  uint8_t marker; // marker index within the table
+  uint32_t cycle; // 0-based cycle the marker fired in
+};
+
+// Starts a marker capture NOW (trigger edge in this call) iff the engine is
+// idle — nothing in flight or queued. Returns false otherwise (or for an
+// unsupported mask); the caller reports TrajectoryFrame::BUSY.
+bool enqueueMarker(const MarkerOrigin &origin, uint8_t cameras,
+                   Microseconds pulse);
+
+// True if `cameras` is a non-empty mask of cameras this engine can trigger
+// AND strobe-track (Trajectory MARK validation).
+bool camerasSupported(uint8_t cameras);
+
 } // namespace Capture
