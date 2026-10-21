@@ -139,6 +139,33 @@ state is zero bytes host→MCU and one small push MCU→host per trigger.
   pos, {interpolate})` for mechanism 1.
 - Docs: `docs/spec/serial-protocol.md`, `docs/architecture/serial-protocol.md`.
 
+### MirrorLink
+
+A MirrorLink session never touches the raw `Controller`. It goes through the
+controller node (`docs/spec/controller.md#trajectory-ownership`):
+
+1. `const t = await controllerNode().openTrajectory({ samples, periodUs,
+   markers, step }, { name: "mirrorlink" })`. This needs a bound v2.2
+   controller. The node enables the mirrors if they are off and refuses a
+   second open.
+2. `controllerNode().onFin(...)` is usually already wired to the anchor node
+   (the multi-fovea pattern). Every OK marker push arrives there as a
+   `FrameOutcome` tagged `trajectory: { id, marker, cycle }`, so pairing and
+   recording run unchanged. `t.onFrame(cb)` sees every push, including
+   `STROBE_TIMEOUT` / `BUSY` / `ENDED`, for the session's own phase
+   bookkeeping.
+3. `await t.start(atHostNs, cycles)`. Pass an explicit host instant so the
+   node's lateness telemetry is exact. Position inputs the session (or
+   another) has open are held while the trajectory runs.
+4. `await t.stop()` / `await t.close()` (close also DELETEs the table). On
+   `onStateChange("detached", { controllerAvailable: true })` after a
+   reconnect, call `t.reupload()` and `start` again. That re-upload is the
+   session's decision, not automatic.
+
+Mirror history is fed from the pushes (exposure-averaged position at
+exposure time), so downstream homography/undistort consumers keep working
+while the MCU owns the DAC.
+
 ### Serial link throughput
 
 - Teensy 4.0 USB CDC is a 480 Mbit/s high-speed link; the 115200 "baud" is

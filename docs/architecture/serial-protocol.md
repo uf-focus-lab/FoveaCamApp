@@ -99,6 +99,23 @@ mirror-history (the single trusted-time writer). Prediction accuracy (vs a
 sampled readback) and FW5 coexistence with CMD_FRAME require verification on
 the full hardware rig.
 
+Sessions reach the v2.2.0 surfaces through the same node, never through the
+raw `Controller`, so enable/disable, reconnect, teardown, mirror history and
+FIN routing stay in one owner. A position input's `updateAt(hostNs, pos, {
+interpolate })` sends a CMD_SCHEDULE keyframe on its stream (falling back to
+`update()` on older firmware or before the stream exists) and records the
+pose in mirror history at the scheduled instant; an immediate `update()`
+supersedes pending keyframes there just as the firmware clears its ring.
+`node.openTrajectory(spec, { name })` uploads THE trajectory (one at a time,
+shown as a named `controller/trajectory` input in the graph) and returns
+`{ start, stop, close, onFrame, onStateChange, reupload, state }`: while it
+runs, position-input pushes are held host-side and re-asserted when the run
+ends; its OK pushes go to the registered FIN sinks (the anchor node — tagged
+`FrameOutcome.trajectory`) and into mirror history at the exposure time;
+a controller unbind leaves it `detached` until the session reuploads or
+closes it. Contract: `docs/spec/controller.md#scheduled-inputs` and
+`#trajectory-ownership`.
+
 ## 5. Hardware triggering
 
 All three cameras are hardware-triggerable on the V0.1 controller board

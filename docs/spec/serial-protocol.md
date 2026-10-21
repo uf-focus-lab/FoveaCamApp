@@ -326,7 +326,9 @@ enabled`, `Unknown stream id`, `Schedule full (32 pending keyframes per stream)`
 Host: `StreamHandle.scheduleAt(hostNs, pos, { interpolate })`
 (`app/orchestrator/controller.ts`) converts host-steady ns to MCU µs through the
 calibrated clock offset (`(hostNs - clockOffsetNs) / 1000`, rounded) and sends
-fire-and-forget; gated on firmware `>= 2.2.0` (`v22Capable`).
+fire-and-forget; gated on firmware `>= 2.2.0` (`v22Capable`). Sessions use it
+through a controller-node position input's `updateAt` (mirror history,
+supersede rule: `docs/spec/controller.md#scheduled-inputs`).
 
 ## uploaded trajectories — CMD_TRAJECTORY {#trajectory}
 
@@ -419,4 +421,6 @@ Host: `Controller.uploadTrajectory({ samples, periodUs, markers, step })` →
 `{ id, start(atHostNs?, cycles?), stop(), dispose(), onFrame(cb) }`
 (`app/orchestrator/controller.ts`), gated on `>= 2.2.0`. Core delivers the pushes
 through `Device.onPush(Protocol.Command.TrajectoryFrame, cb)` — the generic
-non-LOG SYN dispatch in `core/src/Controller.cpp`.
+non-LOG SYN dispatch in `core/src/Controller.cpp`. Sessions use it through
+`controllerNode().openTrajectory` (one at a time, input holding, FIN routing,
+detach on reconnect: `docs/spec/controller.md#trajectory-ownership`).
