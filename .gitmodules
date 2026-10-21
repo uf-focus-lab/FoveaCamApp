@@ -1,0 +1,4 @@
+[submodule "pcb"]
+	path = pcb
+	url = https://github.com/uf-focus-lab/DuoController.git
+	branch = master
