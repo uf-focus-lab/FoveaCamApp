@@ -10,6 +10,7 @@
 #include <vector>
 
 #include <Buffer/Buffer.h>
+#include <type_name.h> // type_name<Payload>() in FixedSizePacket::inflate
 
 namespace Protocol {
 
