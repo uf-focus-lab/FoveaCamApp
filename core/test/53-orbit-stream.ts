@@ -20,7 +20,7 @@
 //   5. TEARDOWN — `release()` returns promptly both while idle and while a
 //      live port link into the controller's native `pos_in` pins the brick.
 //
-// Run UNSANDBOXED: node core/test/51-orbit-stream.ts
+// Run UNSANDBOXED: node core/test/53-orbit-stream.ts
 
 import assert from "node:assert/strict";
 import { Aravis, Controller, cleanup } from "core";
@@ -236,7 +236,7 @@ const wrapPi = (a: number): number => {
   );
   await Promise.race([drain, sleep(1000)]);
   console.log(
-    `51-orbit-stream: pace ${rateHz.toFixed(0)} Hz (paceHz 500 → ${slowHz.toFixed(0)} Hz), ` +
+    `53-orbit-stream: pace ${rateHz.toFixed(0)} Hz (paceHz 500 → ${slowHz.toFixed(0)} Hz), ` +
       `radius RMS ${(rmsL * 100).toFixed(3)}/` +
       `${(rmsR * 100).toFixed(3)} %, phase step ${step.toFixed(3)} rad, tail ${tailHz.toFixed(2)} Hz, ` +
       `idle release ${idleReleaseMs.toFixed(0)} ms.`,
@@ -268,9 +268,9 @@ const wrapPi = (a: number): number => {
   sink.release();
   dev.release();
   console.log(
-    `51-orbit-stream: piped release ${pipedReleaseMs.toFixed(0)} ms, no crash.`,
+    `53-orbit-stream: piped release ${pipedReleaseMs.toFixed(0)} ms, no crash.`,
   );
 }
 
 cleanup();
-console.log("51-orbit-stream: all checks passed.");
+console.log("53-orbit-stream: all checks passed.");

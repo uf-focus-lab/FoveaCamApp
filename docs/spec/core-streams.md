@@ -156,4 +156,4 @@ v = slew(center) + J · amp · (cos φ, sin φ)
 - **Teardown.** `release()` → `close()`: idempotent, wakes the pacer and JOINS the thread
   BEFORE the stream ejects its subscribers ([eject-and-drain](#eject-and-drain)), which
   also runs from the CoreObject `destruct` hook so a live port link pinning the brick
-  cannot leave the thread running. Guarded by `core/test/51-orbit-stream.ts`.
+  cannot leave the thread running. Guarded by `core/test/53-orbit-stream.ts`.
