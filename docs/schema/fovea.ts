@@ -62,7 +62,7 @@ export const DESCRIPTOR_SCHEMA_DATA = JSON.stringify({
     "observation's exposures (pairing-nodes ruling 1 — free-run recordings " +
     "always carry left:null, right:null); `center` is the NEAREST recorded " +
     "wide frame by timestamp and is explicitly UNSYNCHRONIZED (the wide " +
-    "camera is not hardware-triggerable — CAM0 GPIO uncabled). `bbox` is in " +
+    "camera free-runs in multi-fovea by choice). `bbox` is in " +
     "wide (undistorted) pixel coordinates from the tracker batch. One " +
     "channel per live target; the fovea imagery is reconstructed offline " +
     "from the pointed-at raw frames + per-frame params.",

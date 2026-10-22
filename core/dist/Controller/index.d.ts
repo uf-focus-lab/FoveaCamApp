@@ -50,8 +50,8 @@ declare module "core/Controller" {
   export type FrameArg = {
     stream: number;
     // Bitmask (CameraName[] or a raw number); omitted/undefined means
-    // the firmware default (CAM_L | CAM_R). "C" is REJected until the
-    // center camera has a strobe cable.
+    // the firmware default (CAM_L | CAM_R). "C" (center) is triggerable on
+    // the V0.1 controller board — request it explicitly.
     cameras?: CameraName[] | number;
     pulse?: number; // trigger pulse width, in microseconds
     // v2.0 trigger settle HOLD (µs) — held only when this request SWITCHES the
@@ -66,8 +66,8 @@ declare module "core/Controller" {
   };
   /** CMD_FRAME ACK payload: position in the per-stream FIFO (0 = next). */
   export type FrameAccepted = { queue_position: number };
-  /** CMD_FRAME FIN payload, latched at exposure start (strobe rising
-   *  edge). Timestamps are MCU microseconds, as `bigint` (uint64,
+  /** CMD_FRAME FIN payload, latched at exposure start (strobe line
+   *  asserted — rising edge of the non-isolated ExposureActive line). Timestamps are MCU microseconds, as `bigint` (uint64,
    *  matching firmware's Global::time). */
   export type FrameResult = {
     stream: number;
@@ -82,6 +82,123 @@ declare module "core/Controller" {
      *  start-only latched value. */
     left: AnalogChannels;
     right: AnalogChannels;
+  };
+
+  // ---- v2.2.0: CMD_SCHEDULE / CMD_TRAJECTORY --------------------------------
+  // All times are MCU-clock MICROSECONDS (the SYS_TIMESTAMP / FrameResult
+  // domain). uint64 fields are `bigint` — a `number` would be truncated to 32
+  // bits by the native encoder.
+
+  /** CMD_SCHEDULE SET: one timestamped keyframe on an EXISTING stream. The
+   *  stream target becomes left/right once the MCU clock reaches `t_apply`;
+   *  with `interpolate` it ramps linearly from the previous keyframe. Late
+   *  keyframes apply at once; ones older than the last applied are dropped.
+   *  CMD_STREAM UPDATE clears the schedule. Single-phase (ACK echoes). */
+  export type ScheduleArg = {
+    stream: number;
+    t_apply: bigint;
+    interpolate?: boolean;
+    /** Raw flag bits (OR-ed with `interpolate`); 1 = INTERPOLATE. */
+    flags?: number;
+    left: AnalogChannels;
+    right: AnalogChannels;
+  };
+  export type ScheduleDecoded = {
+    stream: number;
+    flags: number;
+    interpolate: boolean;
+    t_apply: bigint;
+    left: AnalogChannels;
+    right: AnalogChannels;
+  };
+
+  export type TrajectoryOp =
+    | "BEGIN"
+    | "DATA"
+    | "MARK"
+    | "COMMIT"
+    | "START"
+    | "STOP"
+    | "DELETE";
+  /** One table sample: the target `t_offset` µs into the period. */
+  export type TrajectorySampleArg = {
+    t_offset: number;
+    left: AnalogChannels;
+    right: AnalogChannels;
+  };
+  /** CMD_TRAJECTORY SET (op-tagged, variable size). Every op is single-phase
+   *  (ACK/REJ); the ACK echoes the op's fixed header (DATA: no samples). */
+  export type TrajectoryArg =
+    | {
+        op: "BEGIN";
+        id: number; // 0..3
+        sample_count: number; // >= 1, <= 4096 across all tables
+        period: number; // µs, > 0
+        /** Step/hold between samples instead of linear interpolation. */
+        step?: boolean;
+        flags?: number;
+      }
+    | {
+        op: "DATA";
+        id: number;
+        first_index: number;
+        /** 1..12 samples (one COBS frame) — chunk larger tables. */
+        samples: TrajectorySampleArg[];
+      }
+    | {
+        op: "MARK";
+        id: number;
+        marker: number; // 0..7
+        t_offset?: number; // µs into the period, < period
+        /** Omitted/empty = CLEAR this marker (unlike Frame's default). */
+        cameras?: CameraName[] | number;
+        pulse?: number; // trigger pulse width µs, > 0
+      }
+    | {
+        op: "START";
+        id: number;
+        /** MCU µs of phase 0, cycle 0. Omitted/0n = now. */
+        t_start?: bigint;
+        /** Cycles to run; omitted/0 = forever. */
+        cycles?: number;
+      }
+    | { op: "COMMIT" | "STOP" | "DELETE"; id: number };
+  export type TrajectoryDecoded = {
+    op: TrajectoryOp;
+    id: number;
+    sample_count?: number;
+    period?: number;
+    flags?: number;
+    step?: boolean;
+    first_index?: number;
+    count?: number;
+    samples?: TrajectorySampleArg[];
+    marker?: number;
+    t_offset?: number;
+    cameras?: CameraName[];
+    pulse?: number;
+    t_start?: bigint;
+    cycles?: number;
+  };
+  export type TrajectoryStatus =
+    | "OK"
+    | "STROBE_TIMEOUT"
+    | "BUSY"
+    | "CANCELLED"
+    | "ENDED"
+    | "UNKNOWN";
+  /** SYN CMD_TRAJECTORY push (`Device.onPush(Protocol.Command.
+   *  TrajectoryFrame, cb)`): one per marker firing, plus a run-level push
+   *  (`marker: null`) with status ENDED (finite run done; cycle = cycles) or
+   *  CANCELLED (system disabled). `result` is only meaningful for status OK
+   *  (`result.stream` = trajectory id, `frame_id` shared with CMD_FRAME);
+   *  BUSY carries the missed marker's scheduled time in `result.t_trigger`. */
+  export type TrajectoryFrame = {
+    id: number;
+    marker: number | null;
+    cycle: number;
+    status: TrajectoryStatus;
+    result: FrameResult;
   };
 
   /**
@@ -133,6 +250,13 @@ declare module "core/Controller" {
       readonly Frame: PacketFactory<FrameArg, FrameDecoded>;
       readonly FrameAccepted: PacketFactory<FrameAccepted>;
       readonly FrameResult: PacketFactory<FrameResult>;
+      /** v2.2.0 timestamped keyframe (CMD_SCHEDULE). */
+      readonly Schedule: PacketFactory<ScheduleArg, ScheduleDecoded>;
+      /** v2.2.0 uploaded trajectory ops (CMD_TRAJECTORY SET). */
+      readonly Trajectory: PacketFactory<TrajectoryArg, TrajectoryDecoded>;
+      /** v2.2.0 SYN CMD_TRAJECTORY push decoder (buffer only) — pass to
+       *  `Device.onPush`. */
+      readonly TrajectoryFrame: PacketFactory<never, TrajectoryFrame>;
     };
   };
 
@@ -159,6 +283,14 @@ declare module "core/Controller" {
        *  overflow event. Short writes are framing-safe (the remainder is
        *  tailed and completes before any new frame starts). */
       txSoftFail: number;
+      /** Requests awaiting their ACK/FIN right now. Requests are PIPELINED:
+       *  any number may be in flight, matched to responses by seq (docs/spec/
+       *  serial-protocol.md#pipelining). */
+      inFlight: number;
+      /** ACK-backed request bytes queued in the write seam behind a full
+       *  kernel tty queue (drained by the rx thread on POLLOUT) — a burst
+       *  past the kernel buffer queues instead of throwing. */
+      txQueuedBytes: number;
       /** ACK round-trip rolling stats over the trailing window, from the
        *  existing two-phase request timing (+ the ~2 Hz probe ping).
        *  `baselineP50` = the connect-time baseline the governor's inflation
@@ -185,6 +317,16 @@ declare module "core/Controller" {
       arg: FrameArg | BufferLike,
     ): TwoPhase<FrameResult, FrameAccepted>;
 
+    // v2.2.0 single-phase SETs whose decoded shape differs from the argument.
+    set(
+      fn: typeof Protocol.Command.Schedule,
+      arg: ScheduleArg | BufferLike,
+    ): Promise<PacketInstance<ScheduleDecoded>>;
+    set(
+      fn: typeof Protocol.Command.Trajectory,
+      arg: TrajectoryArg | BufferLike,
+    ): Promise<PacketInstance<TrajectoryDecoded>>;
+
     // Single-phase (default): resolves on ACK alone, no `.accepted` —
     // exactly today's (pre-v2) behavior.
     get<T>(fn: PacketFactory<T>): Promise<PacketInstance<T>>;
@@ -197,10 +339,28 @@ declare module "core/Controller" {
      * Sequence == 0 fire-and-forget: the firmware performs the SET but sends
      * no ACK/FIN/REJ at
      * all — no promise, no pending-map entry. Intended for high-rate
-     * stream position updates (CMD_STREAM UPDATE, ~1kHz); throws
-     * synchronously on a transport/encode failure.
+     * stream position updates (CMD_STREAM UPDATE, multi-kHz); written at
+     * once, never behind an unanswered request. Latest-wins under
+     * backpressure: a frame that cannot start on a full kernel queue is
+     * dropped (counted in txSoftFail) and throws synchronously, like any
+     * transport/encode failure.
      */
+    fireAndForget(
+      fn: typeof Protocol.Command.Schedule,
+      arg: ScheduleArg | BufferLike,
+    ): void;
     fireAndForget<T>(fn: PacketFactory<T>, arg: T | BufferLike): void;
+
+    /**
+     * v2.2.0: subscribe to the MCU's unsolicited SYN pushes for `fn`'s
+     * property — each push payload is decoded with `fn` and handed to `cb`
+     * on the JS thread. One callback per property (a later call replaces
+     * it); `null` unsubscribes. LOG pushes stay native (not subscribable).
+     */
+    onPush(
+      fn: typeof Protocol.Command.TrajectoryFrame,
+      cb: ((frame: PacketInstance<never, TrajectoryFrame>) => void) | null,
+    ): void;
 
     /** TEST-ONLY (core/test/46): deterministic pressure scripting — force
      *  the outq gauge (`outq`, <0 restores the real ioctl), inject synthetic
@@ -255,12 +415,13 @@ declare module "core/Controller" {
    * The controller's NATIVE position in-port: accepts FINAL volts off a port
    * link's delivery
    * thread and natively replicates the JS StreamHandle.update path — the
-   * stream-update GATE (1 ms min interval + dedupe), the channels() volt→DAC
+   * stream-update GATE (min interval — `minIntervalUs`, default 200 µs — +
+   * dedupe), the channels() volt→DAC
    * conversion, and the CMD_STREAM UPDATE fire-and-forget write through the
    * device's shared write seam (one mutex — never interleaves with NAPI
    * writes; the seam closes BEFORE the fd on device release, so post-
    * disconnect writes are counted no-ops). Each accepted write records into
-   * a fixed 4096-sample native history ring (the mirror-history authority
+   * a fixed 16384-sample native history ring (the mirror-history authority
    * for NATIVELY-driven inputs). Stream lifecycle stays JS: create/TERMINATE
    * ride `Controller.createStream` (quiesce ownership unchanged).
    */
@@ -274,7 +435,7 @@ declare module "core/Controller" {
       throttled: number;
       errors: number;
       /** Fairness-reserve deferrals (coalesced UPDATEs behind a pending
-       *  two-phase request). */
+       *  request) — only when opted in (`fairnessMs > 0`; default off). */
       deferred: number;
       /** Governor multiplicative decreases. */
       backoffs: number;
@@ -283,6 +444,8 @@ declare module "core/Controller" {
       /** The governed emission rate (0 when the governor is off). */
       effectiveRateHz: number;
       ceilingHz: number;
+      /** The emission floor (µs) — no two UPDATEs closer than this. */
+      minIntervalUs: number;
       governorState: "off" | "steady" | "seeking" | "backoff";
       /** ACK-RTT view — the session's serial-latency estimate reads
        *  p50 here at its stats throttle. */
@@ -291,8 +454,12 @@ declare module "core/Controller" {
       ackRttCount: number;
     };
     /** Live-retune the AIMD governor (partial update; named errors on bad
-     *  ranges). `enabled: false` pins the fixed 1 ms gate exactly.
-     *  The session sets `ceilingHz` = the global prediction_rate_hz. */
+     *  ranges). `enabled: false` pins the fixed `minIntervalUs` gate exactly.
+     *  The session sets `ceilingHz` = the global prediction_rate_hz.
+     *  Defaults (docs/spec/serial-protocol.md#rate-limits): ceilingHz 5000,
+     *  floorHz 60, stepHz 125, evalMs 100, outqLow 256, outqHigh 1024,
+     *  rttInflation 2, fairnessMs 0 (reserve OFF), maxDeferMs 100,
+     *  minIntervalUs 200. */
     setGovernor(params: {
       enabled?: boolean;
       ceilingHz?: number;
@@ -302,8 +469,11 @@ declare module "core/Controller" {
       outqLow?: number;
       outqHigh?: number;
       rttInflation?: number;
+      /** Defer UPDATEs behind a request pending this long; 0 = off. */
       fairnessMs?: number;
       maxDeferMs?: number;
+      /** Emission floor in µs (0..1e6). */
+      minIntervalUs?: number;
     }): void;
     historyLatest(): MirrorHistorySample | null;
     historyAt(tNs: bigint): MirrorHistoryAt | null;

@@ -39,13 +39,11 @@ uint16_t bias_voltage = 0;
 char log_buffer[COBS::MaxPacketSize];
 
 void crash(std::string err) {
+  // Unrecoverable: park the drivers (enable LOW) and repeat the message. No
+  // LED blink — pin 13 is a camera line on the V0.1 board (Board.h).
+  Board::enable.write(Board::DISABLE);
   while (true) {
     Serial.println(err.c_str());
-    for (unsigned i = 0; i < 5; i++) {
-      delay(100);
-      Board::led.write(Board::LED_ON);
-      delay(100);
-      Board::led.write(Board::LED_OFF);
-    }
+    delay(1000);
   }
 }

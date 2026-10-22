@@ -69,7 +69,7 @@ fail with no hardware attached, so the runner excludes them from `all`.
 
 ### Hardware-free — run anywhere with a built addon
 
-Everything else (00, 06–48). Three families, all self-contained:
+Everything else (00, 06–52). Three families, all self-contained:
 
 - **Fake-camera pipe/brick tests** — inject synthetic frames through the native
   `enableFakeCamera`/test-source hooks, then exercise the convert / undistort /
@@ -82,4 +82,7 @@ Everything else (00, 06–48). Three families, all self-contained:
   `48`).
 - **PTY-serial controller tests** — open a pseudo-terminal `Device` (a scripted
   serial peer, **not** real hardware) to test the compose/sink chain, the serial
-  rate governor, and the firmware simulation (`45`, `46`, `47`).
+  rate governor, and request pipelining (`45`, `46`, `52`); `47`, `49`, `50`
+  and `51` drive the firmware simulator (`test/build/fovea-fw-sim`, built with
+  `cd test && make build`) for the enable sequence, DAC recovery, strobe
+  polarity, and the v2.2 schedule/trajectory surfaces.

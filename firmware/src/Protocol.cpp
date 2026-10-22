@@ -14,6 +14,7 @@
 #include "Global.h"
 #include "MEMS.h"
 #include "Streams.h"
+#include "Trajectory.h"
 #include "convert.h"
 
 void Protocol::send(Protocol::RawPacket &packet) {
@@ -107,6 +108,11 @@ static void cancelPendingTrigger(const char *reason) {
   if (!trigger.pending)
     return;
   trigger.clear();
+  // The pulse was asserted on every camera's Line2 by the handler; a cancel
+  // (System::Disable) must release them too or a trigger line stays HIGH
+  // until the next legacy Trigger FINs.
+  for (auto &cam : Board::camera)
+    cam.trigger.write(LOW);
   Packet::Command::Trigger::reject(trigger.seq, reason);
 }
 
@@ -185,12 +191,15 @@ HANDLE_GET(System::Enable) {
 
 HANDLE_SET(System::Enable) {
   if (payload.enable && !Global::system_enabled) {
-    // Enable system
+    // Enable system. Order per Mirrorcle guide p27 (Board.h, specs.md §6):
+    // DAC init + V_BIAS on all channels, FCLK running, THEN the driver
+    // enable — the HV stage must never come up on an uninitialised DAC or a
+    // stopped filter clock.
     VERB("Enabling system");
+    MEMS::enable(); // RESET, INT_REF, DAC_POWER, LDAC, V_BIAS (both mirrors)
+    Board::fclk.tone();
+    delay(1); // let the filter clock run before the drivers see it
     Board::enable.write(Board::ENABLE);
-    delay(1);
-    MEMS::enable();
-    Board::low_pass_filter.tone();
     Global::system_enabled = true;
     // v1.1: enable does NOT reset Global::time (only System::Timestamp SET does).
     // spec: docs/spec/serial-protocol.md#clock
@@ -202,10 +211,12 @@ HANDLE_SET(System::Enable) {
     Streams::clear();
     cancelPendingActuate("System disabled");
     cancelPendingTrigger("System disabled");
-    MEMS::disable();
-    delay(1);
+    // Power down in reverse of enable (guide p31): driver enable LOW first,
+    // then park the DAC at V_BIAS, then stop FCLK.
     Board::enable.write(Board::DISABLE);
-    Board::low_pass_filter.noTone();
+    delay(1);
+    MEMS::disable();
+    Board::fclk.noTone();
     Global::system_enabled = false;
   } else {
     VERB("System enable state unchanged");
@@ -253,7 +264,7 @@ HANDLE_GET(Config::LPF) {
 HANDLE_SET(Config::LPF) {
   VERB("Setting LPF frequency to %u Hz", payload.frequency);
   Global::lpf_frequency = payload.frequency;
-  Board::low_pass_filter.freq(Global::lpf_frequency);
+  Board::fclk.freq(Global::lpf_frequency);
   GET(seq);
 }
 
@@ -297,6 +308,9 @@ HANDLE_SET(Command::Trigger) {
     reject(seq, "A trigger request is already pending");
     return;
   }
+  // Legacy all-camera pulse: asserts every camera's `trigger` (Line2 on the
+  // V0.1 board — C, L and R are all cabled). Never touches `strobe` (Line3 =
+  // VAUX) or the opto pair; those Pins are inputs and cannot be written.
   for (auto &cam : Board::camera)
     cam.trigger.write(HIGH);
   trigger.start(seq, payload, Global::time.now() + payload.duration);
@@ -308,6 +322,12 @@ HANDLE_SET(Command::Trigger) {
 HANDLE_SET(Command::MirrorStream) {
   if (!Global::system_enabled) {
     reject(seq, "Cannot perform action: system is not enabled");
+    return;
+  }
+  // v2.2.0: a running trajectory owns the DAC — stream targets are refused.
+  // spec: docs/spec/serial-protocol.md#trajectory
+  if (payload.op == Payload::UPDATE && Trajectory::running()) {
+    reject(seq, "A trajectory owns the DAC (STOP it first)");
     return;
   }
   bool ok;
@@ -360,6 +380,119 @@ HANDLE_GET_PAYLOAD(Command::Frame) {
   send(packet);
 }
 
+// ---- v2.2.0 CMD_SCHEDULE: timestamped keyframes --------------------------------
+// spec: docs/spec/serial-protocol.md#schedule
+HANDLE_SET(Command::Schedule) {
+  if (!Global::system_enabled) {
+    reject(seq, "Cannot perform action: system is not enabled");
+    return;
+  }
+  if (Trajectory::running()) {
+    reject(seq, "A trajectory owns the DAC (STOP it first)");
+    return;
+  }
+  switch (Streams::schedule(payload.stream, payload.t_apply, payload.flags,
+                            payload.left, payload.right)) {
+  case Streams::ScheduleResult::OK:
+    break;
+  case Streams::ScheduleResult::UNKNOWN_STREAM:
+    reject(seq, "Unknown stream id");
+    return;
+  case Streams::ScheduleResult::FULL:
+    reject(seq, "Schedule full (32 pending keyframes per stream)");
+    return;
+  case Streams::ScheduleResult::STALE:
+    reject(seq, "Keyframe older than the last applied one (dropped)");
+    return;
+  }
+  auto packet = Create::ACK(seq);
+  deflate(payload, packet);
+  send(packet);
+}
+
+// ---- v2.2.0 CMD_TRAJECTORY: uploaded periodic trajectories --------------------
+// spec: docs/spec/serial-protocol.md#trajectory
+// Not a FixedSizePacket (op-tagged, variable size), so no HANDLE_SET macro.
+// Inside this member `Trajectory` names the packet class; the firmware engine
+// is `::Trajectory`, the packet namespace `::Packet`.
+void Packet::Command::Trajectory::SET(const Protocol::Sequence &seq,
+                                      Inflated payload) {
+  const uint8_t op = payload.op();
+  const size_t header = headerSize(op);
+  if (header == 0) {
+    reject(seq, "Unknown trajectory operation");
+    return;
+  }
+  if (payload.size < header) {
+    reject(seq, "Trajectory packet too short for its operation");
+    return;
+  }
+  using namespace ::Packet::Command;
+  const char *reason = nullptr;
+  switch (op) {
+  case BEGIN: {
+    if (payload.size != header) {
+      reject(seq, "Bad BEGIN length");
+      return;
+    }
+    const auto p = payload.as<TrajectoryBegin>();
+    reason = ::Trajectory::begin(p.id, p.sample_count, p.period, p.flags);
+    break;
+  }
+  case DATA: {
+    const auto p = payload.as<TrajectoryData>();
+    if (payload.size != header + size_t(p.count) * sizeof(TrajectorySample)) {
+      reject(seq, "Bad DATA length (header + count x 20-byte samples)");
+      return;
+    }
+    reason = ::Trajectory::data(p.id, p.first_index, p.count,
+                                payload.data + header);
+    break;
+  }
+  case MARK: {
+    if (payload.size != header) {
+      reject(seq, "Bad MARK length");
+      return;
+    }
+    const auto p = payload.as<TrajectoryMark>();
+    reason = ::Trajectory::mark(p.id, p.marker, p.t_offset, p.cameras, p.pulse);
+    break;
+  }
+  case START: {
+    if (payload.size != header) {
+      reject(seq, "Bad START length");
+      return;
+    }
+    if (!Global::system_enabled) {
+      reject(seq, "Cannot perform action: system is not enabled");
+      return;
+    }
+    const auto p = payload.as<TrajectoryStart>();
+    reason = ::Trajectory::start(p.id, p.t_start, p.cycles);
+    break;
+  }
+  default: { // COMMIT / STOP / DELETE
+    if (payload.size != header) {
+      reject(seq, "Bad trajectory packet length");
+      return;
+    }
+    const uint8_t id = payload.id();
+    reason = op == COMMIT ? ::Trajectory::commit(id)
+             : op == STOP ? ::Trajectory::stop(id)
+                          : ::Trajectory::remove(id);
+    break;
+  }
+  }
+  if (reason) {
+    reject(seq, reason);
+    return;
+  }
+  // ACK echoes the op's fixed header (DATA: without its samples).
+  auto packet = Create::ACK(seq);
+  packet.setData(payload.data, header);
+  send(packet);
+}
+
 // Advances the non-blocking Actuate/Trigger completion timers; called from
 // loop() alongside Streams::tick() and Capture::tick(). Defined with the
 // `Protocol::` qualifier, so this function is itself a member of namespace
@@ -378,7 +511,7 @@ void Protocol::tick() {
   now = Global::time.now();
   if (trigger.ready(now)) {
     trigger.clear();
-    for (auto &cam : Board::camera)
+    for (auto &cam : Board::camera) // release every Line2 trigger (C, L, R)
       cam.trigger.write(LOW);
     trigger.result.timestamp = now;
     auto packet = ::Packet::Command::Trigger::Create::FIN(trigger.seq);

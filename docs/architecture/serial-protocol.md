@@ -36,9 +36,13 @@ wedge into a ≤1 s glitch.
 
 - **CMD_STREAM** — a named, continuously-updatable mirror-position target
   (64 slots, `Streams::CAPACITY`). CREATE/TERMINATE are ACK-backed;
-  **UPDATE is fire-and-forget** (seq=0, no response, ~kHz-safe). Host-side
-  `StreamHandle.update()` suppresses identical targets and enforces a 1 ms
-  min interval.
+  **UPDATE is fire-and-forget** (seq=0, no response, multi-kHz-safe).
+  Host-side `StreamHandle.update()` suppresses identical targets and enforces
+  a min interval (default 0.2 ms, the live `Controller.streamMinIntervalMs`;
+  the native sink's `minIntervalUs`) — derivation in
+  `docs/spec/serial-protocol.md#rate-limits`. Requests are pipelined (many in
+  flight, matched by seq; nothing waits for a previous ACK —
+  `docs/spec/serial-protocol.md#pipelining`).
 - **CMD_FRAME** — a triggered capture request on a stream. Two-phase:
   `.accepted` resolves on ACK (queue position; rejects on REJ), the request
   itself resolves on **FIN** carrying `frame_id`, MCU trigger/exposure
@@ -49,6 +53,31 @@ wedge into a ≤1 s glitch.
   active stream — `Streams::snapshot()` would report the stream target
   rather than the DAC's actual state. A control loop owns its stream
   exclusively while running.
+- **CMD_SCHEDULE (protocol v2.2.0)** — timestamped keyframes on an existing
+  stream: `StreamHandle.scheduleAt(hostNs, pos, { interpolate })` converts the
+  host-steady instant to the MCU clock through the controller's calibrated
+  offset (the inverse of the FIN decode) and sends it fire-and-forget. The
+  firmware applies each keyframe at its MCU time from a 32-deep per-stream ring,
+  optionally ramping linearly between keyframes at DAC write rate, so serial
+  jitter no longer lands in the motion. `update()` still means "now, latest
+  wins" and clears pending keyframes. Spec: `docs/spec/serial-protocol.md#schedule`.
+- **CMD_TRAJECTORY (protocol v2.2.0) — MirrorLink.** For a periodic motion
+  with captures at fixed phases, even timestamped streaming wastes the link:
+  every sample crosses the wire, and each frame needs its own CMD_FRAME round
+  trip whose trigger instant still depends on host scheduling.
+  `Controller.uploadTrajectory({ samples, periodUs, markers })` uploads the
+  table once (ACK-backed, 12-sample DATA chunks pipelined) and the MCU plays it
+  back on its own clock: the DAC follows the table at phase `(t − t_start) mod
+  period` and each marker fires the cameras through the same capture engine as
+  CMD_FRAME (strobe tracking, exposure-averaged positions, timeout) when the
+  phase crosses it. Results come back as pushes (`SYN CMD_TRAJECTORY` →
+  `Device.onPush` → `handle.onFrame`, decoded like `FrameOutcome`), so the
+  steady state is zero bytes host→MCU and one small push per trigger. A running
+  trajectory owns the DAC (stream UPDATE / SCHEDULE are refused); `stop()`
+  holds the last position until the next stream write. Spec:
+  `docs/spec/serial-protocol.md#trajectory`.
+- Both v2.2.0 surfaces are gated on firmware `>= 2.2.0`
+  (`Controller.v22Capable`); older firmware REJects the unknown properties.
 
 ## 4. The actuation path (controller node, push model)
 
@@ -70,12 +99,56 @@ mirror-history (the single trusted-time writer). Prediction accuracy (vs a
 sampled readback) and FW5 coexistence with CMD_FRAME require verification on
 the full hardware rig.
 
+Sessions reach the v2.2.0 surfaces through the same node, never through the
+raw `Controller`, so enable/disable, reconnect, teardown, mirror history and
+FIN routing stay in one owner. A position input's `updateAt(hostNs, pos, {
+interpolate })` sends a CMD_SCHEDULE keyframe on its stream (falling back to
+`update()` on older firmware or before the stream exists) and records the
+pose in mirror history at the scheduled instant; an immediate `update()`
+supersedes pending keyframes there just as the firmware clears its ring.
+`node.openTrajectory(spec, { name })` uploads THE trajectory (one at a time,
+shown as a named `controller/trajectory` input in the graph) and returns
+`{ start, stop, close, onFrame, onStateChange, reupload, state }`: while it
+runs, position-input pushes are held host-side and re-asserted when the run
+ends; its OK pushes go to the registered FIN sinks (the anchor node — tagged
+`FrameOutcome.trajectory`) and into mirror history at the exposure time;
+a controller unbind leaves it `detached` until the session reuploads or
+closes it. Contract: `docs/spec/controller.md#scheduled-inputs` and
+`#trajectory-ownership`.
+
 ## 5. Hardware triggering
 
-Only the L/R cameras are hardware-triggerable on the current rig — the
-center camera's GPIO port is reserved on the board but uncabled
-(camera-side connector size; recoverable with a slimmer cable —
-`docs/hardware/rig.md`).
+All three cameras are hardware-triggerable on the V0.1 controller board
+(`docs/hardware/rig.md` §Cameras): each camera's GPIO cable lands on a
+`J_CAMn` socket, the MCU drives the trigger on camera **Line3** (the BFS's
+input-only non-isolated line) and reads the ExposureActive strobe back on
+camera **Line2** (open-drain output, so active LOW against the Teensy
+pull-up, `Board::STROBE_ACTIVE_LEVEL`). The opto pair (Line0/Line1) stays cabled as
+a bench fallback only.
+
+- **Camera mask.** `CMD_FRAME`'s `cameras` bitmask follows the
+  `firmware/include/Board.h` `camera[]` order: `CAM_C` = 1, `CAM_L` = 2,
+  `CAM_R` = 4. `CAM_C` is a valid bit. The host always sends an explicit
+  mask, because an absent mask is NAPI-encoded as 0 rather than the
+  firmware default. The trigger-sync and multi-fovea sessions send
+  `["L", "R"]` (for trigger-sync, the `PAIR_CAMERAS` default of
+  `frameRequestFromBudget`). Adding
+  C is the calling session's choice: it also has to put C into trigger
+  mode and budget the pulse on C's exposure. `CMD_TRIGGER` (the bare pulse
+  the Manage Cameras trigger test uses) pulses every camera's trigger line.
+- **Camera side.** The MCU only pulses lines. Each triggered camera has to
+  be switched into FrameStart-triggered mode with its strobe output
+  programmed, through `enableHardwareTrigger`
+  (`app/orchestrator/camera-trigger.ts`): `TriggerSource=Line3`;
+  `LineSelector=Line2`, `LineMode=Output`, `LineSource=ExposureActive`,
+  `LineInverter=false`.
+  `disableHardwareTrigger` returns it to free-run and leaves the line
+  config in place. Never put a camera in the mask before its trigger is
+  enabled. A camera that is not in trigger mode does not expose on the
+  pulse. Its strobe then follows free-run exposures (the Line2 config is
+  still in place), or stays released: an unprogrammed Line2 does not pull
+  the line, so the Teensy pull-up holds it HIGH and the request times out.
+  Either way, the FIN does not describe a triggered exposure.
 
 Wire-level framing — packet layout, seq/ACK/REJ/FIN encoding, CRC — lives in
 `core/src/Controller.cpp` and `firmware/include/`.

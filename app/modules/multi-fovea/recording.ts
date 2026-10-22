@@ -207,7 +207,8 @@ export function createMultiFoveaRecording(
     right: new Map(),
   };
   /** Recent recorded CENTER frames (insertion = time order) for the nearest-
-   *  by-timestamp pointer (explicitly unsynchronized — CAM0 GPIO uncabled). */
+   *  by-timestamp pointer (explicitly unsynchronized — C free-runs: it is not in
+   *  this session's trigger mask, though the V0.1 board cables CAM0). */
   const centerFrames: Array<{ tNs: bigint; seq: number }> = [];
   /** Latest pair per controller stream id → the descriptor L/R binding. */
   const pairByStream = new Map<number, { leftDts: bigint; rightDts: bigint; at: number }>();

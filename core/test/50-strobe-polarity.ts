@@ -4,22 +4,31 @@
 // You may find the full license in project root directory.
 // -------------------------------------------------------
 //
-// Strobe polarity: does the firmware's edge sense match the electrical shape
-// of the camera's strobe output? The camera's opto-isolated output is an
-// open-collector sink (FLIR BFS GPIO: Line1 / OPTOOUT, 0-24 V, 25 mA max) —
-// it only pulls low, so `Board::camera[].strobe` supplies its own pull-up and
-// the line IDLES HIGH, going LOW for the duration of ExposureActive.
+// Strobe polarity on the V0.1 controller board. Triggering uses the camera's
+// NON-isolated lines: `Board::camera[].trigger` drives camera Line3 (the
+// BFS's input-only non-isolated line) and `Board::camera[].strobe` reads
+// camera Line2, which the host programs as an ExposureActive output
+// (LineInverter off). The BFS Line2 output is OPEN DRAIN: it pulls the
+// Teensy-pulled-up line LOW while the camera exposes and releases it (HIGH)
+// otherwise — `Board::STROBE_ACTIVE_LEVEL = LOW`, the single constant
+// Capture.cpp keys every edge decision on. (The opto-isolated Line1 the old
+// board used has the same open-collector shape, `OPTO_STROBE_ACTIVE_LEVEL`.)
 //
 // Proves:
-//   1. Both strobe pins idle HIGH out of Board::init() — the pull-up is
-//      actually configured (Pin<INPUT_PULLUP>), not floating.
-//   2. An active-LOW strobe (the honest waveform) drives CMD_FRAME to a FIN
-//      with sane exposure timing.
-//   3. Diagnosis when 2 fails: an active-HIGH strobe latching instead means
-//      the firmware reads the line inverted relative to how it is wired.
+//   1. All three strobe lines (C, L, R) idle at the RELEASED level (HIGH, the
+//      pull-up) — the sim's default waveform is the honest open-drain one.
+//   2. The active-LOW waveform drives CMD_FRAME to a FIN with sane exposure
+//      timing, both for the L|R pair and for C|L|R — the center camera is
+//      triggerable (no "no strobe cable" REJ).
+//   3. Polarity is a board constant, not something the line negotiates: an
+//      inverted active-HIGH waveform (LineInverter=true) against the
+//      active-LOW firmware times out ("Strobe timeout: line stuck at active
+//      level ..."). If it FINs instead, Capture.cpp is not honouring
+//      STROBE_ACTIVE_LEVEL.
 //
-// Sim support: `polarity <L|R> <high|low>` selects the injected waveform and
-// `read <L|R>` probes a strobe pin's live level (test/fw-sim/main.cpp).
+// Sim support (test/fw-sim/main.cpp): `strobe <C|L|R> ...` arms injection,
+// `polarity <C|L|R> <high|low>` selects the waveform (default = the Board
+// constant), `read <C|L|R>` probes a strobe pin's live level.
 //
 // Run UNSANDBOXED: node core/test/50-strobe-polarity.ts
 
@@ -44,6 +53,8 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
     }),
   ]);
 }
+
+type Cam = "C" | "L" | "R";
 
 class Sim {
   readonly proc: ChildProcessByStdio<Writable, Readable, null>;
@@ -93,7 +104,7 @@ class Sim {
   }
 
   /** Live level of a camera's strobe pin, as the firmware's ISR would read it. */
-  async strobeLevel(cam: "L" | "R"): Promise<number> {
+  async strobeLevel(cam: Cam): Promise<number> {
     const from = this.mark();
     this.proc.stdin.write(`read ${cam}\n`);
     const hit = await this.waitLine(
@@ -115,6 +126,9 @@ if (!existsSync(simBinary)) {
 const BIAS = 30000;
 const TL: AnalogChannels = [1000, 2000, 3000, 4000];
 const TR: AnalogChannels = [4000, 3000, 2000, 1000];
+// Injected strobe schedule per camera: assert at +rise, release at +fall (µs
+// after that camera's trigger rise).
+const SCHEDULE: Record<Cam, string> = { C: "300 2000", L: "500 2500", R: "700 2500" };
 
 const sim = new Sim(simBinary);
 let device: InstanceType<typeof Device> | null = null;
@@ -127,17 +141,21 @@ try {
   device = new Device(ptyPath);
   await withTimeout(device.verifyVersion(), 5000, "verifyVersion");
 
-  // --- 1: the pull-up is configured -------------------------------------------
+  // --- 1: every strobe line idles at the released level -----------------------
   {
-    const [left, right] = await Promise.all([sim.strobeLevel("L"), sim.strobeLevel("R")]);
+    const [center, left, right] = await Promise.all([
+      sim.strobeLevel("C"),
+      sim.strobeLevel("L"),
+      sim.strobeLevel("R"),
+    ]);
     assert.equal(
-      left,
+      center,
       1,
-      "left strobe pin idles HIGH — Board::camera[1].strobe must be Pin<INPUT_PULLUP>; " +
-        "a bare Pin<INPUT> floats against the camera's open-collector output",
+      "center strobe idles HIGH (released, pull-up) — STROBE_ACTIVE_LEVEL is LOW on V0.1",
     );
-    assert.equal(right, 1, "right strobe pin idles HIGH (Board::camera[2].strobe pull-up)");
-    console.log("50-strobe-polarity: §1 strobe pins idle HIGH (pull-up configured) OK.");
+    assert.equal(left, 1, "left strobe idles HIGH (released)");
+    assert.equal(right, 1, "right strobe idles HIGH (released)");
+    console.log("50-strobe-polarity: §1 C/L/R strobe lines idle at the released level OK.");
   }
 
   await device.set(Protocol.Config.Bias, BIAS);
@@ -149,51 +167,75 @@ try {
     right: TR,
   });
 
-  /** Arm both strobes at `polarity` and report whether one CMD_FRAME reaches a FIN. */
-  async function latchesAt(polarity: "low" | "high"): Promise<boolean> {
-    await sim.ctl(`polarity L ${polarity}`);
-    await sim.ctl(`polarity R ${polarity}`);
-    await sim.ctl("strobe L 500 2500");
-    await sim.ctl("strobe R 700 2500");
+  /** Arm `cams` at `polarity`, run one CMD_FRAME for them, and report whether
+   *  it reached a FIN (`true`) or was REJected (the REJ message). */
+  async function capture(cams: Cam[], polarity: "low" | "high"): Promise<true | string> {
+    for (const cam of cams) {
+      await sim.ctl(`polarity ${cam} ${polarity}`);
+      await sim.ctl(`strobe ${cam} ${SCHEDULE[cam]}`);
+    }
+    const label = `${cams.join("")} ${polarity}`;
     const frame = device!.get(Protocol.Command.Frame, {
       stream: 1,
-      cameras: ["L", "R"],
+      cameras: cams,
       pulse: 2000,
       settle_time: 0,
     });
-    await withTimeout(frame.accepted, 5000, `${polarity} frame ACK`);
+    await withTimeout(frame.accepted, 5000, `${label} frame ACK`);
+    let fin;
     try {
-      const fin = await withTimeout(frame, 5000, `${polarity} frame FIN`);
-      assert(fin.t_exposure > fin.t_trigger, "exposure latches after the trigger edge");
-      assert(fin.t_exposure - fin.t_trigger < 50_000n, "strobe asserts within 50 ms");
-      return true;
-    } catch {
-      return false;
+      fin = await withTimeout(frame, 5000, `${label} frame FIN`);
+    } catch (err) {
+      return String((err as Error)?.message ?? err);
     }
+    assert(fin.t_exposure > fin.t_trigger, `${label}: exposure latches after the trigger edge`);
+    assert(fin.t_exposure - fin.t_trigger < 50_000n, `${label}: strobe asserts within 50 ms`);
+    return true;
   }
 
-  // --- 2/3: which edge does the firmware actually latch on? --------------------
+  // --- 2: the honest active-LOW (open-drain) waveform FINs, C included --------
   {
-    const activeLow = await latchesAt("low");
+    const pair = await capture(["L", "R"], "low");
+    assert.equal(
+      pair,
+      true,
+      `active-LOW L|R strobe must FIN (got: ${pair}) — Capture.cpp must latch on ` +
+        "Board::STROBE_ACTIVE_LEVEL",
+    );
+    const all = await capture(["C", "L", "R"], "low");
+    assert.equal(
+      all,
+      true,
+      `C|L|R frame must FIN on V0.1 — the center camera is cabled (got: ${all})`,
+    );
+    console.log("50-strobe-polarity: §2 active-LOW strobe FINs for L|R and C|L|R OK.");
+  }
+
+  // --- 3: an inverted active-HIGH waveform cannot pass for active-LOW ---------
+  {
     await sleep(100);
-    const activeHigh = await latchesAt("high");
-    console.log(
-      `50-strobe-polarity: active-low latches=${activeLow}, active-high latches=${activeHigh}`,
+    const inverted = await capture(["L", "R"], "high");
+    assert.notEqual(
+      inverted,
+      true,
+      "POLARITY NOT A BOARD CONSTANT: an active-HIGH strobe FINed against the " +
+        "active-LOW firmware — Capture.cpp is reading the line without " +
+        "Board::STROBE_ACTIVE_LEVEL.",
+    );
+    assert.match(String(inverted), /Strobe timeout/, "inverted polarity REJs as a strobe timeout");
+    assert.match(
+      String(inverted),
+      /stuck at active level/,
+      "the timeout names the line stuck at the active level (bench diagnosis)",
     );
 
-    assert(
-      activeLow,
-      activeHigh
-        ? "POLARITY MISMATCH: the strobe pin idles HIGH (pull-up) and the camera's " +
-            "open-collector output pulls it LOW during exposure, but the firmware only " +
-            "latches on an active-HIGH strobe (Capture.cpp onStrobeEdge treats " +
-            "digitalReadFast(pin) HIGH as asserted). On the rig every frame REJs with " +
-            '"Strobe timeout". Fix one side: set LineInverter=true in ' +
-            "app/orchestrator/camera-trigger.ts, or invert the firmware's edge sense."
-        : "active-low strobe produced no FIN, and neither did active-high — the failure " +
-            "is upstream of polarity (trigger, stream, or queue state)",
-    );
-    console.log("50-strobe-polarity: §2 firmware latches the active-LOW strobe OK.");
+    // Back to the honest waveform: idle HIGH (pull-up) again, and it captures.
+    await sim.ctl("polarity L low");
+    await sim.ctl("polarity R low");
+    assert.equal(await sim.strobeLevel("L"), 1, "left strobe idles HIGH again");
+    assert.equal(await sim.strobeLevel("R"), 1, "right strobe idles HIGH again");
+    assert.equal(await capture(["L", "R"], "low"), true, "active-LOW FINs again");
+    console.log("50-strobe-polarity: §3 inverted waveform times out (polarity contract) OK.");
   }
 
   await device.set(Protocol.System.Enable, false);

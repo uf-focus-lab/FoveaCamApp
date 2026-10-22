@@ -10,6 +10,7 @@
 
 import { createMirrorSink, Protocol, Device, type LogLevel } from "core/Controller";
 import type { CameraName, FirmwareVersion, FrameArg, MirrorSink } from "core/Controller";
+import type { TrajectoryFrame, TrajectoryStatus } from "core/Controller"; // v2.2.0
 import { SerialPort } from "serialport";
 import {
   channels,
@@ -24,13 +25,70 @@ type PortInfo = Awaited<ReturnType<typeof SerialPort.list>>[number];
 
 // Streams::CAPACITY, firmware/include/Streams.h — fixed-size table on the MCU.
 export const STREAM_CAPACITY = 64;
-export const STREAM_MIN_UPDATE_INTERVAL_MS = 1;
+/** Default host-side floor between two CMD_STREAM UPDATEs on one stream (ms)
+ *  — the JS `StreamUpdateGate` and, via `createNativeMirrorSink`, the native
+ *  MirrorSink's `minIntervalUs`. Tunable per controller
+ *  (`Controller.streamMinIntervalMs`); this is only the default.
+ *
+ *  Derivation (docs/spec/serial-protocol.md#rate-limits): the old 1 ms was
+ *  sized for the 2 MHz shared DAC bus (~150 µs per committed position). The
+ *  V0.1 board's two concurrent 10–20 MHz buses commit one in ~10 µs; with
+ *  ~3–5 µs of firmware COBS decode + handler per 24-byte UPDATE the MCU
+ *  sustains ~65 kHz of DAC-committed updates. 0.2 ms (5 kHz) keeps the MCU
+ *  loop ≤ ~8 % busy with updates — half of the old 1 kHz × 150 µs — and the
+ *  firmware coalesces anything faster (latest wins per loop iteration), so
+ *  the device loop stays protected; the serial governor still backs off on
+ *  USB/tty pressure. */
+export const STREAM_MIN_UPDATE_INTERVAL_MS = 0.2;
 
 // Minimum firmware/protocol version exposing the targeted MEMS-recovery reset
 // (System::Reset MEMS type). Older firmware REJects the unknown enum, so
 // `recoverMems()`/`v21Capable` gate on this — the v2Capable major-only version
 // gate taken one level finer (major.minor.patch).
 export const RECOVER_MEMS_MIN_VERSION = { major: 2, minor: 1, patch: 0 } as const;
+
+// Minimum firmware/protocol version for the v2.2.0 surfaces: CMD_SCHEDULE
+// (`StreamHandle.scheduleAt`) and CMD_TRAJECTORY (`uploadTrajectory`). Older
+// firmware REJects both properties ("Unknown packet type").
+export const SCHEDULE_MIN_VERSION = { major: 2, minor: 2, patch: 0 } as const;
+
+// Firmware limits (lib/Protocol/Packet.h Trajectory::CHUNK_SAMPLES,
+// firmware/include/Trajectory.h, Streams::SCHEDULE_DEPTH). Checked host-side so
+// a bad spec fails before anything goes on the wire; the firmware REJects past
+// them anyway.
+export const TRAJECTORY_CHUNK_SAMPLES = 12;
+export const TRAJECTORY_MAX_TABLES = 4;
+export const TRAJECTORY_MAX_SAMPLES = 4096;
+export const TRAJECTORY_MAX_MARKERS = 8;
+export const SCHEDULE_DEPTH = 32;
+// DATA chunks kept in flight during an upload (ACK-backed, pipelined).
+const TRAJECTORY_UPLOAD_WINDOW = 8;
+
+/** Host-steady NANOSECONDS → MCU-clock MICROSECONDS — the inverse of the
+ *  FIN decode (`hostNs = mcuUs * 1000 + clockOffsetNs`). Rounds to the nearest
+ *  µs; a time before the MCU epoch clamps to 0n (which every v2.2.0 surface
+ *  reads as "now"). */
+export function hostNsToMcuUs(hostNs: bigint, clockOffsetNs: bigint): bigint {
+  const ns = hostNs - clockOffsetNs;
+  return ns <= 0n ? 0n : (ns + 500n) / 1000n;
+}
+
+/** MCU-clock µs → trusted host-steady ns (the FIN / push decode boundary). */
+export function mcuUsToHostNs(mcuUs: bigint, clockOffsetNs: bigint): bigint {
+  return mcuUs * 1000n + clockOffsetNs;
+}
+
+/** Splits `samples` into CMD_TRAJECTORY DATA chunks of at most `size`. */
+export function chunkTrajectorySamples<T>(
+  samples: readonly T[],
+  size = TRAJECTORY_CHUNK_SAMPLES,
+): Array<{ firstIndex: number; samples: T[] }> {
+  if (!Number.isInteger(size) || size < 1) throw new Error("chunk size must be >= 1");
+  const out: Array<{ firstIndex: number; samples: T[] }> = [];
+  for (let i = 0; i < samples.length; i += size)
+    out.push({ firstIndex: i, samples: samples.slice(i, i + size) });
+  return out;
+}
 
 /** `a >= b` over (major, minor, patch) firmware versions. */
 function versionAtLeast(
@@ -84,9 +142,11 @@ export class StreamUpdateGate {
   private lastRight: Pos;
   private lastSentAt: number;
 
+  /** `minIntervalMs` is a number or a live getter (a controller's tunable
+   *  `streamMinIntervalMs`, read on every `accept`). */
   constructor(
     initial: { left: Pos; right: Pos },
-    private readonly minIntervalMs = STREAM_MIN_UPDATE_INTERVAL_MS,
+    private readonly minIntervalMs: number | (() => number) = STREAM_MIN_UPDATE_INTERVAL_MS,
     now = performance.now(),
   ) {
     this.lastLeft = clonePos(initial.left);
@@ -97,22 +157,144 @@ export class StreamUpdateGate {
   accept(next: { left: Pos; right: Pos }, now = performance.now()): boolean {
     if (samePos(next.left, this.lastLeft) && samePos(next.right, this.lastRight))
       return false;
-    if (now - this.lastSentAt < this.minIntervalMs) return false;
+    const minIntervalMs =
+      typeof this.minIntervalMs === "function" ? this.minIntervalMs() : this.minIntervalMs;
+    if (now - this.lastSentAt < minIntervalMs) return false;
     this.lastLeft = clonePos(next.left);
     this.lastRight = clonePos(next.right);
     this.lastSentAt = now;
     return true;
   }
+
+  /** Record `next` as sent WITHOUT the dedupe / min-interval checks — the
+   *  forced-UPDATE path (`StreamHandle.update(pos, { force: true })`). */
+  force(next: { left: Pos; right: Pos }, now = performance.now()): void {
+    this.lastLeft = clonePos(next.left);
+    this.lastRight = clonePos(next.right);
+    this.lastSentAt = now;
+  }
+
+  /** The accepted pose never reached the wire (a latest-wins drop under
+   *  back-pressure): forget it for DEDUPE so the next push — even the same
+   *  pose — is sent, while the min-interval still paces the retry. */
+  forgetLast(): void {
+    this.lastLeft = { x: NaN, y: NaN };
+    this.lastRight = { x: NaN, y: NaN };
+  }
 }
 
 /** A CMD_STREAM handle: a named,
  *  continuously-updatable mirror-position target. `update()` is fire-and-
- *  forget (seq=0, ~1kHz-safe) — it never resolves/rejects, matching the
- *  protocol's design (the firmware sends no response for it at all). */
+ *  forget (seq=0, multi-kHz-safe — see STREAM_MIN_UPDATE_INTERVAL_MS) — it
+ *  never resolves/rejects, matching the protocol's design (the firmware
+ *  sends no response for it at all), and is written immediately: it never
+ *  waits behind an awaited request. */
 export interface StreamHandle {
   readonly id: number;
-  update(pos: { left: Pos; right: Pos }): void;
+  /** Returns true when the UPDATE was written to the wire, false when the
+   *  gate deduped/paced it or a latest-wins drop discarded it — the
+   *  controller node uses this to know whether a pending CMD_SCHEDULE ring
+   *  was actually cleared (an UPDATE that never left the host clears
+   *  nothing). Callers that don't care ignore it. `force` bypasses the
+   *  gate's dedupe + min-interval (one-off re-assertions — the controller
+   *  node uses it to take the DAC back after an uploaded trajectory STOPs,
+   *  when the pose may equal the last one sent); never use it per tick. */
+  update(pos: { left: Pos; right: Pos }, opts?: { force?: boolean }): boolean;
+  /** v2.2.0 CMD_SCHEDULE: apply `pos` at host-steady time `hostNs` (converted
+   *  to the MCU clock through the calibrated offset) instead of on arrival;
+   *  with `interpolate` the firmware ramps linearly from the previous
+   *  keyframe. Fire-and-forget like `update()` (no gate/dedupe — every
+   *  keyframe counts; the MCU ring holds SCHEDULE_DEPTH pending). A later
+   *  `update()` clears pending keyframes. Requires firmware >= 2.2.0. */
+  scheduleAt(
+    hostNs: bigint,
+    pos: { left: Pos; right: Pos },
+    opts?: { interpolate?: boolean },
+  ): void;
   close(): Promise<void>;
+}
+
+/** One sample of an uploaded trajectory: the mirror target `tOffsetUs` into
+ *  the period (volts, like every Pos surface). */
+export interface TrajectorySample {
+  tOffsetUs: number;
+  left: Pos;
+  right: Pos;
+}
+
+/** A trigger placed inside the period: fires `cameras` once per cycle when
+ *  the phase crosses `tOffsetUs`, through the firmware capture engine. */
+export interface TrajectoryMarker {
+  tOffsetUs: number;
+  /** Default L+R. */
+  cameras?: CameraName[] | number;
+  pulseUs: number;
+}
+
+export interface TrajectorySpec {
+  /** Strictly increasing `tOffsetUs`, each in [0, periodUs). */
+  samples: TrajectorySample[];
+  periodUs: number;
+  /** Up to TRAJECTORY_MAX_MARKERS. */
+  markers?: TrajectoryMarker[];
+  /** Hold each sample until the next instead of linear interpolation. */
+  step?: boolean;
+}
+
+/** A decoded SYN CMD_TRAJECTORY push — `FrameOutcome` conventions (volts,
+ *  OWNER-APPLIED trusted host-steady ns). `marker` is null for the run-level
+ *  ENDED / CANCELLED pushes; positions/timestamps are only meaningful when
+ *  `status === "OK"` (BUSY carries the missed marker's due time in tTrigger). */
+export interface TrajectoryFrameOutcome {
+  trajectoryId: number;
+  marker: number | null;
+  cycle: number;
+  status: TrajectoryStatus;
+  frameId: number;
+  tTrigger: bigint;
+  tExposure: bigint;
+  left: Pos;
+  right: Pos;
+}
+
+/** An uploaded (committed) MCU trajectory table. */
+export interface TrajectoryHandle {
+  readonly id: number;
+  /** START at host-steady `atHostNs` (default: now) for `cycles` (default 0 =
+   *  forever). The mirror pre-positions at phase 0 until then. */
+  start(atHostNs?: bigint, cycles?: number): Promise<void>;
+  /** STOP: the mirror holds its last position; the next stream write takes
+   *  the DAC back. Idempotent. */
+  stop(): Promise<void>;
+  /** DELETE (stops first) and release the table id. Idempotent. */
+  dispose(): Promise<void>;
+  /** Subscribe to this table's pushes; returns the unsubscribe function. */
+  onFrame(cb: (frame: TrajectoryFrameOutcome) => void): () => void;
+}
+
+/** Host-side validation of a trajectory spec against the firmware limits —
+ *  throws a descriptive Error, so a bad spec never reaches the wire. */
+export function validateTrajectorySpec(spec: TrajectorySpec): void {
+  const { samples, periodUs, markers = [] } = spec;
+  if (!Number.isInteger(periodUs) || periodUs <= 0 || periodUs > 0xffffffff)
+    throw new Error("periodUs must be a positive integer (µs)");
+  if (samples.length === 0) throw new Error("a trajectory needs at least one sample");
+  if (samples.length > TRAJECTORY_MAX_SAMPLES)
+    throw new Error(`a trajectory holds at most ${TRAJECTORY_MAX_SAMPLES} samples`);
+  samples.forEach((s, i) => {
+    if (!Number.isInteger(s.tOffsetUs) || s.tOffsetUs < 0 || s.tOffsetUs >= periodUs)
+      throw new Error(`sample ${i}: tOffsetUs must be an integer in [0, periodUs)`);
+    if (i > 0 && s.tOffsetUs <= samples[i - 1].tOffsetUs)
+      throw new Error(`sample ${i}: tOffsetUs must be strictly increasing`);
+  });
+  if (markers.length > TRAJECTORY_MAX_MARKERS)
+    throw new Error(`a trajectory holds at most ${TRAJECTORY_MAX_MARKERS} markers`);
+  markers.forEach((m, i) => {
+    if (!Number.isInteger(m.tOffsetUs) || m.tOffsetUs < 0 || m.tOffsetUs >= periodUs)
+      throw new Error(`marker ${i}: tOffsetUs must be an integer in [0, periodUs)`);
+    if (!Number.isInteger(m.pulseUs) || m.pulseUs <= 0)
+      throw new Error(`marker ${i}: pulseUs must be a positive integer`);
+  });
 }
 
 /** A native mirror sink bound to a live MCU stream (native-compose-
@@ -146,6 +328,13 @@ export interface FrameOutcome {
    *  like `actuate()`. */
   left: Pos;
   right: Pos;
+  /** Present ONLY on an outcome the controller node forwards from a running
+   *  uploaded trajectory (an OK `SYN CMD_TRAJECTORY` push, v2.2.0) rather
+   *  than a `CMD_FRAME` FIN. `stream` then carries the trajectory id (the
+   *  firmware's `result.stream`), so a consumer that keys on stream ids can
+   *  tell the two apart here; FIN consumers that only need the exposure time
+   *  + volts (the anchor node) ignore it. */
+  trajectory?: { id: number; marker: number; cycle: number };
 }
 
 export class Controller {
@@ -176,6 +365,10 @@ export class Controller {
     this.clockOffsetNs = offsetNs;
   }
   private _enabled = false;
+  /** Host-side floor between two UPDATEs on one stream (ms): the JS
+   *  `StreamUpdateGate` reads it live on every update; native sinks take it
+   *  as `minIntervalUs` at creation. Default STREAM_MIN_UPDATE_INTERVAL_MS. */
+  streamMinIntervalMs = STREAM_MIN_UPDATE_INTERVAL_MS;
   // Firmware version resolved by verifyVersion() during `ready` — retained so
   // version-gated surfaces finer than v2Capable (e.g. recoverMems, >= 2.1.0)
   // can compare minor/patch. null until `ready` resolves, or if verifyVersion
@@ -223,10 +416,17 @@ export class Controller {
       // Retain the resolved version for the finer-grained recover gate
       // (v21Capable). `?? null` tolerates a device/fake that resolves nothing.
       this.firmwareVersion = (await device.verifyVersion()) ?? null;
-      await this.disable();
-      await this.setBias(bias);
-      await this.setLPF(lpf);
-      await this.setLogLevel(log_level);
+      // Pipelined: requests are matched by seq and the firmware handles them
+      // in wire order, so the disable → bias → LPF → log-level sequence is
+      // written back-to-back (one round trip, not four). Each call writes
+      // synchronously, so the wire order is the call order (Bias is REJected
+      // while enabled — Enable(false) still lands first).
+      await Promise.all([
+        this.disable(),
+        this.setBias(bias),
+        this.setLPF(lpf),
+        this.setLogLevel(log_level),
+      ]);
     })();
   }
 
@@ -253,6 +453,14 @@ export class Controller {
     return (
       this.firmwareVersion != null &&
       versionAtLeast(this.firmwareVersion, RECOVER_MEMS_MIN_VERSION)
+    );
+  }
+  /** True once `ready` has confirmed firmware >= 2.2.0 — CMD_SCHEDULE
+   *  (`StreamHandle.scheduleAt`) and CMD_TRAJECTORY (`uploadTrajectory`). */
+  get v22Capable() {
+    return (
+      this.firmwareVersion != null &&
+      versionAtLeast(this.firmwareVersion, SCHEDULE_MIN_VERSION)
     );
   }
   /** Cumulative serial byte/packet counters — the caller derives rates by
@@ -444,19 +652,29 @@ export class Controller {
       throw error;
     }
     this.streamStats.set(id, { count: 0, left: pos.left, right: pos.right });
-    const gate = new StreamUpdateGate(pos);
+    const gate = new StreamUpdateGate(pos, () => this.streamMinIntervalMs);
     let closed = false;
     return {
       id,
-      update: (next) => {
+      update: (next, opts) => {
         if (closed) throw new Error(`Stream ${id} is closed`);
-        if (!gate.accept(next)) return;
-        this.device.fireAndForget(Protocol.Command.MirrorStream, {
-          op: "UPDATE",
-          id,
-          left: channels(next.left, this.bias, this.dv),
-          right: channels(next.right, this.bias, this.dv),
-        });
+        if (opts?.force) gate.force(next);
+        else if (!gate.accept(next)) return false;
+        try {
+          this.device.fireAndForget(Protocol.Command.MirrorStream, {
+            op: "UPDATE",
+            id,
+            left: channels(next.left, this.bias, this.dv),
+            right: channels(next.right, this.bias, this.dv),
+          });
+        } catch {
+          // Latest-wins drop (full kernel queue / requests queued ahead —
+          // counted natively in txSoftFail, the governor's signal). Never
+          // throw into the caller's hot path (native-sink parity); re-arm the
+          // dedupe so a resting target is re-sent on the next push.
+          gate.forgetLast();
+          return false;
+        }
         // The ~kHz-capable stream hot path — `emit` is an O(1) counter bump,
         // never a gate on the fire-and-forget write.
         this.serialMeter.emit("packets");
@@ -466,6 +684,24 @@ export class Controller {
           stats.left = next.left;
           stats.right = next.right;
         }
+        return true;
+      },
+      scheduleAt: (hostNs, next, opts) => {
+        if (closed) throw new Error(`Stream ${id} is closed`);
+        if (!this.v22Capable)
+          throw new Error(
+            "scheduleAt requires firmware >= 2.2.0 (CMD_SCHEDULE unavailable)",
+          );
+        this.device.fireAndForget(Protocol.Command.Schedule, {
+          stream: id,
+          t_apply: hostNsToMcuUs(hostNs, this.clockOffsetNs),
+          interpolate: opts?.interpolate ?? false,
+          left: channels(next.left, this.bias, this.dv),
+          right: channels(next.right, this.bias, this.dv),
+        });
+        this.serialMeter.emit("packets");
+        const stats = this.streamStats.get(id);
+        if (stats) stats.count++;
       },
       close: async () => {
         if (closed) return;
@@ -503,6 +739,8 @@ export class Controller {
       dv: this.dv,
       nodeId,
     });
+    // One tunable for both update paths: the native gate's emission floor.
+    sink.setGovernor?.({ minIntervalUs: Math.round(this.streamMinIntervalMs * 1000) });
     let closed = false;
     return {
       sink,
@@ -562,6 +800,189 @@ export class Controller {
     })();
     return Object.assign(completed, { accepted });
   }
+
+  // --- Protocol v2.2.0: uploaded trajectories (MirrorLink) -----------------
+  // spec: docs/spec/serial-protocol.md#trajectory
+
+  private readonly trajectoryIds = new Set<number>();
+  private readonly trajectoryListeners = new Map<
+    number,
+    Set<(frame: TrajectoryFrameOutcome) => void>
+  >();
+  private trajectoryPushBound = false;
+
+  /** Decode one SYN CMD_TRAJECTORY push like `frame()`'s FIN: volts, and MCU
+   *  µs → trusted host-steady ns through the current clock offset. */
+  decodeTrajectoryFrame(f: TrajectoryFrame): TrajectoryFrameOutcome {
+    return {
+      trajectoryId: f.id,
+      marker: f.marker,
+      cycle: f.cycle,
+      status: f.status,
+      frameId: f.result.frame_id,
+      tTrigger: mcuUsToHostNs(f.result.t_trigger, this.clockOffsetNs),
+      tExposure: mcuUsToHostNs(f.result.t_exposure, this.clockOffsetNs),
+      left: decodeChannels(f.result.left),
+      right: decodeChannels(f.result.right),
+    };
+  }
+
+  private bindTrajectoryPush(): void {
+    if (this.trajectoryPushBound) return;
+    this.trajectoryPushBound = true;
+    this.device.onPush(Protocol.Command.TrajectoryFrame, (f) => {
+      const listeners = this.trajectoryListeners.get(f.id);
+      if (!listeners || listeners.size === 0) return;
+      const outcome = this.decodeTrajectoryFrame(f);
+      for (const cb of listeners) {
+        try {
+          cb(outcome);
+        } catch (error) {
+          console.error("trajectory onFrame listener threw:", error);
+        }
+      }
+    });
+  }
+
+  /**
+   * Upload a periodic trajectory to the MCU (CMD_TRAJECTORY BEGIN → DATA
+   * chunks → MARK → COMMIT, all ACK-backed; DATA pipelined
+   * TRAJECTORY_UPLOAD_WINDOW deep). Positions are volts, converted with the
+   * same `channels()` math as streams. The returned handle STARTs/STOPs the
+   * MCU-side playback; its `onFrame` is fed by the per-marker SYN pushes.
+   * Steady state: zero host→MCU bytes, one push per marker firing. Requires
+   * firmware >= 2.2.0. A failed upload DELETEs the partial table.
+   */
+  async uploadTrajectory(spec: TrajectorySpec): Promise<TrajectoryHandle> {
+    if (!this.device.connected) throw new Error("Controller not connected");
+    if (!this.v22Capable)
+      throw new Error(
+        "uploadTrajectory requires firmware >= 2.2.0 (CMD_TRAJECTORY unavailable)",
+      );
+    validateTrajectorySpec(spec);
+    let id = -1;
+    for (let candidate = 0; candidate < TRAJECTORY_MAX_TABLES; candidate++)
+      if (!this.trajectoryIds.has(candidate)) {
+        id = candidate;
+        break;
+      }
+    if (id < 0)
+      throw new Error(`Trajectory capacity (${TRAJECTORY_MAX_TABLES} tables) exceeded`);
+    this.trajectoryIds.add(id);
+    this.bindTrajectoryPush();
+    const Trajectory = Protocol.Command.Trajectory;
+    try {
+      await this.set(Trajectory, {
+        op: "BEGIN",
+        id,
+        sample_count: spec.samples.length,
+        period: spec.periodUs,
+        step: spec.step ?? false,
+      });
+      const chunks = chunkTrajectorySamples(spec.samples);
+      await pipelined(
+        chunks.map((chunk) => () =>
+          this.set(Trajectory, {
+            op: "DATA",
+            id,
+            first_index: chunk.firstIndex,
+            samples: chunk.samples.map((s) => ({
+              t_offset: s.tOffsetUs,
+              left: channels(s.left, this.bias, this.dv),
+              right: channels(s.right, this.bias, this.dv),
+            })),
+          }),
+        ),
+        TRAJECTORY_UPLOAD_WINDOW,
+      );
+      for (const [marker, m] of (spec.markers ?? []).entries())
+        await this.set(Trajectory, {
+          op: "MARK",
+          id,
+          marker,
+          t_offset: m.tOffsetUs,
+          cameras: m.cameras ?? ["L", "R"],
+          pulse: m.pulseUs,
+        });
+      await this.set(Trajectory, { op: "COMMIT", id });
+    } catch (error) {
+      try {
+        await this.set(Trajectory, { op: "DELETE", id });
+      } catch {
+        // best-effort cleanup on a dead/REJecting device
+      }
+      this.trajectoryIds.delete(id);
+      throw error;
+    }
+
+    const listeners = new Set<(frame: TrajectoryFrameOutcome) => void>();
+    this.trajectoryListeners.set(id, listeners);
+    let disposed = false;
+    const live = (what: string) => {
+      if (disposed) throw new Error(`Trajectory ${id} is disposed (${what})`);
+    };
+    return {
+      id,
+      start: async (atHostNs?: bigint, cycles = 0) => {
+        live("start");
+        await this.set(Trajectory, {
+          op: "START",
+          id,
+          t_start: atHostNs === undefined ? 0n : hostNsToMcuUs(atHostNs, this.clockOffsetNs),
+          cycles,
+        });
+      },
+      stop: async () => {
+        live("stop");
+        await this.set(Trajectory, { op: "STOP", id });
+      },
+      dispose: async () => {
+        if (disposed) return;
+        disposed = true;
+        listeners.clear();
+        this.trajectoryListeners.delete(id);
+        try {
+          if (this.device.connected) await this.set(Trajectory, { op: "DELETE", id });
+        } finally {
+          this.trajectoryIds.delete(id);
+        }
+      },
+      onFrame: (cb) => {
+        live("onFrame");
+        listeners.add(cb);
+        return () => {
+          listeners.delete(cb);
+        };
+      },
+    };
+  }
+}
+
+/** Runs `tasks` with at most `window` in flight (issue order preserved — each
+ *  task's serial write happens when it starts); rejects with the first error
+ *  once the in-flight tasks settle, starting no new ones after it. */
+async function pipelined(
+  tasks: ReadonlyArray<() => Promise<unknown>>,
+  window: number,
+): Promise<void> {
+  let next = 0;
+  let failed = false;
+  let firstError: unknown;
+  const worker = async () => {
+    while (!failed && next < tasks.length) {
+      const task = tasks[next++];
+      try {
+        await task();
+      } catch (error) {
+        if (!failed) firstError = error;
+        failed = true;
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(window, tasks.length) }, worker),
+  );
+  if (failed) throw firstError;
 }
 
 // --- Shared device handle ------------------------------------------------

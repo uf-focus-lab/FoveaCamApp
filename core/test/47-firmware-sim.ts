@@ -9,7 +9,7 @@
 // Capture,Global,MEMS}.cpp compiled into test/build/fovea-fw-sim (HAL shim +
 // pty; build with `cd test && make build`) — the first firmware BEHAVIOR
 // coverage that runs off the rig. Proves:
-//   1. verifyVersion v2.1.0 handshake (v2Capable, two-phase unlocked).
+//   1. verifyVersion handshake (this build's version) (v2Capable, two-phase unlocked).
 //   2. Enable sequence — bias staged while disabled, enable rail pin, the
 //      exact MEMS DAC word train (RESET, INT_REF, DAC_POWER, LDAC, bias);
 //      Config::Bias REJ while enabled.
@@ -179,13 +179,17 @@ try {
     }
   }
 
-  // --- 1: v2.1.0 handshake ---------------------------------------------------
+  // --- 1: version handshake ---------------------------------------------------
   {
     const version = await withTimeout(device.verifyVersion(), 5000, "verifyVersion");
     assert.deepEqual(
       { major: version.major, minor: version.minor, patch: version.patch },
-      { major: 2, minor: 1, patch: 0 },
-      "firmware reports protocol v2.1.0",
+      {
+        major: Protocol.System.Version.major,
+        minor: Protocol.System.Version.minor,
+        patch: Protocol.System.Version.patch,
+      }, // this build's shared lib/Protocol/Version.h
+      "firmware reports this build's protocol version",
     );
     assert.equal(version.compatible, true, "compatible");
     assert.equal(device.v2Capable, true, "v2Capable set");
@@ -204,16 +208,19 @@ try {
     assert.equal(enabled.valueOf(), true, "enable ACK echoes enabled");
     // The full MEMS enable word train, in order: FULL RESET, INT REF on, all
     // DAC channels powered, software LDAC, then V_BIAS to the staged value —
-    // all broadcast to both mirrors (cs=LR). Board enable rail rises first.
-    await sim.waitLine((l) => l === "dac cs=LR 1F7530", mark, 5000, "bias DAC write");
+    // all broadcast to both mirrors (same word on both buses: cs=LR). Then
+    // FCLK starts, and only then does the driver enable rail (MEMS_EN, pin 6)
+    // rise (Mirrorcle guide p27).
+    const bias = await sim.waitLine((l) => l === "dac cs=LR 1F7530", mark, 5000, "bias DAC write");
     assert.deepEqual(
       sim.dacLines(mark).slice(0, 5),
       ["280001", "380001", "20000F", "300000", "1F7530"],
       "MEMS enable DAC word sequence",
     );
-    const rail = await sim.waitLine((l) => l === "pin 15 1", mark, 1000, "enable rail");
-    const firstDac = await sim.waitLine((l) => l.startsWith("dac "), mark, 1000, "first dac");
-    assert(rail.index < firstDac.index, "enable rail rises before MEMS traffic");
+    const fclk = await sim.waitLine((l) => l === "pwm pin=10 duty=128", mark, 1000, "FCLK on");
+    const rail = await sim.waitLine((l) => l === "pin 6 1", mark, 1000, "enable rail");
+    assert(bias.index < fclk.index, "FCLK starts after the DAC init + bias");
+    assert(fclk.index < rail.index, "enable rail rises last, after FCLK");
 
     // Config::Bias REJ while enabled.
     await assert.rejects(
@@ -236,8 +243,25 @@ try {
     assert.equal(created.op, "CREATE", "CREATE ACK echo");
     assert.equal(created.id, 1, "CREATE id echo");
     // A freshly CREATEd stream takes the DAC when nothing else holds it:
-    // ch[0] -> DAC channel A on the LEFT mirror (WRITE_UPDATE_DAC|A = 0x18).
-    await sim.waitLine((l) => l === "dac cs=L 1803E8", mark, 5000, "CREATE applies target");
+    // ch[0] -> DAC channel A on the LEFT mirror (WRITE_IREG|A = 0x00), the
+    // first of 3x WRITE_IREG + 1x APPLY_IREG per mirror, both buses in
+    // lockstep (left word, then right word, per frame).
+    const commit = await sim.waitLine((l) => l === "dac cs=L 0003E8", mark, 5000, "CREATE applies target");
+    await sim.waitLine((l) => l === "dac cs=R 1203E8", commit.index, 1000, "CREATE commit complete");
+    assert.deepEqual(
+      sim.lines.slice(commit.index, commit.index + 8),
+      [
+        "dac cs=L 0003E8", // A 1000
+        "dac cs=R 000FA0", // A 4000
+        "dac cs=L 0107D0", // B 2000
+        "dac cs=R 010BB8", // B 3000
+        "dac cs=L 030BB8", // D <- ch[2] 3000
+        "dac cs=R 0307D0", // D <- ch[2] 2000
+        "dac cs=L 120FA0", // C <- ch[3] 4000, APPLY_IREG (update all)
+        "dac cs=R 1203E8", // C <- ch[3] 1000, APPLY_IREG (update all)
+      ],
+      "position update = 4 lockstep frames per mirror",
+    );
 
     const updated = await device.set(Protocol.Command.MirrorStream, {
       op: "UPDATE",
@@ -257,7 +281,7 @@ try {
       right: T2bR,
     });
     // 12000 = 0x2EE0 on left channel A — the silent update actually moved the DAC.
-    await sim.waitLine((l) => l === "dac cs=L 182EE0", mark2, 5000, "seq=0 UPDATE applies");
+    await sim.waitLine((l) => l === "dac cs=L 002EE0", mark2, 5000, "seq=0 UPDATE applies");
     await sleep(200);
     assert.equal(device.stats.rxPackets, rxPackets, "seq=0 UPDATE produced no response packet");
 
@@ -431,13 +455,17 @@ try {
     for (const { stream } of frames)
       assert.match(String(finErrors.get(stream)), /System disabled/, `frame ${stream} REJ reason`);
 
-    // Physical teardown: active-frame trigger pins released, MEMS driven back
-    // to bias, enable rail dropped after the MEMS traffic.
-    await sim.waitLine((l) => l === "pin 22 0", mark, 1000, "L trigger released");
-    await sim.waitLine((l) => l === "pin 18 0", mark, 1000, "R trigger released");
+    // Physical teardown: active-frame trigger pins released (Board.h V0.1
+    // Line3 trigger pins: L = camera[1] (20), R = camera[2] (5)), then power-down
+    // in reverse of enable (Mirrorcle guide p31): enable rail (pin 6) LOW
+    // first, MEMS driven back to bias, FCLK stopped last.
+    await sim.waitLine((l) => l === "pin 20 0", mark, 1000, "L trigger released");
+    await sim.waitLine((l) => l === "pin 5 0", mark, 1000, "R trigger released");
+    const rail = await sim.waitLine((l) => l === "pin 6 0", mark, 1000, "enable rail drop");
     const disableDac = await sim.waitLine((l) => l === "dac cs=LR 1F7530", mark, 1000, "MEMS disable bias");
-    const rail = await sim.waitLine((l) => l === "pin 15 0", mark, 1000, "enable rail drop");
-    assert(disableDac.index < rail.index, "MEMS parked before the enable rail drops");
+    const fclkOff = await sim.waitLine((l) => l === "pwm pin=10 duty=0", mark, 1000, "FCLK off");
+    assert(rail.index < disableDac.index, "enable rail drops before the MEMS is parked");
+    assert(disableDac.index < fclkOff.index, "FCLK stops after the MEMS is parked");
 
     // While disabled, stream ops REJ with the not-enabled reason.
     await assert.rejects(

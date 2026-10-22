@@ -30,8 +30,9 @@ void emit(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 // A recorded OUTPUT pin write that CHANGED the pin level — main emits the
 // `pin` line and schedules strobe edges off camera-trigger rises.
 void onPinWrite(unsigned pin, uint8_t level);
-// One committed MEMS-SPI transaction (a 3-byte DAC word); `csMask` bit0 =
-// left mirror selected, bit1 = right (Board::mems_cs, LOW = selected).
+// One decoded MEMS bus frame (a 3-byte DAC word, hal.cpp bus decoder);
+// `csMask` bit0 = left bus (Board::dac[0]), bit1 = right; 3 = the same word
+// went out on both buses in the same lockstep frame.
 void onDacWord(uint8_t csMask, const uint8_t *bytes, size_t len);
 
 // --- main → hal (defined in hal.cpp) ----------------------------------------

@@ -35,6 +35,108 @@ the return for telemetry / homography feeders. Optional `onApplied(volts, actuat
 delivers the v1 awaited readback. When no controller is bound the last predicted value
 is returned (the mirror holds) and nothing is recorded.
 
+### Scheduled inputs (v2.2.0 CMD_SCHEDULE) {#scheduled-inputs}
+
+Sessions reach the protocol v2.2.0 surfaces through the node, never the raw
+`Controller` (`docs/spec/serial-protocol.md#schedule`, `#trajectory`), so lifecycle,
+mirror history and FIN routing keep one owner.
+
+`input.updateAt(hostNs, pos, { interpolate })` is the timestamped sibling of `update()`:
+
+- Routed to `StreamHandle.scheduleAt` when the bound controller is `v22Capable` and the
+  input's MCU stream exists. Otherwise — v2.1 firmware, no stream yet (the first push
+  creates it), a native input owns the wire, no controller — it falls back to `update()`
+  (immediate) and counts it in `input.scheduleFallbacks`.
+- Mirror history records the prediction at the SCHEDULED host time, because the history
+  is "mirror position vs host time". A keyframe already due (`hostNs` ≤ now) applies on
+  arrival and is recorded at send time. To make `mirrorAt` match the firmware:
+  - Into an empty schedule (no recorded sample still in the future), a hold sample of
+    the current position is recorded at now first. The firmware anchors an interpolated
+    ramp at the arrival instant.
+  - A step keyframe (no `interpolate`) also records the previous position at its own
+    instant, so the history shows a step, not a ramp.
+- Push keyframes in time order. One older than the newest recorded sample is still sent,
+  but it is not recorded (the history ring is monotonic) and is counted.
+- Ordering rule with `update()`: an immediate push SUPERSEDES pending keyframes, because
+  the firmware clears the stream's ring on UPDATE.
+  - Once the UPDATE has actually gone out (`StreamHandle.update()` returns true), the
+    node drops every history sample newer than now (`MirrorHistory.truncateAfter`) and
+    then records the pose at send time.
+  - A gated or dropped UPDATE never reached the MCU. The schedule keeps running and its
+    history stands.
+  - When no recorded keyframe is still in the future, `update()` takes the unchanged
+    legacy path: record at send time, then send.
+- `c.pos` (`applyStreamedPos`) is not advanced for a future keyframe.
+
+### Trajectory ownership (v2.2.0 CMD_TRAJECTORY, MirrorLink) {#trajectory-ownership}
+
+`node.openTrajectory(spec, { name })` uploads `spec` (`Controller.uploadTrajectory`) and
+resolves to the node's handle
+`{ name, id, state, start(atHostNs?, cycles?), stop(), close(), onFrame(cb),
+onStateChange(cb), reupload() }`.
+
+- **Gate.** It requires a bound `v22Capable` controller and rejects otherwise, like the
+  v2 gate for streams. At most ONE trajectory is open: a second `openTrajectory` (even
+  while the first is still uploading) is refused with an error and never queued. The
+  firmware runs one at a time.
+- **Enable lifecycle.** It shares the input bookkeeping. The node enables a disabled
+  controller on open. It disables on the last close (position, native or trajectory)
+  only if the node enabled the controller. A failed upload frees the slot.
+- **States.**
+  - `uploading` → `ready` ⇄ `running` → `detached` → `closed`.
+  - `start()` enters `running` before START goes out. The run ends on a STOP ack, on
+    the run-level `ENDED` push, or on `CANCELLED` (system disabled).
+  - `start()` refuses while running, uploading, detached or closed.
+- **Input holding.** While the trajectory is `running`, every position-input push
+  (`update` / `updateAt`) is held locally. Nothing is sent (the firmware would REJ it)
+  and nothing is recorded. The input returns its last predicted value.
+  - When the run ends, each input re-takes the DAC with its latest pose: the held one,
+    or its pre-run target. The node sends it as a FORCED UPDATE that bypasses the
+    gate's dedupe, because the firmware HOLDs the trajectory's last position until the
+    next stream write, even an identical one. The pose is recorded at send time.
+  - START also drops any not-yet-due scheduled-keyframe history, since those keyframes
+    no longer move the mirror.
+  - Native inputs are not held. Their seq-0 UPDATEs are silently ignored by the
+    firmware while the trajectory runs.
+- **Reconnect.** On `unbindController`, or a `bindController` swap to another device,
+  the handle goes `detached`. `onFrame` stops, `id` is null, and no wire traffic is
+  sent (the table went with the device).
+  - Re-upload is never automatic. A later bind reports
+    `onStateChange("detached", { controllerAvailable })`, and the session decides
+    whether to `reupload()` (same spec, back to `ready`) or `close()`.
+- **Teardown.** `close()` STOPs a running trajectory and DELETEs the table. Both are
+  best-effort: a dead device never throws out of `close()`. It then resumes the inputs,
+  retires the graph input, and applies the disable-iff-we-enabled rule.
+
+**FIN routing.**
+
+- Every push reaches the handle's `onFrame`.
+- An `OK` push is also forwarded to the registered FIN sinks (`onFin` → the anchor
+  node). It goes as a `FrameOutcome` with `stream` = the trajectory id (the firmware's
+  `result.stream`) and the extra `trajectory: { id, marker, cycle }` tag. Pairing and
+  recording consume it unchanged, and a consumer that keys on stream ids tells the two
+  sources apart by the tag.
+- Non-OK statuses (`STROBE_TIMEOUT`, `BUSY`, `CANCELLED`, `ENDED`) go to `onFrame`
+  only. They are logged at most once per status per second (`RateLimitedLog`).
+- **History feeding.** Each OK push records its exposure-averaged position at its
+  exposure host time (`tExposure`). While the MCU owns the DAC, that is the only
+  trustworthy mirror position.
+
+**Graph and telemetry.** While a trajectory is open:
+
+- The graph shows a `controller/trajectory` node (kind `trajectory`) with an edge into
+  `controller` on port `name`.
+- `node.trajectorySnapshot()` (`TrajectoryStat`, published as the controller session's
+  `trajectory` telemetry) reports:
+  - id, state, running, period, marker count;
+  - cycles seen, per-status push counts, last marker / cycle;
+  - held pushes;
+  - `lastLatenessUs`, the lateness of the last OK push: `t_trigger` −
+    (`t_start` + cycle·period + marker offset). It is exact only when `start(atHostNs)`
+    named the instant (`latenessExact`). A "now" start uses the host's send-time
+    estimate, so the figure includes the serial latency.
+- `node.statsSnapshot()` adds the per-input hold/schedule counters.
+
 ### Enable lifecycle
 
 Enable on first update against a live disabled controller (tracked `enabledByUs`);
@@ -161,7 +263,11 @@ mirror position AT THE FRAME'S (past) exposure time — commands are issued up t
 frames arrive at ~60 fps, so the orchestrator keeps a small ring of `{hostNs, left, right}`
 and answers `mirrorAt(hostNs)` with linear interpolation between the two neighbors. Writers
 (controller-node.ts — the ONE trajectory place): every SENT position update records its
-`predictVolts` result; the v1 awaited `actuate()` path records the readback. Honesty note:
+`predictVolts` result; the v1 awaited `actuate()` path records the readback; a scheduled
+keyframe (`updateAt`) records at its apply time and an immediate update that supersedes
+it truncates the not-yet-due samples (`truncateAfter`); a running uploaded trajectory's
+OK pushes record their exposure-averaged position at `tExposure`
+(see [scheduled inputs](#scheduled-inputs), [trajectory ownership](#trajectory-ownership)). Honesty note:
 these are COMMANDS — the physical mirror follows with LPF group delay (~1.3 ms at the
 120 Hz LPF) + settle; triggered captures should prefer the FIN exposure-averaged voltage when
 present.

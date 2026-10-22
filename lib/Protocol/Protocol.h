@@ -10,6 +10,7 @@
 #include <vector>
 
 #include <Buffer/Buffer.h>
+#include <type_name.h> // type_name<Payload>() in FixedSizePacket::inflate
 
 namespace Protocol {
 
@@ -37,7 +38,10 @@ typedef enum Method : uint8_t {
 // lifecycle, continuous position updates, and triggered frames; CMD_ACTUATE
 // and CMD_TRIGGER are Commands. LOG is pushed from the MCU to the host.
 // SYS_TIMESTAMP (clock calibration, v1.1) sits out of group order because the
-// existing nibble values are frozen on the wire.
+// existing nibble values are frozen on the wire. v2.2.0 adds CMD_SCHEDULE
+// (timestamped keyframes on an existing stream) and CMD_TRAJECTORY (uploaded
+// periodic trajectory with trigger markers, results pushed as SYN) — see
+// Packet.h Command::Schedule / Command::Trajectory.
 #define FOVEA_PROTOCOL_PROPERTIES(X)                                          \
   X(NONE, 0x00)                                                               \
   X(SYS_INFO, 0x01)                                                           \
@@ -52,6 +56,8 @@ typedef enum Method : uint8_t {
   X(CMD_ACTUATE, 0x0A)                                                        \
   X(CMD_TRIGGER, 0x0B)                                                        \
   X(SYS_TIMESTAMP, 0x0C)                                                      \
+  X(CMD_SCHEDULE, 0x0D)                                                       \
+  X(CMD_TRAJECTORY, 0x0E)                                                     \
   X(LOG, 0x0F)
 
 typedef enum Property : uint8_t {

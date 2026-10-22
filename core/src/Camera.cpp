@@ -4,6 +4,7 @@
 // You may find the full license in project root directory.
 // -------------------------------------------------------
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstring>
 
@@ -99,6 +100,9 @@ public:
             INSTANCE_METHOD(CameraObject, getFeature),                 //
             INSTANCE_METHOD(CameraObject, getFeatureInt),              //
             INSTANCE_METHOD(CameraObject, setFeature),                 //
+            INSTANCE_METHOD(CameraObject, setFeatureInt),              //
+            INSTANCE_METHOD(CameraObject, getFeatureBool),             //
+            INSTANCE_METHOD(CameraObject, setFeatureBool),             //
             INSTANCE_METHOD(CameraObject, executeFeature),             //
             INSTANCE_METHOD(CameraObject, calibrateClock),             //
             INSTANCE_GETTER(CameraObject, clockCalibration),           //
@@ -292,6 +296,62 @@ private:
       auto name = info[0].As<String>().Utf8Value();
       auto value = info[1].As<String>().Utf8Value();
       core()->set_feature(name.c_str(), value.c_str());
+      return env.Undefined();
+    }
+    JS_EXCEPT(env.Undefined())
+  }
+  // Integer GenICam node write (`arv_camera_set_integer`). Takes a Number
+  // (an integer within the safe range) or a BigInt (lossless int64).
+  FN(setFeatureInt) {
+    try {
+      JS_ASSERT(info.Length() >= 2 && info[0].IsString(), TypeError,
+                "setFeatureInt(name, value) expects a string name",
+                env.Undefined());
+      auto name = info[0].As<String>().Utf8Value();
+      int64_t value = 0;
+      if (info[1].IsBigInt()) {
+        bool lossless = false;
+        value = info[1].As<BigInt>().Int64Value(&lossless);
+        JS_ASSERT(lossless, RangeError,
+                  "setFeatureInt: BigInt value out of int64 range",
+                  env.Undefined());
+      } else if (info[1].IsNumber()) {
+        const double v = info[1].As<Number>().DoubleValue();
+        JS_ASSERT(std::isfinite(v) && v == std::floor(v) &&
+                      std::fabs(v) <= 9007199254740991.0,
+                  RangeError,
+                  "setFeatureInt: value must be a safe integer",
+                  env.Undefined());
+        value = static_cast<int64_t>(v);
+      } else {
+        JS_THROW(TypeError, "setFeatureInt: value must be a number or bigint",
+                 env.Undefined());
+      }
+      core()->set_feature_int(name.c_str(), value);
+      return env.Undefined();
+    }
+    JS_EXCEPT(env.Undefined())
+  }
+  // Boolean GenICam node access (`arv_camera_{get,set}_boolean`), e.g.
+  // LineInverter — `getFeature`/`setFeature` go through the string API and
+  // throw "Not a ArvGcString" on ArvGcBoolean nodes.
+  FN(getFeatureBool) {
+    try {
+      auto name = info[0].As<String>().Utf8Value();
+      return Boolean::New(env, core()->get_feature_bool(name.c_str()));
+    }
+    JS_EXCEPT(env.Undefined())
+  }
+  FN(setFeatureBool) {
+    try {
+      JS_ASSERT(info.Length() >= 2 && info[0].IsString() &&
+                    info[1].IsBoolean(),
+                TypeError,
+                "setFeatureBool(name, value) expects a string and a boolean",
+                env.Undefined());
+      auto name = info[0].As<String>().Utf8Value();
+      auto value = info[1].As<Boolean>().Value();
+      core()->set_feature_bool(name.c_str(), value);
       return env.Undefined();
     }
     JS_EXCEPT(env.Undefined())

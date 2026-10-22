@@ -60,8 +60,8 @@ own byte count.
   pairing record bound the observation's exposures (free-run recordings
   always carry `left:null, right:null`);
   `center` is the NEAREST recorded wide frame by timestamp and is explicitly
-  UNSYNCHRONIZED (the wide camera is not hardware-triggerable — CAM0 GPIO
-  uncabled). Fovea imagery is reconstructed offline from the pointed-at raw
+  UNSYNCHRONIZED (multi-fovea free-runs the wide camera by choice; the V0.1
+  board does cable its trigger). Fovea imagery is reconstructed offline from the pointed-at raw
   frames + per-frame params; it is never re-encoded.
 
 **Channel/schema table** (pinned from `docs/schema/fovea.ts`, re-exported by

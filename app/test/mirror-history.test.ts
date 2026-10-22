@@ -58,4 +58,18 @@ describe("MirrorHistory", () => {
     p.x = 99;
     expect(h.mirrorAt(1000n)!.left.x).toBe(1);
   });
+
+  it("truncateAfter drops only the samples newer than the cut (wrapped ring too)", () => {
+    const h = new MirrorHistory(4);
+    for (let i = 1; i <= 6; i++) h.record(BigInt(i) * 1000n, pos(i), pos(i));
+    expect(h.size).toBe(4); // 3000..6000
+    expect(h.truncateAfter(4500n)).toBe(2);
+    expect(h.size).toBe(2);
+    expect(h.newest()).toMatchObject({ hostNs: 4000n, left: pos(4) });
+    // Monotonic appends resume from the cut.
+    h.record(4200n, pos(42), pos(42));
+    expect(h.mirrorAt(4200n)!.left.x).toBe(42);
+    expect(h.truncateAfter(0n)).toBe(3);
+    expect(h.newest()).toBeNull();
+  });
 });

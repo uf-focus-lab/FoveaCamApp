@@ -396,7 +396,8 @@ const triggerReadout = computed<TriggerReadout>(() => {
     return {
       text: "testing…",
       tone: "muted",
-      title: "Firing a software then hardware trigger on both fovea cameras.",
+      title:
+        "Firing a software then hardware trigger on both fovea cameras (and the Wide Angle camera, if assigned).",
     };
   const r = triggerTest.value;
   if (!r)
@@ -414,10 +415,16 @@ const triggerReadout = computed<TriggerReadout>(() => {
         : v.hw === "fail"
           ? "wiring"
           : null;
+  // The center camera joins when one holds the Wide Angle role (V0.1 cables it).
+  const tested = (["L", "R", "C"] as const).flatMap((side) => {
+    const v = r[side];
+    return v ? [{ side, v }] : [];
+  });
+  const who = r.C ? "All three cameras" : "Both fovea cameras";
   const issues: string[] = [];
   let anyFail = false;
-  for (const side of ["L", "R"] as const) {
-    const t = token(r[side]);
+  for (const { side, v } of tested) {
+    const t = token(v);
     if (t) issues.push(`${side}: ${t}`);
     if (t === "camera" || t === "wiring") anyFail = true;
   }
@@ -427,25 +434,25 @@ const triggerReadout = computed<TriggerReadout>(() => {
       tone: anyFail ? "danger" : "muted",
       title:
         "camera = the software trigger produced no frame (camera or stream path). " +
-        "wiring = software passed but the hardware pulse produced no frame — check the opto trigger cabling. " +
+        "wiring = software passed but the hardware pulse produced no frame — check that camera's J_CAM cable (trigger on camera Line2). " +
         "no probe = the frame probe is unavailable (camera pipe parked) — not a failure; re-run with the preview open." +
         testedAt(r.at),
     };
-  const bothHw = r.L.hw === "ok" && r.R.hw === "ok";
-  return bothHw
+  const allHw = tested.every(({ v }) => v.hw === "ok");
+  return allHw
     ? {
-        text: "OK · sw+hw trigger",
+        text: r.C ? "OK · sw+hw trigger · L R C" : "OK · sw+hw trigger",
         tone: "ok",
         title:
-          "Both fovea cameras produced a frame from a software AND a hardware trigger — the trigger input chain is healthy. " +
-          "The strobe-return line is only proven by a live trigger-sync engage." +
+          `${who} produced a frame from a software AND a hardware trigger — the trigger input chain is healthy. ` +
+          "The strobe-return line (camera Line2) is only proven by a live trigger-sync engage." +
           testedAt(r.at),
       }
     : {
-        text: "OK · sw trigger",
+        text: r.C ? "OK · sw trigger · L R C" : "OK · sw trigger",
         tone: "ok",
         title:
-          "Both cameras produced a frame from a software trigger; the hardware leg was skipped (no controller connected)." +
+          `${who} produced a frame from a software trigger; the hardware leg was skipped (no controller connected).` +
           testedAt(r.at),
       };
 });
@@ -657,7 +664,7 @@ function cancelEdit(e?: Event) {
           <button
             class="test-btn"
             :disabled="testing || formatBusy || unifyBusy"
-            title="Fires a real software then hardware trigger on both fovea cameras and checks a frame arrives. Briefly pauses the previews."
+            title="Fires a real software then hardware trigger on both fovea cameras (and the Wide Angle camera, if assigned) and checks a frame arrives. Briefly pauses the previews."
             @click="runTriggerTest"
           >
             test
