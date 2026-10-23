@@ -1359,7 +1359,6 @@ export default function mirrorLinkSession(
       // so the clamp check would misreport it). Settled by the next landed
       // swap.
       const unconfirmed = siblingIds.size > 0;
-      if (unconfirmed) reasons.push(MISMATCH.swapUnconfirmed);
       if (timed) {
         const want0 = runRaw[0]?.pulseUs ?? 0;
         if (
@@ -1389,6 +1388,7 @@ export default function mirrorLinkSession(
         reasons.push(MISMATCH.readout);
       if (runMode === "triangle" && flipTooClose) reasons.push(MISMATCH.flip);
       if (clockLapsed) reasons.push(MISMATCH.clockLapsed);
+      if (unconfirmed) reasons.push(MISMATCH.swapUnconfirmed);
       return reasons;
     }
 
@@ -1692,9 +1692,11 @@ export default function mirrorLinkSession(
      *  strobe margin): a SHRINKING exposure is written before the swap, a
      *  GROWING one after it (the swapped-in table already carries the
      *  predicted exposure). A failed swap after a pre-swap write writes the
-     *  previous exposure back. Once the swap settles (success or failure) a
-     *  run that is no longer `running` aborts the scan; a failure that left
-     *  it running keeps the old geometry (warned once). */
+     *  previous exposure back — unless the new table MAY be live (the shorter
+     *  exposure is safe under either). Once the swap settles (success or
+     *  failure) a run that is no longer `running` aborts the scan; a failure
+     *  that left it running keeps the old geometry (warned once) — or, when
+     *  the new table may be live, an unconfirmed one (`mismatch` says so). */
     async function replaceNow(): Promise<void> {
       const traj = trajectory;
       const t = triple;
@@ -1774,9 +1776,14 @@ export default function mirrorLinkSession(
       if (failed) {
         if (!warnedReplace) {
           warnedReplace = true;
+          const rep0 =
+            error instanceof TrajectoryReplaceError ? error.replacement : null;
           report(
             "mirror-link",
-            `live trajectory re-upload failed: ${errorLine(error)} — the scan keeps its previous geometry`,
+            `live trajectory re-upload failed: ${errorLine(error)} — ` +
+              (rep0?.maybeLive
+                ? "the mirror may run either the previous or the new edit until the next edit lands"
+                : "the scan keeps its previous geometry"),
             "warning",
           );
         }

@@ -448,3 +448,45 @@ in round 6:
   core share; (f) D1 takes the minimum pipelined time over 3 bursts;
   (g) re-arm diagnostics print cycle and phase separately, and running out
   of re-arms is a fixture failure of its own (no stage retry on top).
+  Also done in that rework, for robustness under sustained starvation of the
+  sim (accepted): (h) C3 and C5/C6 run on a 120 ms period (C3 was 20 ms,
+  C5/C6 60 ms) — the DAC value at each fraction of the period is unchanged
+  and every documented swap guarantee (crossing state by index, next-cycle
+  rule, ENDED on spent cycles, HOLD seeds) is still exercised, but no longer
+  at the short periods; (i) longer marker pulses (C3 20 ms, C5/C6 60 ms) so
+  the strobe timeout falls ~22-25 ms after the strobe fall; (j) C4's fresh
+  START leads by 200 ms with its handling instant measured, plus a check that
+  the HOLD position is the DAC's; (k) `swapMark` is read after a drain (an
+  unread wrap no longer reads as a phase reset); (l) C5 re-runs as a fixture
+  miss when the swap was handled past b's marker phase (otherwise the
+  by-index crossing state would go unexercised).
+
+## Review round 7 (2026-10-23) — findings and decisions
+
+Four reviews on ec68dc7. No blockers. Fixed in round 7:
+
+- **Unconfirmed swap vs the identical-spec shortcut (should-fix):** after a
+  possibly-live failed swap, an edit back to the running geometry built a
+  spec identical to `runSpec` and the shortcut returned before any swap — the
+  Timed camera kept the shorter exposure for good, the mismatch persisted and
+  the sibling was never retired. Decision: the shortcut is suspended while a
+  sibling may be live; `mismatch_reason` names the unconfirmed swap
+  ("replacement swap unconfirmed — the mirror may run the previous edit",
+  LAST in the reason order) and the Timed clamp check is suspended in that
+  state (the camera deliberately differs from the running table); the
+  failure warning says the mirror may run either edit. Manual and spec tables
+  carry the row.
+- **Failed pair swap retires siblings (contract gap):**
+  `TrajectoryReplaceError.retiredSiblings` names the possibly-live siblings
+  whose STOP landed on a failed STOP/START pair; the node moves their
+  open-ended scoring entries to the grace and the session retires their
+  `specById` entries. Tests at all three layers.
+- **Wording:** an atomic START replaces whichever table plays; only the pair
+  and `stop()` STOP siblings (session comments, `endRun`, spec §actuation,
+  `controller.md` lifetime); "keeps its previous geometry" and the Timed
+  write-back are qualified with the may-be-live exception (spec ×3, contract,
+  `replaceNow` doc); the manual's crosshair is "where you aimed" (the scan
+  center unless a vergence pan holds); the readout remedy is "make both
+  windows end at the same point of their sweep"; the spec's ring row drops
+  `off` (the row is mounted only while the reader is on); the brief's
+  round-6 section records the harness rework's extra changes (h)-(l).

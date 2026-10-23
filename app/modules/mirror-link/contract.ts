@@ -36,8 +36,10 @@ export type ScanTelemetry = {
    *  sweep per cycle). */
   hz: number;
   /** The amplitude (°) the RUNNING table was built for — held with the run's
-   *  spec, so a failed re-upload leaves it at the value the MCU plays, not
-   *  the edited `scan_amp` (spec §exposure-windows, telemetry). */
+   *  spec, so a failed re-upload leaves it at the value the MCU plays (unless
+   *  the failed swap's table may be live — `mismatch` then names the
+   *  unconfirmed swap), not the edited `scan_amp` (spec §exposure-windows,
+   *  telemetry). */
   amp_deg: number;
   /** The TRAJECTORY period on the MCU (µs): T, or 2T for the triangle. */
   period_us: number;
@@ -183,7 +185,7 @@ export const mirrorLink = defineContract({
   },
   telemetry: {
     ready: false as boolean, // calibrated triple leased + conversions loaded
-    target: { x: 0, y: 0 } as Point2d, // scan center, wide px
+    target: { x: 0, y: 0 } as Point2d, // the aimed (steer) point, wide px — the scan center unless a vergence pan holds (`scan_center_px`)
     target_angle: { x: 0, y: 0 } as Point2d, // ...and in radians (angular)
     /** The commanded pose: the mirrors' idle pose, and while scanning the
      *  scan path's CENTER — the PosView crosshair stays put instead of flickering at

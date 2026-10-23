@@ -376,7 +376,8 @@ says why it cannot run as asked):
   camera's, so it is checked, not baked into the cap.
 
 **Telemetry.** `ScanTelemetry` = `mode`, `hz`, `amp_deg` (the RUNNING amplitude, held
-with the run's spec — a failed re-upload leaves it at the value the MCU plays), `period_us`
+with the run's spec — a failed re-upload leaves it at the value the MCU plays, unless the
+failed swap's table may be live, §actuation), `period_us`
 (T or 2T), `windows`
 (`{ t_offset_us, pulse_us }` per marker, as the MCU runs them — republished after every
 re-upload / restart), `exposure_mode` (`TriggerWidth`, or `Timed` when either eye fell
@@ -475,7 +476,7 @@ dim + dashed when only the fit succeeded), the LEADER arc in `--warn` (distinct 
 eye colors), and radial ticks at every field (long) and byte (short) boundary. The arc +
 ticks stay mounted and fade rather than remount — a marginal emitter flips ok↔fail at
 frame rate. Under it a fixed-height, START-aligned mono row reads the decoded text +
-`px/chip` (emphasized), or `off` / `idle` / `reading…` / the failure reason (with the
+`px/chip` (emphasized), or `idle` / `reading…` / the failure reason (the row is mounted only while the reader is on; with the
 last decode, muted); the full text, the hex and the reading direction ride its `title`.
 Below the center tile's scan row sit the §ring-views stage selector and the two strips.
 
@@ -672,8 +673,10 @@ while scanning arms a throttle timer: at most ONE `NodeTrajectory.replace(spec)`
 so the latest geometry wins, and at most ONE replace op queued at a time — while one waits,
 further edits only mark it pending (it builds the latest spec when it runs), so a replace
 slower than the throttle never stacks an op per steer event (the node coalesces in-flight
-swaps too; the throttle keeps the wire sane). An identical spec is skipped. A replace that
-throws with the run still going keeps the previous geometry (one warning per run); a run
+swaps too; the throttle keeps the wire sane). An identical spec is skipped (not while a
+failed swap's table may be live — §actuation). A replace that throws with the run still
+going keeps the previous geometry (one warning per run) — unless the failed swap's table may
+be live, in which case `mismatch` names the unconfirmed swap (§actuation); a run
 that is not `running` once the replace settles — `TrajectoryReplaceError.running ===
 false`, a detach, a plain error from a dead device — stops the scan (§lifecycle). A period
 change is never a replace — §lifecycle restarts the run.

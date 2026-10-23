@@ -210,7 +210,8 @@ stopping the scan. MirrorLink calls it on every steer drag or slider move, at mo
     scores against the in-flight spec. A handle without the hook is seen at resolve
     instead. A `TrajectoryReplaceError` with a `replacement` keeps that id scored
     against the replacement spec: for its grace, or, while it `maybeLive`, until the
-    run ends.
+    next running swap, a failed pair swap that STOPped it (`retiredSiblings`), or the
+    run's end.
 - **Phase carry.** `t_start` and `cycles` are the run's original values. The firmware
   joins a past `t_start` in progress, so the mirror continues at the phase the old
   table was at. For `start(atHostNs)` that is the exact MCU value sent. A "now" start

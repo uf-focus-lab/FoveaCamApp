@@ -29,7 +29,8 @@ Three live columns sit across the top:
   *Reading the emitter*). The voltage bar draws the scan path the mirror is
   commanded to follow, with the crosshair on the path's center.
 - **Center Wide** (orange) — the wide view you steer on. It carries a crosshair
-  at the scan center with its angle in degrees, the scan path with its exposed
+  where you aimed (the scan center, unless **Auto Vergence** holds a pan) with
+  its angle in degrees, the scan path with its exposed
   stretches drawn thicker, the **axis handle** (a spoke from the scan center
   ending in a dot), and a small cyan and greenyellow circle showing where each
   fovea is currently aimed. Below it sit the **Start Scan** button and the scan
@@ -52,7 +53,7 @@ handle's dot, which turns the scan instead (see *To scan*). The dot always sits
 a little way out from the scan center, so a press there always aims (with
 **Auto Vergence** holding a pan, the crosshair sits off that center — press
 beside the dot, not on it). Both foveas follow
-the cursor; a crosshair with a degree readout marks the scan center and the
+the cursor; a crosshair with a degree readout marks where you aimed and the
 dashed path previews what the mirrors will trace. Release to leave the mirrors
 parked there. The depth the two eyes converge on comes from the **Verge
 Distance** slider, not from the drag.
@@ -137,7 +138,7 @@ cameras actually expose.
    **Center Wide** view: the axis follows the pointer for as long as you hold
    the button, and the drag does *not* move the scan center. The handle only
    sets the direction: at a small amplitude its dot is drawn further out than
-   the end of the path, so it never sits on the crosshair. Press anywhere else
+   the end of the path, so it never sits on the scan center. Press anywhere else
    on the view — the scan center included — and you steer as usual. Over the dot
    the pointer turns into a hand and the handle brightens; while you drag it
    the dot grows. While **Auto Vergence** holds a pan the scan center sits a
@@ -215,7 +216,7 @@ current settings would run.
 | Amber reason | What it means, what to do |
 |---|---|
 | trigger rate above the camera's maximum frame rate | The cameras cannot take frames that fast — lower **Scan Frequency**. |
-| exposures closer than the sensor readout | Two exposures END closer together than the sensor needs to read out a frame — in triangle mode move the two windows' ENDS further apart, or lower **Scan Frequency**. |
+| exposures closer than the sensor readout | Two exposures END closer together than the sensor needs to read out a frame — in triangle mode make both windows end at the same point of their sweep (**Sync Windows** does this), or lower **Scan Frequency**. |
 | exposure windows too close for reliable flipping at this frequency | The two triangle frames are too close together in time to tell apart which one to flip — widen the spacing between the windows, or lower **Scan Frequency**. |
 | unequal windows: Timed exposure gives both the rising window's length | On a timed-fallback camera with **Sync Windows** off, the camera takes the rising window's length for both frames; set the windows equal (or turn Sync on) if that is not what you want. |
 | Timed exposure would run into the next trigger | On a timed-fallback camera the exposure the camera can take is longer than a whole sweep (its minimum exposure is above one sweep — the **Scan Frequency** period; a triangle's full period is two sweeps), so a frame would still be exposing when the next trigger arrives — lower **Scan Frequency**. Shortening the windows does not help: the app already keeps a shorter exposure inside its sweep. |
