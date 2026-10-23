@@ -47,6 +47,8 @@ const periodMs = computed(
 );
 const windowMs = (w: readonly number[]) =>
   `${(w[0] * periodMs.value).toFixed(1)}–${(w[1] * periodMs.value).toFixed(1)} ms`;
+/** One thumb's ms readout — the dual slider's per-thumb `aria-valuetext`. */
+const thumbMs = (v: number) => `${(v * periodMs.value).toFixed(1)} ms`;
 
 const scanWindow = computed<ScanWindow>({
   get: () => state.scan_window,
@@ -82,13 +84,18 @@ const WINDOW_TITLE =
   "The part of each revolution the foveas expose, as start–end within the period. Right-click resets to neutral.";
 const RISE_TITLE =
   "The part of the outward sweep the foveas expose, as start–end within the sweep. Right-click resets to neutral.";
+// Sync means identical TIMING (spec review round 1, decided): the falling
+// window takes the rising window's fractions, each counted from the start of
+// its own sweep — so an asymmetric window exposes opposite ends of the line on
+// the two frames.
+const SYNC_MEANS =
+  "the same timing within the return sweep, which starts from the far end — so a window not centred in its sweep exposes opposite ends of the line on the two frames";
 const fallTitle = computed(() =>
   state.tri_window_sync
-    ? "Follows Rising Window while Sync is on."
+    ? `Follows Rising Window while Sync is on: ${SYNC_MEANS}.`
     : "The part of the return sweep the foveas expose, as start–end within the sweep; that frame arrives flipped vertically. Right-click resets to neutral.",
 );
-const SYNC_TITLE =
-  "Keep the falling-sweep window identical to the rising one.";
+const SYNC_TITLE = `Give the falling sweep the rising sweep's window: ${SYNC_MEANS}.`;
 </script>
 
 <template>
@@ -108,7 +115,7 @@ const SYNC_TITLE =
     <RangeSlider
       v-model="state.scan_axis_deg"
       :title="AXIS_TITLE"
-      :min="-180"
+      :min="-179.5"
       :max="180"
       :neutral="0"
       :step="0.5"
@@ -135,6 +142,7 @@ const SYNC_TITLE =
         :max="1"
         :neutral="1"
         :step="0.01"
+        :detents="[0]"
       >
         <span>Ratio</span>
         <span>{{ state.scan_ratio > 0 ? state.scan_ratio.toFixed(2) : "line" }}</span>
@@ -147,6 +155,8 @@ const SYNC_TITLE =
         :step="WINDOW_STEP"
         :min-gap="WINDOW_STEP"
         :neutral="DEFAULT_WINDOW"
+        :value-text="thumbMs"
+        label="Exposure window"
       >
         <span>Exposure Window</span>
         <span>{{ windowMs(scanWindow) }}</span>
@@ -161,6 +171,8 @@ const SYNC_TITLE =
         :step="WINDOW_STEP"
         :min-gap="WINDOW_STEP"
         :neutral="DEFAULT_TRI_WINDOW"
+        :value-text="thumbMs"
+        label="Rising window"
       >
         <span>Rising Window</span>
         <span>{{ windowMs(riseWindow) }}</span>
@@ -176,6 +188,8 @@ const SYNC_TITLE =
         :min-gap="WINDOW_STEP"
         :neutral="DEFAULT_TRI_WINDOW"
         :disabled="state.tri_window_sync"
+        :value-text="thumbMs"
+        label="Falling window"
       >
         <span>Falling Window</span>
         <span>{{ windowMs(fallWindow) }}</span>
@@ -224,8 +238,10 @@ const SYNC_TITLE =
   }
 }
 
-// Label + checkbox on one row; the box takes the accent like every other
-// emphasis in the drawer (a fill, never a border).
+// Label + checkbox on one row. Checked, the box takes the accent as a FILL like
+// every other emphasis in the drawer; unchecked, its resting border is the
+// native control's — an exception to "a fill, never a border", accepted
+// because the owner asked for a real checkbox.
 .check-row {
   display: flex;
   align-items: center;

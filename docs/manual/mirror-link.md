@@ -1,14 +1,15 @@
 # MirrorLink
 
-MirrorLink points both fovea mirrors at one spot and then spins them in a small
-circle around it, fast, while each fovea camera takes exactly one frame per
-revolution. A light source that blinks on and off at its own rate therefore
-paints a **dashed ring** in every fovea frame: the gaps in the ring are the
-source's off-periods, so the ring itself is the decoded signal. Use it to read a
-free-running optical transmitter, or simply to see a blink pattern you cannot
-resolve frame by frame. The circle is the default; the **Scan Pattern** pane
-also offers an ellipse, a straight line, and a triangle sweep that runs out and
-back along a line (see *To scan*).
+MirrorLink points both fovea mirrors at one spot and then sweeps them fast along
+a small path around it while the controller triggers the fovea cameras at exact
+points on that path. By default the path is a circle and each camera takes
+exactly one frame per revolution, so a light source that blinks on and off at its
+own rate paints a **dashed ring** in every fovea frame: the gaps in the ring are
+the source's off-periods, so the ring itself is the decoded signal. Use it to
+read a free-running optical transmitter, or simply to see a blink pattern you
+cannot resolve frame by frame. The **Scan Pattern** pane also offers an ellipse,
+a straight line, and a triangle sweep that runs out and back along a line, which
+takes two frames per cycle, one each way (see *To scan*).
 
 **Prerequisites:** a full calibration present (see [Calibration](./calibration.md))
 and all three cameras connected (see [Manage Cameras](./manage-cameras.md)). On
@@ -47,7 +48,9 @@ keyboard — then drag the grips between the columns to resize them.
 ### To aim
 
 Press and drag anywhere on the **Center Wide** view — anywhere except the axis
-handle's dot, which turns the scan instead (see *To scan*). Both foveas follow
+handle's dot, which turns the scan instead (see *To scan*). The dot always sits
+a little way out from the crosshair, so a press on the crosshair itself always
+aims. Both foveas follow
 the cursor; a crosshair with a degree readout marks the scan center and the
 dashed path previews what the mirrors will trace. Release to leave the mirrors
 parked there. The depth the two eyes converge on comes from the **Verge
@@ -72,7 +75,7 @@ middle of a fovea frame, not just somewhere in it.
   left fovea and lowers the right by the same amount, for when the source sits
   high in one view and low in the other.
 
-Both move the ring's center without changing its size or shape, so you can use
+Both move the scan path's center without changing its size or shape, so you can use
 them while the scan runs. The two small circles on the Center Wide view show
 where each fovea is aimed.
 
@@ -91,7 +94,7 @@ keeps up as the rig drifts.
    left them, and the sliders hold the values it reached.
 
 While the **scan** is running the loop pauses (the status reads `paused: scanning`): a
-scanned fovea frame is a ring, not the patch the match needs. It picks up again the moment
+scanned fovea frame is a smear along the scan path, not the patch the match needs. It picks up again the moment
 you stop the scan, from the values it had. So the usual order is converge first, then scan.
 
 Other things the status line can say: `hold: match low score` — neither view is confident
@@ -131,9 +134,12 @@ cameras actually expose.
    the wide view's horizontal), or press on the **axis handle** — the dot at the
    end of the short spoke from the scan center — and drag it around on the
    **Center Wide** view: the axis follows the pointer for as long as you hold
-   the button, and the drag does *not* move the scan center. Press anywhere else
-   on the view and you steer as usual. The pointer turns into a hand over the
-   dot.
+   the button, and the drag does *not* move the scan center. The handle only
+   sets the direction: at a small amplitude its dot is drawn further out than
+   the end of the path, so it never sits on the crosshair. Press anywhere else
+   on the view — the crosshair included — and you steer as usual. Over the dot
+   the pointer turns into a hand and the handle brightens; while you drag it
+   the dot grows.
 3. Set **Amplitude** (0–2°): the radius along the axis for the ellipse, half the
    sweep for the triangle.
 4. Shape it per mode:
@@ -149,8 +155,11 @@ cameras actually expose.
      on the way out, one on the way back. **Rising Window** and **Falling
      Window** set what part of each sweep is exposed, in milliseconds within
      that sweep. With **Sync Windows** on (the default) the falling window
-     simply copies the rising one and its slider is greyed out; turn Sync off to
-     set it separately. The frame from the return sweep is flipped upside down
+     copies the rising one's timing and its slider is greyed out; turn Sync off
+     to set it separately. Same timing means each window counts from the start
+     of its own sweep, and the return sweep starts from the far end, so a window
+     that is not centred in the sweep exposes opposite ends of the line on the
+     two frames. The frame from the return sweep is flipped upside down
      before you (or the ring reader) see it, so both frames of a cycle read the
      same way up.
 5. Press **Start Scan** (it stays disabled until the three cameras are leased —
@@ -206,6 +215,9 @@ The **Ring Reader** switch in the drawer's right column (under **Scan Frequency*
 its own worker thread, so it is only worth paying for when you are actually reading an
 emitter. It becomes available once the cameras are leased.
 
+The reader needs a closed path: on the line (**Ratio** `0`) and the **Triangle** pattern
+there is no ring to find, and it reports `no ring`.
+
 With it on, and while the scan runs, MirrorLink decodes the ring in every fovea frame —
 separately for each eye — and annotates the view:
 
@@ -224,7 +236,7 @@ on screen:
 
 | Reason | What to do |
 |---|---|
-| `no ring` | No circular track was found — the emitter is out of frame, too dim (raise **Gain**), or the scan is not running. |
+| `no ring` | No circular track was found — the emitter is out of frame, too dim (raise **Gain**), the scan is not running, or the pattern is not a closed loop (a line or the triangle). |
 | `no leader` | A ring, but no start marker: usually too dim or the emitter is not sending this format. |
 | `below resolution` | The message is too long for the ring you are drawing. Raise **Amplitude** (Scan Pattern pane), or shorten the emitter's message. |
 | `low contrast @ bit N` | The chips have blurred together at that point in the message — the dot is too big for the chip arc. Raise **Amplitude** (Scan Pattern pane), shorten the message, or improve focus. The hover shows the measured contrast. |
@@ -283,7 +295,7 @@ right fovea frames and the wide view — and opens the capture preview window, w
 `<name>.tiff` (16-bit for the foveae) beside a `<name>.json` of its metadata.
 
 The fovea images are saved exactly as the camera saw them: **not** straightened against a
-mirror position, because a frame that integrated a whole revolution has no single one. That
+mirror position, because a frame that integrated a stretch of the scan has no single one. That
 raw ring is what an offline decoder needs.
 
 The JSON carries the app's state at that moment under `mirror_link`: the scan timing (or

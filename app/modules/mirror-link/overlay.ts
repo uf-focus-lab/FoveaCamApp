@@ -80,26 +80,52 @@ export function polylinePath(
   return closed ? d + " Z" : d;
 }
 
-/** Whether the scan is a CLOSED path: the ellipse, unless its ratio collapses
- *  it to a line (spec §scan-patterns). */
-export function isClosedPath(mode: string, ratio: number): boolean {
-  return mode === "ellipse" && ratio > 0;
-}
-
-/** Axis-handle sizes as multiples of the overlay stroke: the drawn dot's
- *  radius, and the grab radius around it (spec §views). */
+/** Axis-handle sizes as multiples of the overlay stroke (spec §views): the
+ *  drawn dot's radius, the grab radius around it, and the shortest distance
+ *  from the scan center the handle is DRAWN at. The handle only sets the axis
+ *  DIRECTION, so at a small amplitude it is pushed out along the axis to
+ *  `AXIS_HANDLE_MIN_DIST` strokes — far enough that its grab zone never covers
+ *  the crosshair and its dot never hides the target dot. */
 export const AXIS_HANDLE_DOT = 3;
 export const AXIS_HANDLE_HIT = 6;
+export const AXIS_HANDLE_MIN_DIST = 15;
 
-/** Whether a press at `p` (frame px) grabs the axis handle at `handle`. A
- *  `{0,0}` handle is the uncalibrated sentinel — hidden, never hit. */
+type Px = { x: number; y: number };
+
+/**
+ * Where the axis handle is DRAWN (and hit-tested): on the ray from `target`
+ * through `handle` (`telemetry.axis_handle_px`, the +amp end of the axis), at
+ * `max(|handle − target|, AXIS_HANDLE_MIN_DIST · stroke)` from the target.
+ * Null — hidden — on the `{0,0}` uncalibrated sentinel and when the handle
+ * sits on the target (no direction to draw).
+ */
+export function axisHandleAt(
+  target: Px,
+  handle: Px,
+  stroke: number,
+): Px | null {
+  if (handle.x === 0 && handle.y === 0) return null;
+  const dx = handle.x - target.x;
+  const dy = handle.y - target.y;
+  const len = Math.hypot(dx, dy);
+  if (!(len > 1e-9) || !Number.isFinite(len)) return null;
+  const d = Math.max(len, stroke * AXIS_HANDLE_MIN_DIST);
+  return { x: target.x + (dx / len) * d, y: target.y + (dy / len) * d };
+}
+
+/** Whether a press at `p` (frame px) grabs the axis handle: within
+ *  `stroke · AXIS_HANDLE_HIT` of the DRAWN handle (`axisHandleAt`) and never
+ *  nearer the scan center than that same radius — a press on the crosshair
+ *  always steers. */
 export function hitsAxisHandle(
-  p: { x: number; y: number },
-  handle: { x: number; y: number },
+  p: Px,
+  target: Px,
+  handle: Px,
   stroke: number,
 ): boolean {
-  if (handle.x === 0 && handle.y === 0) return false;
-  return (
-    Math.hypot(p.x - handle.x, p.y - handle.y) <= stroke * AXIS_HANDLE_HIT
-  );
+  const at = axisHandleAt(target, handle, stroke);
+  if (!at) return false;
+  const r = stroke * AXIS_HANDLE_HIT;
+  if (Math.hypot(p.x - target.x, p.y - target.y) < r) return false;
+  return Math.hypot(p.x - at.x, p.y - at.y) <= r;
 }
