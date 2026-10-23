@@ -78,6 +78,13 @@ constexpr uint64_t DROP_LOG_PERIOD_US = 1'000'000;
 // ---- v2.2.0 DAC ownership ---------------------------------------------------
 Owner dacOwner = Owner::STREAMS;
 MirrorPosition driveLeft{}, driveRight{};
+// The first drive() after claim() writes unconditionally. A flag of its own,
+// NOT `refresh`: Streams::tick() runs before Trajectory::tick() in loop(), and
+// a refresh under TRAJECTORY ownership re-writes driveLeft/driveRight — until
+// the new run's first drive() that is the LAST run's position, a stale value
+// that would move the mirror for one tick before phase 0. tick() therefore
+// leaves the DAC alone while this is set (drive() honours a pending refresh).
+bool firstDrive = false;
 
 inline Keyframe &slot(uint8_t id, uint8_t index) {
   return keyframes[id][(rings[id].head + index) % SCHEDULE_DEPTH];
@@ -309,7 +316,10 @@ void tick() {
     dacOwner = Owner::STREAMS; // a fresh stream write reclaims the DAC
   if (dacOwner != Owner::STREAMS) {
     dirty = false;
-    if (refresh) {
+    // Before the run's first drive() the driven position is the previous
+    // run's: a touch() landing after claim() (1 Hz housekeeping, a MEMS
+    // recovery in the START batch) stays pending for drive() instead.
+    if (refresh && !(dacOwner == Owner::TRAJECTORY && firstDrive)) {
       writeDac(driveLeft, driveRight);
       refresh = false;
     }
@@ -380,13 +390,6 @@ uint32_t droppedFull() { return dropFull; }
 // ---- v2.2.0 DAC ownership ---------------------------------------------------
 
 Owner owner() { return dacOwner; }
-
-// The first drive() after claim() writes unconditionally. A flag of its own,
-// NOT `refresh`: Streams::tick() runs before Trajectory::tick() in loop(), and
-// a pending refresh under TRAJECTORY ownership re-writes the LAST run's drive
-// position — a stale value that would move the mirror for one tick before
-// the new run's phase 0.
-bool firstDrive = false;
 
 void claim() {
   dacOwner = Owner::TRAJECTORY;

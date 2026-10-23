@@ -290,6 +290,13 @@ HANDLE_SET(Command::Actuate) {
     reject(seq, "Cannot perform action: system is not enabled");
     return;
   }
+  // v2.2.1: a running trajectory owns the DAC — a direct write would fight
+  // its drive() (HOLD after STOP is not running: Actuate works there).
+  // spec: docs/spec/serial-protocol.md#trajectory
+  if (Trajectory::running()) {
+    reject(seq, "A trajectory owns the DAC (STOP it first)");
+    return;
+  }
   if (actuate.pending) {
     reject(seq, "An actuate request is already pending");
     return;
@@ -304,6 +311,12 @@ HANDLE_SET(Command::Actuate) {
 }
 
 HANDLE_SET(Command::Trigger) {
+  // v2.2.1: a running trajectory's markers drive the trigger lines.
+  // spec: docs/spec/serial-protocol.md#trajectory
+  if (Trajectory::running()) {
+    reject(seq, "A trajectory owns the trigger lines (STOP it first)");
+    return;
+  }
   if (trigger.pending) {
     reject(seq, "A trigger request is already pending");
     return;
