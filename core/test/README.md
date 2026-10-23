@@ -69,13 +69,13 @@ fail with no hardware attached, so the runner excludes them from `all`.
 
 ### Hardware-free — run anywhere with a built addon
 
-Everything else (00, 06–52). Three families, all self-contained:
+Everything else (00, 06–54). Three families, all self-contained:
 
 - **Fake-camera pipe/brick tests** — inject synthetic frames through the native
   `enableFakeCamera`/test-source hooks, then exercise the convert / undistort /
-  fovea / scale / stereo / heatmap / composite / raw / compress / pair bricks,
-  SHM ring, fan-out, topology, and lifecycle/teardown paths (e.g. `11`–`38`,
-  `41`).
+  fovea / scale / stereo / heatmap / composite / raw / compress / pair / flip
+  bricks, SHM ring, fan-out, topology, and lifecycle/teardown paths (e.g.
+  `11`–`38`, `41`, `54`).
 - **Pure-algorithm tests** — no camera, no serial: projection, regression, KCF,
   IMM predictor, ring payload math, bayer channel order, mcap writer, recorder
   brick, MatView zero-copy vision (`06`–`10`, `31`, `37`, `39`, `40`, `42`–`44`,
