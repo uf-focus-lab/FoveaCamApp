@@ -402,7 +402,9 @@ Teensy DMAMEM, 80 KB, first-fit), `MAX_MARKERS = 8` per table.
   trigger), so a next marker due within 5 ms of the previous marker's window end
   pushes `BUSY` too.
 - A finite run ends holding phase 0 and pushes `ENDED`. `STOP` holds the last
-  position. After either, the mirror stays put (`Owner::HOLD`, surviving the
+  position (the last DAC write: a `STOP`/`DELETE` handled in the same loop
+  iteration as its `START`, before the run's first drive, holds where the mirror
+  already was). After either, the mirror stays put (`Owner::HOLD`, surviving the
   1 Hz MEMS refresh) until the next stream write — UPDATE, an applied keyframe,
   a CREATE that takes the DAC, or a CMD_FRAME activation — takes the DAC back.
 - While a trajectory runs (armed or playing) it owns the DAC: `CMD_STREAM UPDATE`,
@@ -410,12 +412,14 @@ Teensy DMAMEM, 80 KB, first-fit), `MAX_MARKERS = 8` per table.
   (STOP it first)`; silent for seq 0), and it owns the trigger lines: the legacy
   `Command::Trigger` REJs `A trajectory owns the trigger lines (STOP it first)`.
   Both work again once the run is over (`HOLD` after STOP/ENDED is not running —
-  an Actuate there writes the DAC as usual). A host `CMD_FRAME` is still
-  accepted: it cannot re-point the DAC, so it exposes at the trajectory's
-  current position (and reports it), and any marker crossing while it is in
-  flight pushes `BUSY`. `DELETE` stops a
-  running table first; deleting a free id is a
-  no-op ACK. `System::Enable(false)` halts the run (`CANCELLED` push) and cancels
+  an Actuate there writes the DAC and becomes the hold position, which the 1 Hz
+  refresh re-commits). Conversely, `START` REJs `A trigger is pending (legacy
+  Trigger) — wait for its FIN` while a legacy `Command::Trigger` is pending: its
+  FIN would drop the trigger lines mid-way through a marker's pulse. A host
+  `CMD_FRAME` is still accepted: it cannot re-point the DAC, so it exposes at
+  the trajectory's current position (and reports it), and any marker crossing
+  while it is in flight pushes `BUSY`. `DELETE` stops a running table first;
+  deleting a free id is a no-op ACK. `System::Enable(false)` halts the run (`CANCELLED` push) and cancels
   an in-flight marker capture (`CANCELLED`); uploaded tables survive.
 - **Atomic swap (v2.2.1).** `START {id = b, t_start, cycles}` while table `a` runs
   (armed or playing) is ACCEPTED iff `b ≠ a`, `b` is committed, `b.period ==
@@ -455,6 +459,7 @@ be < period`, `Marker pulse must be > 0`, `Unsupported camera mask for a marker`
 `Trajectory incomplete: every sample index must be uploaded`, `Sample offset must
 be < period`, `Sample offsets must be strictly increasing`, `Trajectory not
 committed (COMMIT first)`, `A trajectory is already running (STOP it first)`,
+`A trigger is pending (legacy Trigger) — wait for its FIN` (START),
 `Cannot perform action: system is not enabled` (START), plus the per-op length
 checks (`Bad BEGIN length`, `Bad DATA length …`, …) and `Unknown trajectory
 operation`.

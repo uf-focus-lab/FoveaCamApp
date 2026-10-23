@@ -304,6 +304,9 @@ HANDLE_SET(Command::Actuate) {
   MEMS::set(MEMS::Device::LEFT, payload.left);
   MEMS::set(MEMS::Device::RIGHT, payload.right);
   MEMS::apply();
+  // v2.2.1: in HOLD this is the new hold position (no snap-back at the 1 Hz
+  // refresh). spec: docs/spec/serial-protocol.md#trajectory
+  Streams::noteActuate(payload.left, payload.right);
   actuate.start(seq, payload, Global::time.now() + payload.settle_time);
   auto packet = Create::ACK(seq);
   deflate(payload, packet);
@@ -479,6 +482,13 @@ void Packet::Command::Trajectory::SET(const Protocol::Sequence &seq,
     }
     if (!Global::system_enabled) {
       reject(seq, "Cannot perform action: system is not enabled");
+      return;
+    }
+    // v2.2.1: a pending legacy Trigger holds every Line3 HIGH until its FIN,
+    // which would drop them mid-way through a marker's pulse. (A swap START
+    // never sees one: Trigger is REJected while a run plays.)
+    if (trigger.pending) {
+      reject(seq, "A trigger is pending (legacy Trigger) — wait for its FIN");
       return;
     }
     const auto p = payload.as<TrajectoryStart>();

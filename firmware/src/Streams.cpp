@@ -85,6 +85,13 @@ MirrorPosition driveLeft{}, driveRight{};
 // that would move the mirror for one tick before phase 0. tick() therefore
 // leaves the DAC alone while this is set (drive() honours a pending refresh).
 bool firstDrive = false;
+// What the DAC was last written with (writeDac, or a direct Actuate via
+// noteActuate). claim() seeds driveLeft/driveRight from it, so a HOLD before
+// the run's first drive() (START and STOP/DELETE handled in one loop
+// iteration) holds the DAC's actual position. Not known after boot or a
+// disable (clear()): the enable sequence leaves every channel at V_BIAS.
+MirrorPosition dacLeft{}, dacRight{};
+bool dacKnown = false;
 
 inline Keyframe &slot(uint8_t id, uint8_t index) {
   return keyframes[id][(rings[id].head + index) % SCHEDULE_DEPTH];
@@ -119,6 +126,9 @@ void writeDac(const MirrorPosition &left, const MirrorPosition &right) {
   MEMS::set(MEMS::Device::LEFT, left);
   MEMS::set(MEMS::Device::RIGHT, right);
   MEMS::apply();
+  dacLeft = left;
+  dacRight = right;
+  dacKnown = true;
 }
 
 // Sets a stream's target (ISR-safe against Capture's snapshot) and marks the
@@ -346,6 +356,7 @@ void clear() {
   dirty = false;
   refresh = false;
   dacOwner = Owner::STREAMS;
+  dacKnown = false; // parked at V_BIAS; the next enable re-inits it there
 }
 
 // ---- v2.2.0 CMD_SCHEDULE ----------------------------------------------------
@@ -396,6 +407,14 @@ void claim() {
   dirty = false;
   refresh = false; // never re-drive the previous run's position
   firstDrive = true;
+  MirrorPosition left = dacLeft, right = dacRight;
+  if (!dacKnown)
+    for (uint8_t i = 0; i < 4; i++)
+      left.ch[i] = right.ch[i] = Global::bias_voltage;
+  noInterrupts();
+  driveLeft = left;
+  driveRight = right;
+  interrupts();
 }
 
 void drive(const MirrorPosition &left, const MirrorPosition &right) {
@@ -418,6 +437,18 @@ void release() {
     return;
   dacOwner = Owner::HOLD;
   dirty = false;
+}
+
+void noteActuate(const MirrorPosition &left, const MirrorPosition &right) {
+  dacLeft = left;
+  dacRight = right;
+  dacKnown = true;
+  if (dacOwner != Owner::HOLD)
+    return;
+  noInterrupts();
+  driveLeft = left;
+  driveRight = right;
+  interrupts();
 }
 
 } // namespace Streams

@@ -397,6 +397,7 @@ const TRAJECTORY_START_REJ_TEXTS: readonly RegExp[] = [
   /Trajectory not committed/i,
   /system is not enabled/i,
   /Bad START length/i,
+  /A trigger is pending/i, // 2.2.1: a legacy Trigger holds the lines until its FIN
   /Unknown trajectory operation/i,
   /Trajectory packet too short/i,
   /Unknown packet type/i,

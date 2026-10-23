@@ -117,12 +117,19 @@ Owner owner();
 // drive() always writes — and nothing else does: a pending touch() is dropped,
 // and one landing after claim() is left for that first drive() instead of
 // being re-committed by tick(), so the previous run's position is never
-// re-driven before phase 0).
+// re-driven before phase 0). The drive position starts as the DAC's last
+// written value, so a release() before the first drive() holds where the
+// mirror actually is.
 void claim();
 // Writes `left`/`right` to the DAC if they changed (or a touch() is pending).
 // No-op unless owner() == TRAJECTORY.
 void drive(const MirrorPosition &left, const MirrorPosition &right);
 // Trajectory STOP: TRAJECTORY -> HOLD (no-op otherwise).
 void release();
+// Command::Actuate wrote the DAC directly (never while a trajectory runs):
+// records it as the DAC's last written value and, under HOLD, makes it the
+// hold position (the 1 Hz refresh and snapshot() then use it instead of
+// snapping back to the trajectory's last position).
+void noteActuate(const MirrorPosition &left, const MirrorPosition &right);
 
 } // namespace Streams

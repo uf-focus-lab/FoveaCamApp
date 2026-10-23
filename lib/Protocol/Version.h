@@ -46,7 +46,12 @@ namespace Version {
 // already started still pushes with a's id. Any other START while running
 // still REJs "A trajectory is already running (STOP it first)". Wire layout
 // unchanged; a host that sees that REJ (older firmware) falls back to
-// STOP(a) + START(b).
+// STOP(a) + START(b). Also wire-visible in 2.2.1: while a trajectory runs
+// (armed or playing) Command::Actuate REJs "A trajectory owns the DAC (STOP it
+// first)" and the legacy Command::Trigger REJs "A trajectory owns the trigger
+// lines (STOP it first)"; a START while a legacy Trigger is pending REJs "A
+// trigger is pending (legacy Trigger) — wait for its FIN". An Actuate in HOLD
+// (after STOP/ENDED) becomes the hold position.
 constexpr uint8_t Major = 2;
 constexpr uint8_t Minor = 2;
 constexpr uint8_t Patch = 1;
