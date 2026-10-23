@@ -53,10 +53,13 @@ export type ScanTelemetry = {
    *  TriggerWidth mode) and the camera's readback frame rate limit. */
   exposure_us: { L: number; R: number };
   frame_rate: { L: number; R: number };
-  /** Set when the cameras cannot take the requested windows as asked: a
-   *  Timed clamp, unequal triangle windows in Timed mode (every marker then
-   *  carries marker 0's pulse), a trigger rate above a camera's maximum frame
-   *  rate, or two exposures closer end-to-end than the sensor readout. */
+  /** Set when the scan cannot run as asked — one of the spec's reason table
+   *  (§exposure-windows): a Timed clamp, unequal triangle windows in Timed
+   *  mode (every marker then carries marker 0's pulse), a Timed exposure
+   *  overrunning the next trigger, a trigger rate above a camera's maximum
+   *  frame rate, two exposures closer end-to-end than the sensor readout,
+   *  triangle windows too close for reliable flipping, or the controller
+   *  clock calibration lapsing mid-scan. */
   mismatch: boolean;
   /** One sentence naming WHY `mismatch` is set; null when it is not. */
   mismatch_reason: string | null;

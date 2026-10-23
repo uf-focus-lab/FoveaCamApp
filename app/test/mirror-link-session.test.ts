@@ -870,6 +870,38 @@ describe("start / stop", () => {
     ).toEqual([10_000, 120_000]);
   });
 
+  it("Timed: a falling END edit that leaves the spec identical still re-judges the windows", async () => {
+    const h = await harness({
+      state: { scan_mode: "triangle", tri_window_sync: false },
+    });
+    h.triple.leases.R.camera.modes.splice(1); // R: Timed only
+    await h.setState("tri_window_rise", [0.1, 0.5]);
+    await h.setState("tri_window_fall", [0.1, 0.5]);
+    await h.call("startScan");
+    await settle();
+    expect(h.tele.scan.exposure_mode).toBe("Timed");
+    expect(h.tele.scan.mismatch).toBe(false);
+    // Every marker carries marker 0's pulse and the falling START is unmoved,
+    // so the MCU spec does not change — no replace goes out — but the
+    // REQUESTED windows now differ: the Timed mismatch must say so.
+    await h.setState("tri_window_fall", [0.1, 0.8]);
+    await vi.advanceTimersByTimeAsync(0);
+    await settle();
+    expect(h.traj().replaced).toHaveLength(0);
+    expect(h.tele.scan.mismatch).toBe(true);
+    expect(h.tele.scan.mismatch_reason).toBe(
+      "unequal windows: Timed exposure gives both the rising window's length",
+    );
+    // ...and back to equal clears it, again without a replace.
+    perfNow += 200; // past the replace throttle
+    await h.setState("tri_window_fall", [0.1, 0.5]);
+    await vi.advanceTimersByTimeAsync(200);
+    await settle();
+    expect(h.traj().replaced).toHaveLength(0);
+    expect(h.tele.scan.mismatch).toBe(false);
+    expect(h.tele.scan.mismatch_reason).toBeNull();
+  });
+
   it("Timed: an exposure clamped past the slope runs into the next trigger → clamped + named", async () => {
     const h = await harness({
       modes: ["Timed"],

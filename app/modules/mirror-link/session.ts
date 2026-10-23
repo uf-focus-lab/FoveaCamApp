@@ -1663,7 +1663,15 @@ export default function mirrorLinkSession(
           }
         }
       }
-      if (sameSpec(built.spec, runSpec)) return;
+      if (sameSpec(built.spec, runSpec)) {
+        // Nothing for the MCU — but the REQUESTED windows may still have
+        // changed (Timed: every marker carries marker 0's pulse, so a falling
+        // END edit builds the same spec): the mismatch checks read them.
+        runRaw = built.raw;
+        runOverrun = built.overrun;
+        publishScanTelemetry();
+        return;
+      }
       const oldId = traj.id;
       const oldSpec = runSpec;
       replacing = true;
@@ -2899,6 +2907,12 @@ export default function mirrorLinkSession(
           }
           try {
             await stopScanNow();
+          } catch (e) {
+            report(
+              "mirror-link",
+              `scan stop failed on teardown: ${errorLine(e)}`,
+              "warning",
+            );
           } finally {
             await restoreGainNow();
           }

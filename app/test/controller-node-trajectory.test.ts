@@ -1315,6 +1315,31 @@ describe("NodeTrajectory.replace", () => {
       await t.close();
     });
 
+    it("a detach forgets the retired ids: a new device's reuse of one is scored as the live table", async () => {
+      const { t, h } = await runningOn();
+      h.replace.mockRejectedValueOnce(
+        Object.assign(new Error("ambiguous: table 0 (or 1) is live"), {
+          running: true,
+          replacement: { id: 1, maybeLive: true },
+        }),
+      );
+      await expect(t.replace(RESHAPED)).rejects.toThrow(/ambiguous/);
+      expect(lateness(h, 1, 0, 4_000, 51)).toBe(51); // RESHAPED, possibly live
+      // The device goes away with its tables; a new one hands id 1 out again.
+      await node!.unbindController();
+      const c2 = makeController({ port: "/dev/v22b" });
+      node!.bindController(c2 as never);
+      await t.reupload();
+      await t.start(START_NS);
+      const h2 = c2.trajectories[0]!;
+      expect(h2.id).toBe(0);
+      await t.replace(RESHAPED); // 0 -> 1 on the NEW device
+      // Scored as the live table (RESHAPED's marker 0 at 4 000 µs) — not
+      // against a stale entry from the old device.
+      expect(lateness(h2, 1, 0, 4_000, 52)).toBe(52);
+      await t.close();
+    });
+
     it("a handle without the onSwap hook: the retired id is scored from the resolve on", async () => {
       const { t, h } = await runningOn();
       h.callsOnSwap = false;

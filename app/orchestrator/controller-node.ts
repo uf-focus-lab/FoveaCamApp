@@ -1508,6 +1508,9 @@ class NodeTrajectoryImpl implements NodeTrajectory {
     this.unsubscribe = null;
     this.handle = null;
     this.owner = null;
+    // The retired tables lived on the departed device too: an id the next
+    // device hands out must never be scored against a stale spec.
+    this.retired.clear();
     this.setState("detached");
   }
 
