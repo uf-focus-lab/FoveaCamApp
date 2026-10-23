@@ -32,6 +32,7 @@ import { setHostClock } from "@orchestrator/time-align";
 import type {
   FrameOutcome,
   TrajectoryFrameOutcome,
+  TrajectoryReplaceOptions,
   TrajectorySpec,
 } from "@orchestrator/controller";
 
@@ -62,6 +63,14 @@ const SPEC: TrajectorySpec = {
 
 // --- fakes -------------------------------------------------------------------
 
+interface FakeSwapState {
+  swapKind: "atomic" | "stop-start";
+  lastSwap: unknown;
+  callsOnSwap: boolean;
+  graceUs: number;
+  gate: Promise<void> | null;
+}
+
 function makeTrajectoryHandle(id = 0) {
   const listeners = new Set<(f: TrajectoryFrameOutcome) => void>();
   // The CURRENT table id — a successful replace() swaps it (+1 here).
@@ -73,9 +82,25 @@ function makeTrajectoryHandle(id = 0) {
     /** What the next successful replace() reports as its swap kind. */
     swapKind: "atomic" as "atomic" | "stop-start",
     lastSwap: null as "atomic" | "stop-start" | null,
-    replace: vi.fn(async function (this: { swapKind: "atomic" | "stop-start"; lastSwap: unknown }, _spec: TrajectorySpec) {
+    /** Like the controller: report the swap through `opts.onSwap` (with
+     *  `graceUs` for the retired id) at the swap; false = an older handle
+     *  without the hook (the node then sees the swap only on resolve). */
+    callsOnSwap: true,
+    graceUs: 55_000,
+    /** When set, a replace() swaps first and then waits on it before
+     *  resolving (the controller's DELETE(old) still out). */
+    gate: null as Promise<void> | null,
+    replace: vi.fn(async function (
+      this: FakeSwapState,
+      _spec: TrajectorySpec,
+      opts?: TrajectoryReplaceOptions,
+    ) {
+      const from = current;
       current += 1;
       this.lastSwap = this.swapKind;
+      if (this.callsOnSwap)
+        opts?.onSwap?.({ to: current, retired: [{ id: from, graceUs: this.graceUs }] });
+      if (this.gate) await this.gate;
     }),
     start: vi.fn(async (_at?: bigint, _cycles?: number) => {}),
     stop: vi.fn(async () => {}),
@@ -785,7 +810,7 @@ describe("NodeTrajectory.replace", () => {
     stream.update.mockClear();
 
     await t.replace(RESHAPED);
-    expect(h.replace).toHaveBeenCalledWith(RESHAPED);
+    expect(h.replace).toHaveBeenCalledWith(RESHAPED, { onSwap: expect.any(Function) });
     expect(h.start).toHaveBeenCalledTimes(1); // the handle re-STARTs, not the node
     expect(h.stop).not.toHaveBeenCalled();
     expect(t.state).toBe("running");
@@ -1042,5 +1067,103 @@ describe("NodeTrajectory.replace", () => {
     expect(node.trajectorySnapshot()!.lastSwap).toBe("stop-start");
     await t.stop();
     await t.close();
+  });
+
+  describe("per-id straggler scoring", () => {
+    /** A third shape: one marker at 6 000 µs. */
+    const THIRD: TrajectorySpec = { ...RESHAPED, markers: [{ tOffsetUs: 6_000, pulseUs: 800 }] };
+    const START_NS = 2_000_000_000n;
+    /** Push `marker` of table `id` at cycle 3, `lateUs` after the phase of
+     *  `offsetUs`; returns the node's lateness reading. */
+    const lateness = (
+      h: ReturnType<typeof makeTrajectoryHandle>,
+      id: number,
+      marker: number,
+      offsetUs: number,
+      lateUs: number,
+    ) => {
+      h.push({
+        trajectoryId: id,
+        marker,
+        cycle: 3,
+        tTrigger: expectedTriggerNs(START_NS, 3, 10_000, offsetUs) + BigInt(lateUs) * 1000n,
+      });
+      return node!.trajectorySnapshot()!.lastLatenessUs;
+    };
+    async function runningOn(): Promise<{
+      t: Awaited<ReturnType<ControllerNode["openTrajectory"]>>;
+      h: ReturnType<typeof makeTrajectoryHandle>;
+    }> {
+      node = new ControllerNode();
+      const c = makeController();
+      node.bindController(c as never);
+      const t = await node.openTrajectory(SPEC, { name: "ml" });
+      await t.start(START_NS);
+      return { t, h: c.trajectories[0]! };
+    }
+
+    it("switches specs AT the swap (onSwap), before the handle's replace resolves", async () => {
+      const { t, h } = await runningOn();
+      const hold = gate();
+      h.gate = hold.promise;
+      const swapping = t.replace(RESHAPED);
+      await tick();
+      expect(h.id).toBe(1); // swapped on the controller; DELETE(old) still out
+      // The OLD table's straggler (SPEC marker 1 at 7 000 µs — RESHAPED has
+      // no marker 1) is scored against SPEC already now…
+      expect(lateness(h, 0, 1, 7_000, 11)).toBe(11);
+      // …and the NEW table against RESHAPED (marker 0 at 4 000 µs, SPEC's is
+      // at 2 000 µs).
+      expect(lateness(h, 1, 0, 4_000, 7)).toBe(7);
+      hold.release();
+      await swapping;
+      expect(lateness(h, 0, 1, 7_000, 12)).toBe(12);
+      await t.close();
+    });
+
+    it("a second swap inside the first's grace keeps one entry per retired id", async () => {
+      const { t, h } = await runningOn();
+      await t.replace(RESHAPED); // 0 -> 1
+      advance(10_000_000n); // 10 ms: id 0 still in its 55 ms grace
+      await t.replace(THIRD); // 1 -> 2
+      expect(lateness(h, 0, 1, 7_000, 21)).toBe(21); // SPEC
+      expect(lateness(h, 1, 0, 4_000, 22)).toBe(22); // RESHAPED
+      expect(lateness(h, 2, 0, 6_000, 23)).toBe(23); // THIRD (current)
+      // Past id 0's grace (55 ms from ITS swap) but inside id 1's: id 0 is
+      // no longer SPEC's; id 1 still RESHAPED's.
+      advance(50_000_000n);
+      expect(lateness(h, 0, 0, 6_000, 24)).toBe(24); // scored as the current table
+      expect(lateness(h, 1, 0, 4_000, 25)).toBe(25);
+      await t.close();
+    });
+
+    it("a handle without the onSwap hook: the retired id is scored from the resolve on", async () => {
+      const { t, h } = await runningOn();
+      h.callsOnSwap = false;
+      await t.replace(RESHAPED);
+      expect(lateness(h, 0, 1, 7_000, 31)).toBe(31);
+      expect(lateness(h, 1, 0, 4_000, 32)).toBe(32);
+      await t.close();
+    });
+
+    it("an ambiguous failed swap keeps scoring the possibly-live replacement id against ITS spec until the run ends", async () => {
+      const { t, h } = await runningOn();
+      h.replace.mockRejectedValueOnce(
+        Object.assign(new Error("ambiguous: table 0 (or 7) is live"), {
+          running: true,
+          replacement: { id: 7, maybeLive: true },
+        }),
+      );
+      await expect(t.replace(RESHAPED)).rejects.toThrow(/ambiguous/);
+      expect(t.state).toBe("running");
+      advance(1_000_000_000n); // no time limit while it may be live
+      expect(lateness(h, 7, 0, 4_000, 41)).toBe(41); // RESHAPED
+      expect(lateness(h, 0, 0, 2_000, 42)).toBe(42); // SPEC (current)
+      await t.stop(); // the run's end graces it
+      advance(100_000_000n); // past grace(RESHAPED) = 55.8 ms
+      await t.start(START_NS);
+      expect(lateness(h, 7, 0, 2_000, 43)).toBe(43); // expired: no longer RESHAPED's
+      await t.close();
+    });
   });
 });

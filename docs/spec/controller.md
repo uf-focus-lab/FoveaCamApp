@@ -131,16 +131,46 @@ stopping the scan. MirrorLink calls it on every steer drag or slider move, at mo
     `START(new, t_start, cycles)` while the old table runs. The firmware accepts it iff
     the new table is committed, has the same period, and `t_start` equals the running
     table's recorded start to the µs; it then switches tables in place, keeping the
-    phase clock and the marker crossing state (no HOLD, no missed marker, no push).
-    It is attempted only when the run's anchor is exact (`start(atHostNs)`); a "now"
-    start's estimated anchor can never match, so it goes straight to the pair.
+    phase clock and the marker crossing state (no HOLD, no push). A marker is never
+    doubled; a marker the new spec moved BEFORE the swap phase first fires next cycle.
+    It is attempted only when the run's anchor is exact: `start(atHostNs)`, or a "now"
+    start after its first STOP/START pair has been ACKed. The pair sends the carried
+    anchor explicitly, so the firmware's recorded `t_start` is that value from then on
+    (`run.exact` becomes true). Before that, a "now" start's estimated anchor can never
+    match, so its first replace goes straight to the pair.
   - **Fallback: the STOP/START pair.** On a REJ whose reason contains "already
     running" (the firmware did not take the atomic START: older semantics or a
     mismatch), and always below 2.2.1: `STOP(old)` and `START(new, t_start, cycles)`
     are written back to back, with no await between them, and both are awaited
     afterwards.
-  - Any other REJ of the atomic START stopped nothing: the new table is DELETEd and
-    `TrajectoryReplaceError` is thrown with `running: true`.
+  - **Atomic START failures: REJ versus transport.** A REJ is the firmware's answer.
+    The addon surfaces it as an `Error` carrying the firmware's reason text. A
+    host-side failure (request timeout, the 30 s sweep of an unanswered request, an
+    unexpected response, a decode error, a disconnect) carries some other message,
+    and the device MAY have applied the START. `classifyTrajectoryStartError` counts a
+    failure as a REJ only when its message is one of the firmware's START REJ texts
+    (`firmware/src/Protocol.cpp` `Trajectory::SET`, `firmware/src/Trajectory.cpp`
+    `start`, plus older firmware's unknown-packet REJ). Anything else counts as a
+    transport failure. The handle then re-STARTs the OLD table at the carried
+    `t_start` and `cycles`. That re-START is safe whichever table plays: if the new
+    one took over, it is itself an atomic swap back (same period, same anchor). If
+    neither plays, it joins the run in progress. If the old one still plays, the
+    firmware REJects it "already running".
+
+    | atomic `START(new)` | re-`START(old)` | outcome | `TrajectoryReplaceError` |
+    |---|---|---|---|
+    | ACK | — | swapped (`lastSwap = "atomic"`), `DELETE(old)` | — |
+    | REJ "already running" | — | STOP/START pair (below) | per the pair |
+    | any other REJ | — | nothing stopped; `DELETE(new)` and unroute it at once | `running: true` |
+    | no REJ (transport) | ACK | the old table runs, phase-continuously. Serial order puts the lost `START(new)` before the re-START, so the new table is not live. It may have played briefly: its id is graced, then DELETEd | `running: true`, `replacement: { id, maybeLive: false }` |
+    | no REJ (transport) | REJ "already running" | AMBIGUOUS: the old table (or, if `START(new)` is still pending on the device, soon the new one) is live. Nothing is queried and nothing is DELETEd. Both ids stay routed to the listener set; the new id stays reserved as a *sibling* with no grace deadline | `running: true`, `replacement: { id, maybeLive: true }` |
+    | no REJ (transport) | fails otherwise | the run is over: best-effort `STOP(old)` and `DELETE(new)` (a DELETE halts a playing table), new id graced | `running: false` |
+
+    A sibling is retired by the handle's next running swap. The atomic START works
+    whichever of the two tables plays; the pair also STOPs each sibling. A plain
+    re-upload retires it too. `stop()` STOPs the current table and every sibling;
+    each sibling whose STOP is ACKed is graced and DELETEd. `dispose()` graces and
+    DELETEs them.
   - `DELETE(old)` follows either way, best-effort. The handle's `id` getter then reads
     the new id, and `lastSwap` (`"atomic"` | `"stop-start"`, null before the first
     running swap; a plain re-upload leaves it) says which path landed. The listener
@@ -164,8 +194,18 @@ stopping the scan. MirrorLink calls it on every steer drag or slider move, at mo
   - `dispose()` honors the grace too. The disposed handle's (now empty) listener set
     keeps the id for the grace, so a straggler reaches nobody, and in particular not
     the id's next owner.
-  - The node scores a retired table's straggler (OK pushes from the old id inside
-    its grace) against the retired spec, not the new one.
+  - **Per-id scoring in the node.** The node scores each OK push against the spec of
+    the table that pushed it. It keeps one entry per retired id, so a second swap
+    inside the first one's grace keeps both, each with its own deadline. The entries
+    are set AT the swap: `TrajectoryHandle.replace(spec, { onSwap })` calls `onSwap`
+    synchronously when the swap lands, with each retired id and the grace the
+    controller applied. That is before `DELETE(old)` goes out and before `replace`
+    resolves, so pushes in that window already score correctly. From that instant the
+    new id scores against the new spec. Before it, any other id is the new table and
+    scores against the in-flight spec. A handle without the hook is seen at resolve
+    instead. A `TrajectoryReplaceError` with a `replacement` keeps that id scored
+    against the replacement spec: for its grace, or, while it `maybeLive`, until the
+    run ends.
 - **Phase carry.** `t_start` and `cycles` are the run's original values. The firmware
   joins a past `t_start` in progress, so the mirror continues at the phase the old
   table was at. For `start(atHostNs)` that is the exact MCU value sent. A "now" start
@@ -176,9 +216,19 @@ stopping the scan. MirrorLink calls it on every steer drag or slider move, at mo
   freed. The old table keeps running and the error is rethrown. If `START(new)` of
   the pair is REJected after `STOP(old)` succeeded, the handle re-STARTs the old table
   at the same `t_start` and throws `TrajectoryReplaceError`. When that restart fails too, the
-  error has `running: false`, and the node ends the run: inputs re-take the DAC.
-- **Concurrency.** The controller handle allows one replace at a time; `start`,
-  `stop` and `dispose` wait for an in-flight one. The node COALESCES: calls made while
+  error has `running: false`, and the node ends the run: inputs re-take the DAC. When
+  `START(new)` of the pair failed without a REJ, the new table may have started, so
+  its id is graced before the DELETE instead of being unrouted at once. The atomic
+  START's failures follow the decision table above.
+- **Concurrency.** On the controller handle, `start`, `stop` and `replace` run one at a
+  time, in call order, on one chain. A replace issued while a `start()` still awaits
+  its START ACK runs after it and sees the run, so it swaps the RUNNING table. Before,
+  it took the not-running path and DELETEd the table being started. A `stop()`
+  issued during a replace goes out after the swap. Only one replace may be queued or
+  running per handle; a second call throws. `dispose()` marks the handle disposed and
+  waits for the chain, and the ops still queued then refuse ("disposed"), so a replace
+  queued before a dispose never uploads. The node-level `start()` → immediate
+  `replace()` ordering is therefore safe. The node COALESCES: calls made while
   a swap is in flight collapse into one pending batch. The latest spec wins and is sent
   once the in-flight swap lands; intermediate specs are never uploaded, and every
   caller in the batch settles with that one swap. `stop()` waits for the in-flight swap
@@ -382,6 +432,10 @@ the sync on connect and stops it on disconnect:
   one) and swaps the offset in with `setClockOffsetNs`. The swap is atomic for outcomes
   decoded after it; FIN and push timestamps already surfaced keep the offset they were
   decoded with. A run anchor already sent to the MCU (`t_start`, MCU µs) is unaffected.
+- **`Controller.clockOffsetNs`** is a read-only getter for the installed offset (host
+  ns at MCU µs 0, `0n` before calibration). A consumer that holds a host-ns view of an
+  MCU-anchored instant, such as MirrorLink's scan start for lateness, re-bases it by
+  the difference after a re-ping. Pushes decoded after the swap use the new offset.
 - **`Controller.clockCalibrated`** is true once a round landed. It turns false again
   after TWO consecutive missed rounds (timed out or failed; `noteClockPingMissed`).
   The last offset stays installed but is no longer vouched for. The next landed round
