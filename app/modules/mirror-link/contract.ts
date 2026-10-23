@@ -64,7 +64,8 @@ export type ScanTelemetry = {
 /** Scan pattern family (spec §scan-patterns). */
 export type ScanMode = "ellipse" | "triangle";
 
-/** A fraction-of-slope exposure window `[start, end]`, 0..1, start < end. */
+/** A fraction-of-slope exposure window `[start, end]`: `0 <= start < end <=
+ *  WINDOW_MAX` (0.95, scan.ts) with `end - start >= WINDOW_MIN`. */
 export type ScanWindow = [number, number];
 
 /** Trajectory + flip bookkeeping while the scan runs (spec §actuation). */
@@ -172,7 +173,7 @@ export const mirrorLink = defineContract({
     target: { x: 0, y: 0 } as Point2d, // scan center, wide px
     target_angle: { x: 0, y: 0 } as Point2d, // ...and in radians (angular)
     /** The commanded pose: the mirrors' idle pose, and while scanning the
-     *  ring's CENTER — the PosView crosshair stays put instead of flickering at
+     *  scan path's CENTER — the PosView crosshair stays put instead of flickering at
      *  the telemetry throttle (spec §views). */
     volt: { L: { x: 0, y: 0 }, R: { x: 0, y: 0 } } as { L: Pos; R: Pos },
     /** The commanded scan PATH in VOLT space, one polyline per eye
