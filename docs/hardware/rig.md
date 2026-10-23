@@ -174,42 +174,66 @@ connect, and v2-only surfaces are gated on `v2Capable`.
 ## MirrorLink scan pass
 
 Hardware-gated checks for the `mirror-link` app (spec
-`docs/spec/mirror-link.md` §rig) — all need the full rig:
+`docs/spec/mirror-link.md` §rig) — all need the full rig.
 
-- **Ring radius vs. amplitude across frequency.** With a point source in
-  view, scan at 5 / 20 / 50 / 100 Hz at a fixed `scan_amp` and measure the
-  REALIZED ring radius in each fovea frame. The commanded circle is exact; the
-  mirror's own low-pass response attenuates the realized radius as frequency
-  rises. Record the roll-off curve — it is the usable-frequency budget.
-- **Exposure readback equals the period.** On both foveas, read back the live
-  exposure while scanning and confirm it matches `1e6 / hz` µs (the `scan`
-  telemetry's `mismatch` flag must stay clear). A camera whose max frame rate is
-  below `hz` should show its max rate with `exposure = period`.
+The scan runs on the MCU as an uploaded trajectory (firmware ≥ 2.2.0) whose
+markers trigger both foveas; the trigger pulse IS the exposure window
+(`ExposureMode = TriggerWidth`). Start needs a calibrated controller clock
+(`scan_blocked` says "controller clock not calibrated yet" until the first
+offset ping lands). The checks:
+
+- **Path vs. amplitude across frequency.** With a point source in view, run
+  the ellipse at ratio 1 at 5 / 20 / 50 / 100 Hz at a fixed `scan_amp` and
+  measure the REALIZED radius in each fovea frame. The commanded path is exact
+  (every sample through the calibration chain); the mirror's own low-pass
+  response attenuates the realized radius as frequency rises. Record the
+  roll-off curve — it is the usable-frequency budget. Repeat one frequency in
+  the triangle: the realized sweep length is the same budget for a line.
+- **Ratio 0 and the axis drag.** Set Ratio to 0 (its detent): the ellipse
+  collapses to a line through the center along the axis. Drag the axis handle
+  on the center view through a half turn while scanning: the line (or, at any
+  other ratio, the ellipse) turns about the center and the drawn
+  `scan_path_px` stays on top of the realized trace.
+- **Trigger rate vs. the camera's maximum frame rate.** Note each fovea's
+  maximum frame rate (Manage Cameras). Each camera triggers once per sweep T,
+  i.e. at `scan_hz` in both patterns. Above that maximum the `scan` telemetry
+  shows `mismatch` with "trigger rate above the camera's maximum frame rate",
+  and BUSY pushes / missing frames must agree with it; at or below it
+  `pushes.busy` stays at 0.
+- **Exposure window on a scope vs. the marker pulse.** Scope the trigger
+  (Line3) and the strobe (Line2, ExposureActive) of one fovea while scanning.
+  In TriggerWidth the strobe width must equal each marker's `pulse_us` and
+  start `t_offset_us` into the period (`scan.windows`); move the window
+  sliders and watch both follow without a missed trigger. A model without
+  TriggerWidth falls back to Timed: both triangle markers then carry the same
+  pulse and `mismatch_reason` names unequal windows.
+- **Both triangle frames.** In the triangle, rising and falling frames
+  alternate, two per 2T period. With a vertical scan axis (90°) the falling
+  frame arrives on the views VERTICALLY flipped so it reads like the rising
+  one (at other axes the vertical flip is not the exact reversal — expected).
+  `perf.trajectory.unmatched` must stay near zero, and note
+  `perf.trajectory.skew_us` per eye: near 0 means the camera stamps frames at
+  the edge the brick matched, near ±pulse the other edge — record which one;
+  anything else is a clock-alignment problem. Squeeze the two windows together
+  at a high `scan_hz` until `mismatch_reason` reads "exposure windows too close
+  for reliable flipping at this frequency"; the scan keeps running.
+- **Replace continuity.** While scanning a point source, drag steer, the
+  amplitude, the ratio and the axis continuously for a minute. The path must
+  move without a visible stutter or a gap, `pushes.timeout`/`busy` must not
+  jump, and `perf.trajectory.reuploads` climbs at ≤ 10/s. `last_swap` reads
+  `atomic` on firmware 2.2.1 (the swap keeps the phase clock and the marker
+  state) and `stop-start` on 2.2.0 (a brief HOLD per swap is acceptable there).
+  A `scan_hz` or mode change restarts the run instead (a short pause).
 - **Restore leaves Manage Cameras byte-identical.** Note each fovea's exposure /
-  frame rate / frame-rate-enable / auto-exposure AND gain / auto-gain before
-  scanning; stop the scan (and separately, leave the app mid-scan with the Gain
-  slider moved) and confirm every value came back unchanged. Gain is
-  session-wide, so its restore is only exercised on leaving the app.
-- **Chord test — the scan must survive a camera write.** With the scan running
-  on a point source, drag the **Gain** slider through its whole range and change
-  `scan_hz` (which rewrites both foveas' exposure). The ring must stay CLOSED —
-  a straight chord across it means a camera write is still stalling the
-  generator. `telemetry.perf.orbit.rateHz` must hold at ~1 kHz with
-  `orbit.native` true throughout, even while `perf.tickGapMs.max` spikes (that
-  spike is the JS loop, which no longer drives the mirrors).
-- **Hexagon test — pose density over time.** Scan a point source at 10 Hz for
-  5 minutes and watch the shape AND the **Status** line's `· <n>/s` suffix. The
-  ring must stay round: a rotating hexagon/polygon means the mirror sink's AIMD
-  governor has backed off (6 vertices ⇒ ~60 poses/s). Confirm
-  `telemetry.perf.orbit.governor.state` stays `steady` at
-  `effectiveRateHz` ≈ 1000 and `backoffs` does not climb; a `backoff` state with
-  rising `softFails`/`outq` is a genuine link problem, a `backoff` with both at
-  zero means the policy (floor 500 Hz, RTT inflation 8×) needs another look.
-  Also compare `emitHz` vs `sinkHz` — if BOTH are low the generator thread is
-  being starved (macOS timer coalescing), not the link.
-- **Dashed-ring readout.** Point at a blinker of KNOWN frequency and confirm the
-  on/off pattern along the ring matches it (count the dashes per revolution
-  against `blink_hz / scan_hz`).
+  exposure mode / trigger activation / trigger overlap / frame rate /
+  frame-rate-enable / auto-exposure AND gain / auto-gain before scanning; stop
+  the scan (and separately, leave the app mid-scan with the Gain slider moved)
+  and confirm every value came back unchanged. Leaving mid-scan must also
+  return the mirrors to the center pose. Gain is session-wide, so its restore
+  is only exercised on leaving the app.
+- **Dashed readout.** Point at a blinker of KNOWN frequency and confirm the
+  on/off pattern along the exposed stretch matches it (count the dashes per
+  window against `blink_hz × pulse_us / 1e6`), in both patterns.
 - **Auto vergence convergence.** With the scan STOPPED and a textured target in
   both fovea views, press Auto Vergence: the status must reach `tracking` and
   Verge Distance / Vertical Shift must settle within a second or two (the same
