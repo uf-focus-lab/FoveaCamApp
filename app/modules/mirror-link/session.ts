@@ -828,10 +828,6 @@ export default function mirrorLinkSession(
         }
         pushes.ok++;
         lastOkMs = now();
-        if (stalled) {
-          stalled = false;
-          publishPerf();
-        }
         if (m && spec) {
           rebaseRunStart();
           latenessUs =
@@ -844,6 +840,12 @@ export default function mirrorLinkSession(
                   m.tOffsetUs,
                 ),
             ) / 1000;
+        }
+        // The stall clears at once (not at the throttle) — AFTER the lateness
+        // update, so the republish carries this push's figure.
+        if (stalled) {
+          stalled = false;
+          publishPerf();
         }
         return;
       }
