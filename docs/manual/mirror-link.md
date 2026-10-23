@@ -30,7 +30,7 @@ Three live columns sit across the top:
   commanded to follow, with the crosshair on the path's center.
 - **Center Wide** (orange) — the wide view you steer on. It carries a crosshair
   at the scan center with its angle in degrees, the scan path with its exposed
-  stretches drawn thicker, the **axis handle** (a short spoke from the center
+  stretches drawn thicker, the **axis handle** (a spoke from the scan center
   ending in a dot), and a small cyan and greenyellow circle showing where each
   fovea is currently aimed. Below it sit the **Start Scan** button and the scan
   status readout, then the **Ring View** selector and its two decoder strips
@@ -132,14 +132,17 @@ cameras actually expose.
    straight line) or **Triangle** (a straight sweep out and back).
 2. Point the scan's main axis. Either drag the **Axis** slider (degrees, `0` is
    the wide view's horizontal), or press on the **axis handle** — the dot at the
-   end of the short spoke from the scan center — and drag it around on the
+   end of the spoke from the scan center — and drag it around on the
    **Center Wide** view: the axis follows the pointer for as long as you hold
    the button, and the drag does *not* move the scan center. The handle only
    sets the direction: at a small amplitude its dot is drawn further out than
    the end of the path, so it never sits on the crosshair. Press anywhere else
    on the view — the crosshair included — and you steer as usual. Over the dot
    the pointer turns into a hand and the handle brightens; while you drag it
-   the dot grows.
+   the dot grows. While **Auto Vergence** holds a pan the scan center sits a
+   little off the crosshair, and the spoke starts from the scan center, where
+   the path really is. A handle pushed off the edge of the frame cannot be
+   grabbed; use the **Axis** slider then.
 3. Set **Amplitude** (0–2°): the radius along the axis for the ellipse, half the
    sweep for the triangle.
 4. Shape it per mode:
@@ -161,7 +164,10 @@ cameras actually expose.
      that is not centred in the sweep exposes opposite ends of the line on the
      two frames. The frame from the return sweep is flipped upside down
      before you (or the ring reader) see it, so both frames of a cycle read the
-     same way up.
+     same way up. On a camera that falls back to a timed exposure (see *What
+     the exposure override does*) the **Falling Window** readout ends in
+     `(timed: rising length)`: both frames then expose for as long as the
+     rising window, whatever the falling slider's end says.
 5. Press **Start Scan** (it stays disabled until the three cameras are leased —
    hover the row to see what it is waiting for). The path goes solid and the
    status line next to the button — repeated in the drawer's **Status** row —
@@ -199,14 +205,27 @@ leave the app.
 
 A camera model that cannot take the trigger's length as its exposure falls back
 to a fixed exposure as long as the first window; the status line then ends in
-`· timed`. In triangle mode with unequal windows that fallback cannot honor both,
-so the status line turns amber. It also turns amber when the cameras stop
-answering the trigger, or when an exposure cannot be applied as asked — hover it
-for the detail; hover it while idle to see what the current settings would run.
+`· timed`. The status line turns amber when the cameras stop answering the
+trigger, or when the scan cannot run exactly as set — its hover starts with
+*Exposure mismatch —* and names why. Hover it while idle to see what the
+current settings would run.
 
-If **Start Scan** is refused (no cameras leased, firmware too old, or a camera
-rejected the settings) the status line reads *idle — refused* and its hover
-carries the reason.
+| Amber reason | What it means, what to do |
+|---|---|
+| trigger rate above the camera's maximum frame rate | The cameras cannot take frames that fast — lower **Scan Frequency**. |
+| exposures closer than the sensor readout | One exposure starts before the sensor has finished reading out the previous frame — in triangle mode move the two windows' ends apart (more time from one window's end to the next one's start), or lower **Scan Frequency**. |
+| exposure windows too close for reliable flipping at this frequency | The two triangle frames are too close together in time to tell apart which one to flip — widen the spacing between the windows, or lower **Scan Frequency**. |
+| unequal windows: Timed exposure uses the rising window for both | On a timed-fallback camera with **Sync Windows** off, the camera takes the rising window's length for both frames; set the windows equal (or turn Sync on) if that is not what you want. |
+| Timed exposure clamped to the camera's exposure range | On a timed-fallback camera the window is longer or shorter than the camera can expose — change the window's length. |
+| the controller clock lapsed | The controller's clock link stopped answering mid-scan, so the frames can no longer be timed against the path — check the controller's connection. |
+
+If **Start Scan** is refused the status line reads *idle — refused* and its
+hover carries the reason: no cameras leased; no controller connected; the
+controller firmware is too old; the controller clock is not calibrated yet —
+wait a moment and press again; a camera rejected the settings (*exposure
+override failed*); or the controller could not start the pattern
+(*trajectory start failed*). If the controller ends the run itself, or
+disconnects, the scan stops and the hover says so.
 
 ### Reading the emitter
 
@@ -308,8 +327,7 @@ be re-analyzed later with everything the reader saw attached to it.
 
 The title-bar record button (or `Cmd/Ctrl-R`) writes the raw left, center, and
 right streams to a `.fcap` file, exactly as in the other apps — see
-[Recording and Capture](./recording-and-capture.md). Still capture is not offered
-here: a scanned frame has no single mirror position to attach to a still. You
+[Recording and Capture](./recording-and-capture.md). You
 cannot switch away from MirrorLink while a recording is running; stop it first.
 
 ## Related
