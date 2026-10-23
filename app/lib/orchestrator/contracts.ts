@@ -251,6 +251,9 @@ export type TrajectoryStat = {
   latenessExact: boolean;
   /** Position-input pushes held locally while the trajectory owned the DAC. */
   heldPushes: number;
+  /** Successful `replace()` swaps since open (phase-continuous re-shapes
+   *  while running, plain re-uploads from `ready`). */
+  reuploads: number;
 };
 
 export const controller = defineContract({
