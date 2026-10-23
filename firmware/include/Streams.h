@@ -52,6 +52,9 @@ void snapshot(MirrorPosition &left, MirrorPosition &right);
 // live targets. No-op when no stream is active. While a trajectory owns (or
 // holds) the DAC, re-commits the driven position instead.
 void touch();
+// A MEMS re-init parked the DAC at V_BIAS: forget the last-written record
+// (claim() seeds V_BIAS until the next write). Call BEFORE touch().
+void noteReinit();
 
 // Call every loop() tick, BEFORE tick(): periodic config re-assertion. While
 // the system is enabled,

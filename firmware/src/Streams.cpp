@@ -278,6 +278,13 @@ void snapshot(MirrorPosition &left, MirrorPosition &right) {
   right = table[activeId].right;
 }
 
+void noteReinit() {
+  // MEMS::enable() ran (recovery): every channel is parked at V_BIAS again, so
+  // the last-written record no longer describes the DAC. claim() then seeds
+  // V_BIAS until the next write.
+  dacKnown = false;
+}
+
 void touch() {
   // Force the DAC's current owner to be re-committed on the next tick(), even
   // if nothing changed. Used after a MEMS re-init (Protocol.cpp MEMS

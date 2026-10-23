@@ -175,6 +175,7 @@ HANDLE_SET(System::Reset) {
     }
     VERB("MEMS recovery requested");
     MEMS::enable();
+    Streams::noteReinit();
     Streams::touch();
     deflate(payload, packet);
     send(packet);
