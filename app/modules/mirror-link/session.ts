@@ -125,6 +125,7 @@ import {
 import { RECT, VEC } from "@lib/util/geometry";
 import type { TemplateMatchValues } from "@orchestrator/template-match-kernel";
 import { hostNowNs } from "@orchestrator/time-align";
+import { trajectoryGraceUs } from "@orchestrator/trajectory-grace";
 import { PID, PID2D } from "@lib/pid";
 import { deg } from "@lib/util/math";
 import { RollingStats } from "@lib/util/rolling";
@@ -140,9 +141,11 @@ import {
 
 import {
   activeWindows,
+  AXIS_HANDLE_MIN_DEG,
   axisDegFromPixelRay,
   axisHandleOffset,
   clampWindow,
+  flipEdges,
   flipToleranceUs,
   minExposureEndSpacingUs,
   normalizeAxisDeg,
@@ -155,6 +158,7 @@ import {
   SCAN_RATIO_RANGE,
   scanAngles,
   sweepUs,
+  timedWindowMarkers,
   WINDOW_MAX,
   windowMarkers,
   windowPaths,
@@ -163,8 +167,12 @@ import {
 import {
   applyTriggeredTiming,
   exposureMismatch,
+  readoutSpacingUs,
+  readTimingLimits,
   restoreTiming,
   snapshotTiming,
+  UNKNOWN_LIMITS,
+  type TimingLimits,
   type TimingSnapshot,
   type TriggeredTiming,
 } from "./exposure";
@@ -222,10 +230,12 @@ const FLIP_WINDOW_MIN_FRAMES = 8;
 /** Reasons `ScanTelemetry.mismatch_reason` names (spec §exposure-windows). */
 const MISMATCH = {
   timedClamp: "Timed exposure clamped to the camera's exposure range",
-  timedUnequal: "unequal windows: Timed exposure uses the rising window for both",
+  timedUnequal: "unequal windows: Timed exposure gives both the rising window's length",
+  timedOverrun: "Timed exposure would run into the next trigger",
   rate: "trigger rate above the camera's maximum frame rate",
   readout: "exposures closer than the sensor readout",
   flip: "exposure windows too close for reliable flipping at this frequency",
+  clockLapsed: "controller clock calibration lapsed",
 } as const;
 
 /** A start / restart cancelled before its START went out (a stop or teardown
@@ -395,13 +405,14 @@ export default function mirrorLinkSession(
         s.telemetry({
           scan_path: { L: [], R: [] },
           scan_path_px: [],
+          scan_path_closed: false,
           scan_window_px: [],
+          scan_center_px: { x: 0, y: 0 },
           axis_handle_px: { x: 0, y: 0 },
         });
         return;
       }
       const mode = scanMode();
-      const hz = clampHz(s.state.scan_hz);
       const g = patternParams();
       const path = patternPath(mode, g.axis, g.amp, g.ratio, SCAN_PATH_SAMPLES);
       const L: Pos[] = [];
@@ -416,27 +427,53 @@ export default function mirrorLinkSession(
       }
       let pathPx: Point2d[] = [];
       let windowPx: Point2d[][] = [];
+      let centerPx: Point2d = { x: 0, y: 0 };
       let handlePx: Point2d = { x: 0, y: 0 };
       if (t.undistort) {
         const c = scanCenterAngle();
         const px = (o: Point2d): Point2d =>
           t.conv.A2P.C({ x: c.x + o.x, y: c.y + o.y }, false);
         pathPx = path.offsets.map(px);
-        // What the cameras expose: the Timed fallback stretches every window
-        // to marker 0's pulse, so the drawn windows say so too.
-        const markers = scanMarkers(mode, hz).markers;
-        windowPx = windowPaths(mode, hz, g.axis, g.amp, g.ratio, markers, SCAN_PATH_SAMPLES).map(
-          (seg) => seg.map(px),
-        );
-        handlePx = px(axisHandleOffset(g.axis, g.amp));
+        windowPx = appliedWindowPx(px);
+        centerPx = px({ x: 0, y: 0 });
+        // At max(amp, ε): the handle encodes the axis even at amplitude 0.
+        handlePx = px(axisHandleOffset(g.axis, Math.max(g.amp, AXIS_HANDLE_MIN_DEG)));
       }
+      // ONE patch: the path, its closing rule and its center travel together,
+      // so the renderer never pairs a new path with an old rule.
       s.telemetry({
         scan_path: { L, R },
         scan_path_px: pathPx,
+        scan_path_closed: path.closed,
         scan_window_px: windowPx,
+        scan_center_px: centerPx,
         axis_handle_px: handlePx,
       });
       scheduleReplace();
+    }
+
+    /** The exposed stretches in wide px through `px`: what the cameras
+     *  expose — the Timed fallback gives every window marker 0's pulse, kept
+     *  inside its slope (clamped), so the drawn windows are the APPLIED ones. */
+    function appliedWindowPx(px: (o: Point2d) => Point2d): Point2d[][] {
+      const mode = scanMode();
+      const hz = clampHz(s.state.scan_hz);
+      const g = patternParams();
+      const markers = scanMarkers(mode, hz).markers;
+      return windowPaths(mode, hz, g.axis, g.amp, g.ratio, markers, SCAN_PATH_SAMPLES).map((seg) =>
+        seg.map(px),
+      );
+    }
+
+    /** The applied Timed exposure moved (arm, retime, disarm) without a
+     *  geometry input: republish the drawn windows alone. */
+    function publishAppliedWindows(): void {
+      const t = triple;
+      if (!t?.undistort) return;
+      const c = scanCenterAngle();
+      s.telemetry({
+        scan_window_px: appliedWindowPx((o) => t.conv.A2P.C({ x: c.x + o.x, y: c.y + o.y }, false)),
+      });
     }
 
     function setTargetFromPixel(px: Point2d): void {
@@ -490,8 +527,15 @@ export default function mirrorLinkSession(
 
     /** A built pattern: the spec the MCU runs, plus the markers as the WINDOWS
      *  ask for them (`raw`) — they differ only in the Timed fallback, where
-     *  every marker carries marker 0's applied exposure. */
-    type BuiltScan = { mode: ScanMode; hz: number; spec: TrajectorySpec; raw: WindowMarker[] };
+     *  every marker carries marker 0's applied exposure, kept inside its
+     *  slope (`overrun`: it still ran into the next trigger and was clamped). */
+    type BuiltScan = {
+      mode: ScanMode;
+      hz: number;
+      spec: TrajectorySpec;
+      raw: WindowMarker[];
+      overrun: boolean;
+    };
 
     let trajectory: NodeTrajectory | null = null;
     let trajectoryUnsubs: Array<() => void> = [];
@@ -499,10 +543,15 @@ export default function mirrorLinkSession(
      *  and the window markers it was built from. */
     let runSpec: TrajectorySpec | null = null;
     let runRaw: WindowMarker[] = [];
+    /** The run's Timed markers overran the next trigger (a mismatch). */
+    let runOverrun = false;
     let runMode: ScanMode = "ellipse";
     let runHz = 0;
     /** The run's EXPLICIT host-steady start instant — lateness is exact
-     *  against it, and `replace` carries it (the phase continues). */
+     *  against it, and `replace` carries it (the phase continues). Host ns:
+     *  the controller exposes no MCU↔host offset getter, so a 30 s re-ping
+     *  that moves the offset steps `lateness_us` by the offset change
+     *  (documented, spec §actuation); the MCU's own phase is unaffected. */
     let runStartNs = 0n;
     /** ...and the same instant on `now()`'s clock, for the watchdogs. */
     let runStartMs = 0;
@@ -514,21 +563,37 @@ export default function mirrorLinkSession(
     let pendingSpec: TrajectorySpec | null = null;
     /** MCU table id → the spec it runs, for THIS run: a push is scored (and
      *  its anchor's pulse taken) against the table that produced it, also
-     *  for the old table's late pushes in the swap grace (spec §actuation). */
-    const specById = new Map<number, TrajectorySpec>();
+     *  for the old table's late pushes in the swap grace (spec §actuation).
+     *  A retired table's entry carries `untilNs` — the controller's grace
+     *  rule (`trajectoryGraceUs`) from the swap on; past it the id may be
+     *  ALLOCATED AGAIN (ids alternate), so an expired entry is ignored and a
+     *  push from the reallocated id resolves to the in-flight spec. The live
+     *  table's entry has `untilNs = null`. */
+    const specById = new Map<number, { spec: TrajectorySpec; untilNs: bigint | null }>();
 
-    function rememberSpec(traj: NodeTrajectory, spec: TrajectorySpec): void {
-      const id = traj.id;
+    const specLive = (e: { untilNs: bigint | null }, at: bigint): boolean =>
+      e.untilNs === null || at <= e.untilNs;
+
+    /** `id` now runs `spec` (a start, or the new table of a swap). */
+    function rememberSpec(id: number | null | undefined, spec: TrajectorySpec): void {
       if (id === null || id === undefined) return;
-      specById.delete(id);
-      specById.set(id, spec);
-      // Only the last few tables can still push (the replace grace is short).
-      while (specById.size > 4) specById.delete(specById.keys().next().value!);
+      const at = hostNowNs();
+      for (const [k, e] of specById) if (!specLive(e, at)) specById.delete(k);
+      specById.set(id, { spec, untilNs: null });
+    }
+
+    /** A swap landed: the OLD table's entry stays valid for its grace only. */
+    function retireSpec(id: number | null | undefined, spec: TrajectorySpec): void {
+      if (id === null || id === undefined) return;
+      const e = specById.get(id);
+      if (e) e.untilNs = hostNowNs() + BigInt(trajectoryGraceUs(spec)) * 1000n;
     }
 
     /** The spec that produced push `f` (see {@link specById}). */
     function specFor(f: TrajectoryFrameOutcome): TrajectorySpec | null {
-      return specById.get(f.trajectoryId) ?? (replacing && pendingSpec ? pendingSpec : runSpec);
+      const e = specById.get(f.trajectoryId);
+      if (e && specLive(e, hostNowNs())) return e.spec;
+      return replacing && pendingSpec ? pendingSpec : runSpec;
     }
 
     /** The Timed fallback's ONE exposure (µs), the pulse every marker then
@@ -543,17 +608,19 @@ export default function mirrorLinkSession(
     }
 
     /** The trigger markers for the current windows: `raw` as the windows ask,
-     *  `markers` as the MCU runs them (equal Timed pulses). */
+     *  `markers` as the MCU runs them (Timed: equal pulses, each kept inside
+     *  its slope — scan.ts `timedWindowMarkers`). `timedPulse` overrides the
+     *  applied Timed exposure (a growing retime swaps the table FIRST, with
+     *  the exposure the camera is about to take). */
     function scanMarkers(
       mode: ScanMode,
       hz: number,
-    ): { raw: WindowMarker[]; markers: WindowMarker[] } {
+      timedPulse: number | null = timedPulseUs(),
+    ): { raw: WindowMarker[]; markers: WindowMarker[]; overrun: boolean } {
       const raw = windowMarkers(mode, hz, activeWindows(mode, s.state));
-      const timed = timedPulseUs();
-      return {
-        raw,
-        markers: timed === null ? raw : raw.map((m) => ({ tOffsetUs: m.tOffsetUs, pulseUs: timed })),
-      };
+      if (timedPulse === null) return { raw, markers: raw, overrun: false };
+      const t = timedWindowMarkers(mode, hz, raw, timedPulse);
+      return { raw, markers: t.markers, overrun: t.overrun };
     }
 
     /**
@@ -564,7 +631,7 @@ export default function mirrorLinkSession(
      * linear interpolation between samples (wrapping last → first) is what
      * turns the triangle's two samples into the sweep.
      */
-    function buildScan(): BuiltScan {
+    function buildScan(timedPulse?: number): BuiltScan {
       const mode = scanMode();
       const hz = clampHz(s.state.scan_hz);
       const g = patternParams();
@@ -574,11 +641,13 @@ export default function mirrorLinkSession(
           return { tOffsetUs, left: clampVolt(v.l), right: clampVolt(v.r) };
         },
       );
-      const { raw, markers } = scanMarkers(mode, hz);
+      const { raw, markers, overrun } =
+        timedPulse === undefined ? scanMarkers(mode, hz) : scanMarkers(mode, hz, timedPulse);
       return {
         mode,
         hz,
         raw,
+        overrun,
         spec: {
           periodUs: patternPeriodUs(mode, hz),
           samples,
@@ -706,7 +775,20 @@ export default function mirrorLinkSession(
       void queueScanOp(() => abortScanNow(runEndReason(state), traj));
     }
 
+    /** The controller clock's calibration lapsed mid-scan (two missed 30 s
+     *  re-pings): every timestamp the scan scores rides that offset, so it is
+     *  a `mismatch_reason` — not a stop (the MCU's own phase is unaffected).
+     *  Re-evaluated at the telemetry throttle; republished on a change. */
+    let clockLapsed = false;
+    function watchClock(): void {
+      const lapsed = activeController()?.clockCalibrated === false;
+      if (lapsed === clockLapsed) return;
+      clockLapsed = lapsed;
+      publishScanTelemetry();
+    }
+
     /** No OK push for {@link NO_OK_PERIODS} periods → one warning per run. */
+
     function watchNoOk(tick: number): void {
       if (!scanActive || !runSpec || warnedNoOk) return;
       const since = Math.max(lastOkMs, runStartMs);
@@ -715,7 +797,9 @@ export default function mirrorLinkSession(
       report(
         "mirror-link",
         `no fovea exposure confirmed for ${NO_OK_PERIODS} scan periods ` +
-          `(${pushes.timeout} strobe timeouts, ${pushes.busy} busy) — check the trigger/strobe cabling`,
+          `(${pushes.timeout} strobe timeouts, ${pushes.busy} busy) — check the trigger/strobe cabling ` +
+          `(a missed strobe keeps the capture engine busy past the next trigger when the gap ` +
+          `after the window is under 5 ms, so BUSY pushes follow strobe timeouts)`,
         "warning",
       );
     }
@@ -771,10 +855,11 @@ export default function mirrorLinkSession(
       trajectory = traj;
       runSpec = built.spec;
       runRaw = built.raw;
+      runOverrun = built.overrun;
       runMode = built.mode;
       runHz = built.hz;
       specById.clear();
-      rememberSpec(traj, built.spec);
+      rememberSpec(traj.id, built.spec);
       trajectoryUnsubs.push(
         traj.onFrame(onTrajectoryFrame),
         traj.onStateChange((state) => onTrajectoryState(traj, state)),
@@ -803,6 +888,7 @@ export default function mirrorLinkSession(
       trajectory = null;
       runSpec = null;
       runRaw = [];
+      runOverrun = false;
       pendingSpec = null;
       specById.clear();
       for (const u of trajectoryUnsubs.splice(0)) u();
@@ -827,14 +913,17 @@ export default function mirrorLinkSession(
     let flipTooClose = false;
 
     /** The run's flip tolerance (scan.ts `flipToleranceUs`: 0.4 × min(T,
-     *  closest circular marker spacing), floored at 1 ms, capped at 0.45 ×
-     *  spacing), in ns, and whether the floor had to give way to the cap. */
+     *  closest circular EDGE gap between markers of different flip), floored
+     *  at 1 ms, capped at 0.45 × that gap), in ns, and whether the floor had
+     *  to give way to the cap. The edges are the markers AS THE MCU RUNS
+     *  THEM — the anchors carry exactly those. */
     function flipTolerance(built: BuiltScan): { ns: bigint; tooClose: boolean } {
       const r = flipToleranceUs(
         built.spec.periodUs,
         sweepUs(built.hz),
-        (built.spec.markers ?? []).map((m) => m.tOffsetUs),
+        flipEdges(built.spec.markers ?? []),
       );
+
       return { ns: BigInt(Math.round(r.toleranceUs * 1000)), tooClose: r.tooClose };
     }
 
@@ -955,21 +1044,11 @@ export default function mirrorLinkSession(
      *  written for (TriggerWidth needs no write per window). */
     let applied: Record<Side, TriggeredTiming> | null = null;
     let appliedPulseUs = 0;
-    /** Each fovea's maximum frame rate, read before arming — the trigger rate
-     *  and readout checks (spec §exposure-windows). Infinity = unknown. */
-    let frameRateMax: Record<Side, number> = { L: Infinity, R: Infinity };
-
-    function readFrameRateMax(t: CalibratedTriple): Record<Side, number> {
-      const one = (side: Side): number => {
-        try {
-          const max = t.leases[side].camera.frame_rate_range.max;
-          return Number.isFinite(max) && max > 0 ? max : Infinity;
-        } catch {
-          return Infinity;
-        }
-      };
-      return { L: one("L"), R: one("R") };
-    }
+    /** Each fovea's maximum frame rate and readout time UNDER the triggered
+     *  timing — read in the same reconfigure, right after it is applied (the
+     *  pre-scan exposure caps the rate otherwise); the trigger rate and
+     *  readout checks (spec §exposure-windows). */
+    const limits: Record<Side, TimingLimits> = { L: UNKNOWN_LIMITS, R: UNKNOWN_LIMITS };
 
     /** Snapshot (once) → trigger mode on (once) → triggered timing, on the
      *  lease's safe reconfigure path. */
@@ -994,6 +1073,7 @@ export default function mirrorLinkSession(
       const box: { v?: TriggeredTiming } = {};
       await lease.reconfigure(() => {
         box.v = applyTriggeredTiming(lease.camera, { pulseUs, preferTriggerWidth });
+        limits[side] = readTimingLimits(lease.camera);
       });
       return box.v!;
     }
@@ -1042,6 +1122,8 @@ export default function mirrorLinkSession(
       }
       applied = null;
       appliedPulseUs = 0;
+      limits.L = limits.R = UNKNOWN_LIMITS;
+      publishAppliedWindows();
       if (failures.length)
         report("mirror-link", `camera timing restore incomplete: ${failures.join("; ")}`, "warning");
     }
@@ -1060,6 +1142,23 @@ export default function mirrorLinkSession(
       for (const side of SIDES) a[side] = await armEye(side, t.leases[side], pulse, false);
       applied = a;
       appliedPulseUs = pulse;
+      publishAppliedWindows();
+    }
+
+    /** The Timed exposure the cameras WILL take for `pulse` (µs): clamped to
+     *  each eye's exposure range, the longer eye's — what `timedPulseUs`
+     *  reads once the write landed. */
+    function predictTimedPulseUs(t: CalibratedTriple, pulse: number): number {
+      let us = 0;
+      for (const side of SIDES) {
+        try {
+          const r = t.leases[side].camera.exposure_range;
+          us = Math.max(us, Math.min(Math.max(pulse, r.min), r.max));
+        } catch {
+          us = Math.max(us, pulse);
+        }
+      }
+      return Math.max(1, Math.round(us));
     }
 
     /** Why the cameras cannot take the run's windows as asked (spec
@@ -1076,18 +1175,21 @@ export default function mirrorLinkSession(
         )
           reasons.push(MISMATCH.timedClamp);
         if (runRaw.some((m) => exposureMismatch(want0, m.pulseUs))) reasons.push(MISMATCH.timedUnequal);
+        if (runOverrun) reasons.push(MISMATCH.timedOverrun);
       }
-      const maxFps = Math.min(frameRateMax.L, frameRateMax.R);
-      if (Number.isFinite(maxFps)) {
-        // One trigger per sweep T per camera, in both patterns.
-        if (1e6 / sweepUs(runHz) > maxFps) reasons.push(MISMATCH.rate);
-        if (
-          runMode === "triangle" &&
-          minExposureEndSpacingUs(runSpec.periodUs, markers) < 1e6 / maxFps
-        )
-          reasons.push(MISMATCH.readout);
-      }
+      // One trigger per sweep T per camera, in both patterns.
+      const maxFps = Math.min(limits.L.frame_rate_max, limits.R.frame_rate_max);
+      if (Number.isFinite(maxFps) && 1e6 / sweepUs(runHz) > maxFps) reasons.push(MISMATCH.rate);
+      // The readout: SensorReadoutTime where readable, else 1 / max fps.
+      const readout = Math.max(readoutSpacingUs(limits.L), readoutSpacingUs(limits.R));
+      if (
+        runMode === "triangle" &&
+        readout > 0 &&
+        minExposureEndSpacingUs(runSpec.periodUs, markers) < readout
+      )
+        reasons.push(MISMATCH.readout);
       if (runMode === "triangle" && flipTooClose) reasons.push(MISMATCH.flip);
+      if (clockLapsed) reasons.push(MISMATCH.clockLapsed);
       return reasons;
     }
 
@@ -1147,13 +1249,16 @@ export default function mirrorLinkSession(
     }
 
     /** Edits that landed while a start/restart was awaiting (spec §lifecycle):
-     *  a new mode or period restarts, anything else re-uploads. */
+     *  a new mode or period restarts, anything else goes through a replace —
+     *  UNCONDITIONALLY: a Timed pulse-only edit builds a spec identical to the
+     *  running one (the markers carry the APPLIED exposure), and only
+     *  `replaceNow` re-times the camera for it (it skips a true no-op). */
     function reconcileRun(): void {
       if (!scanActive || !runSpec) return;
       const now = buildScan();
       if (now.mode !== runMode || now.spec.periodUs !== runSpec.periodUs)
         void queueScanOp(restartScanNow);
-      else if (!sameSpec(now.spec, runSpec)) scheduleReplace();
+      else scheduleReplace();
     }
 
     /**
@@ -1188,8 +1293,11 @@ export default function mirrorLinkSession(
       }
       const t = triple;
       const cancelled = (): boolean => !scanAllowed || triple !== t || stopsPending > 0;
+      // A stop / teardown requested while this start was queued: the cameras
+      // are never armed for it.
+      if (cancelled()) return false;
       resetRunStats();
-      frameRateMax = readFrameRateMax(t);
+      clockLapsed = false;
       const pulse0 = buildScan().raw[0]?.pulseUs ?? 0;
       try {
         applied = await armCameras(t, pulse0);
@@ -1229,7 +1337,9 @@ export default function mirrorLinkSession(
       }
       scanActive = true;
       pushRingEnabled();
+      publishAppliedWindows();
       publishScanBlocked(null);
+
       publishScanTelemetry();
       publishPerf();
       reconcileRun();
@@ -1282,6 +1392,13 @@ export default function mirrorLinkSession(
       if (!scanActive || !t) return;
       const cancelled = (): boolean => !scanAllowed || triple !== t || stopsPending > 0;
       if (cancelled()) return stopScanNow();
+      // The run may have ended (a detach whose notice is still queued behind
+      // this op) or the clock lapsed: never re-open on either.
+      const live = trajectory;
+      if (!live || live.state !== "running")
+        return abortScanNow(runEndReason(live?.state ?? "detached"));
+      if (!activeController()?.clockCalibrated)
+        return abortScanNow("controller clock not calibrated");
       let built = buildScan();
       if (runSpec && built.mode === runMode && built.spec.periodUs === runSpec.periodUs)
         return replaceNow(); // same period after all (e.g. a no-op write)
@@ -1343,28 +1460,50 @@ export default function mirrorLinkSession(
 
     /** Swap the running table for the current geometry (`NodeTrajectory.
      *  replace`, spec §actuation). A period change is the restart's job; an
-     *  identical spec is skipped. In Timed mode a new marker-0 window re-writes
-     *  the exposure FIRST, so the swapped-in pulses are what the camera takes.
-     *  Once the swap settles (success or failure) a run that is no longer
-     *  `running` aborts the scan; a failure that left it running keeps the old
-     *  geometry (warned once). */
+     *  identical spec is skipped; a stop / teardown requested after this op
+     *  was queued makes it moot. In Timed mode a new marker-0 window re-times
+     *  the camera so that its exposure NEVER exceeds the MCU pulse (+ the
+     *  strobe margin): a SHRINKING exposure is written before the swap, a
+     *  GROWING one after it (the swapped-in table already carries the
+     *  predicted exposure). A failed swap after a pre-swap write writes the
+     *  previous exposure back. Once the swap settles (success or failure) a
+     *  run that is no longer `running` aborts the scan; a failure that left
+     *  it running keeps the old geometry (warned once). */
     async function replaceNow(): Promise<void> {
       const traj = trajectory;
       const t = triple;
       if (!scanActive || !traj || !t || !runSpec) return;
+      if (!scanAllowed || stopsPending > 0) return;
       let built = buildScan();
       if (built.mode !== runMode || built.spec.periodUs !== runSpec.periodUs) return;
       const pulse0 = built.raw[0]?.pulseUs ?? 0;
+      const prevPulseUs = appliedPulseUs;
+      let retimedBefore = false;
+      let retimeAfter = false;
       if (applied && pulse0 !== appliedPulseUs) {
-        try {
-          await retimeIfNeeded(t, pulse0);
-        } catch (e) {
-          await abortScanNow(`exposure re-apply failed: ${errorLine(e)}`, traj);
-          return;
+        const current = timedPulseUs();
+        if (current === null) {
+          await retimeIfNeeded(t, pulse0); // TriggerWidth: bookkeeping only
+        } else {
+          const next = predictTimedPulseUs(t, pulse0);
+          if (next <= current) {
+            try {
+              await retimeIfNeeded(t, pulse0);
+            } catch (e) {
+              await abortScanNow(`exposure re-apply failed: ${errorLine(e)}`, traj);
+              return;
+            }
+            retimedBefore = true;
+            built = buildScan();
+          } else {
+            built = buildScan(next);
+            retimeAfter = true;
+          }
         }
-        built = buildScan();
       }
       if (sameSpec(built.spec, runSpec)) return;
+      const oldId = traj.id;
+      const oldSpec = runSpec;
       replacing = true;
       pendingSpec = built.spec;
       let error: unknown = null;
@@ -1399,12 +1538,37 @@ export default function mirrorLinkSession(
             "warning",
           );
         }
+        // The camera took the shorter exposure of a swap that never landed:
+        // back to the running table's (its MCU pulses still carry it).
+        if (retimedBefore)
+          try {
+            await retimeIfNeeded(t, prevPulseUs);
+          } catch (e) {
+            await abortScanNow(`exposure re-apply failed: ${errorLine(e)}`, traj);
+            return;
+          }
+        publishScanTelemetry();
         return;
       }
       runSpec = built.spec;
       runRaw = built.raw;
-      rememberSpec(traj, built.spec);
+      runOverrun = built.overrun;
+      if (traj.id !== oldId) retireSpec(oldId, oldSpec);
+      rememberSpec(traj.id, built.spec);
       reuploads++;
+      // A growing Timed exposure: the MCU pulses are longer now — only now may
+      // the camera expose longer. Should the camera take a different value than
+      // predicted, the next replace swaps the markers onto it.
+      if (retimeAfter) {
+        const swappedPulse = built.spec.markers?.[0]?.pulseUs;
+        try {
+          await retimeIfNeeded(t, pulse0);
+        } catch (e) {
+          await abortScanNow(`exposure re-apply failed: ${errorLine(e)}`, traj);
+          return;
+        }
+        if (timedPulseUs() !== swappedPulse) scheduleReplace();
+      }
       // Atomic (firmware 2.2.1) or the STOP/START pair — the node's row says.
       lastSwap = controllerNode().trajectorySnapshot?.()?.lastSwap ?? lastSwap;
       // Markers moved closer than the flip bricks' tolerance allows: rebuild
@@ -1427,6 +1591,10 @@ export default function mirrorLinkSession(
     // the scan. Same live-handle model as the exposure override — the
     // per-camera config docs are never written.
 
+    /** Gain writes are allowed from the lease until teardown begins (like
+     *  `scanAllowed`, which only turns on once the actuation is wired — a
+     *  carried-over gain is applied before that). */
+    let gainAllowed = false;
     /** Pre-session gain per eye, restored on idle. */
     const gainSnapshots: Partial<Record<Side, GainSnapshot>> = {};
     /** The range BOTH foveas honor; {0,0} until leased (slider disabled). */
@@ -1437,7 +1605,8 @@ export default function mirrorLinkSession(
      *  not take. Serialized on {@link queueScanOp}. */
     async function applyGainNow(dB: number): Promise<void> {
       const t = triple;
-      if (!t || gainRange.min === gainRange.max) return;
+      // Ignored once teardown began: it would land after the gain restore.
+      if (!t || !gainAllowed || gainRange.min === gainRange.max) return;
       const want = Math.min(Math.max(dB, gainRange.min), gainRange.max);
       if (want !== s.state.gain) s.setState("gain", want);
       for (const side of SIDES) {
@@ -2262,6 +2431,7 @@ export default function mirrorLinkSession(
       const t = await scope.use(() => acquireTriple(s), releaseLeases); // drains LAST
       if (!t) return; // frozen at "Leasing cameras" (contention/fail)
       triple = t;
+      gainAllowed = true;
       monitor.done("lease");
 
       // Gain override (spec §gain): snapshot both eyes, publish the shared
@@ -2464,6 +2634,7 @@ export default function mirrorLinkSession(
           if (scanActive) {
             probeFlips(tick);
             watchNoOk(tick);
+            watchClock();
           }
           // Per-eye markers come from the CENTER pose (shift included), not
           // the instantaneous scan pose — they show where each fovea is aimed.
@@ -2510,6 +2681,7 @@ export default function mirrorLinkSession(
         // timing (the restore rides `lease.reconfigure`) — then the gain
         // override (spec §gain).
         scanAllowed = false;
+        gainAllowed = false;
         await queueScanOp(async () => {
           stopVergenceNow(); // the loop's workers + pid node go first
           await stopScanNow();
@@ -2545,7 +2717,9 @@ export default function mirrorLinkSession(
           "scan_blocked",
           "scan_path",
           "scan_path_px",
+          "scan_path_closed",
           "scan_window_px",
+          "scan_center_px",
           "axis_handle_px",
           "perf",
           "gain_range",
