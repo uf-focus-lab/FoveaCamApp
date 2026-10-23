@@ -205,7 +205,8 @@ round; the per-finding detail lives in the fix commits.
   t_start, cycles}` while table `a` runs is ACCEPTED iff `b` is committed,
   `b.period == a.period` and `t_start == a.t_start` (exact µs): the firmware
   switches the playing table in place, keeping the phase clock and the
-  marker crossing state (no HOLD, no missed marker, no push). Any other START
+  marker crossing state (no HOLD, no push; a marker is never doubled, and
+  one moved before the swap phase first fires next cycle). Any other START
   while running still REJs "already running". Host `replace` tries that first
   and falls back to STOP(a) + START(b) on REJ (older firmware). Pushes from
   an in-flight capture of the old table keep arriving after the swap, so the
