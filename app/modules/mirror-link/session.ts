@@ -247,6 +247,8 @@ const MISMATCH = {
   readout: "exposures closer than the sensor readout",
   flip: "exposure windows too close for reliable flipping at this frequency",
   clockLapsed: "controller clock calibration lapsed",
+  swapUnconfirmed:
+    "replacement swap unconfirmed — the mirror may run the previous edit",
 } as const;
 
 /** A start / restart cancelled before its START went out (a stop or teardown
@@ -640,8 +642,10 @@ export default function mirrorLinkSession(
 
     /** Ids a FAILED swap left routed as possibly-live siblings (the
      *  controller's ambiguous row): their entries never expire on their own —
-     *  the next landed swap or the run's end retires them (the controller
-     *  STOPs them there). */
+     *  the next landed swap or the run's end retires them (an atomic START
+     *  replaces whichever table plays; the STOP/START pair and stop() STOP
+     *  each sibling). While any exists, `mismatch` names the unconfirmed swap
+     *  and an edit back to the running geometry still swaps. */
     const siblingIds = new Set<number>();
 
     /** A failed swap left its NEW table id routed (`TrajectoryReplaceError.
@@ -664,8 +668,9 @@ export default function mirrorLinkSession(
       }
     }
 
-    /** A swap landed (the controller STOPped every sibling first): their
-     *  entries stay valid for their grace only. */
+    /** A swap landed (no sibling plays any more — replaced by the atomic
+     *  START or STOPped by the pair): their entries stay valid for their
+     *  grace only. */
     function retireSiblingSpecs(): void {
       for (const id of siblingIds) {
         const e = specById.get(id);
@@ -1347,11 +1352,18 @@ export default function mirrorLinkSession(
       if (!runSpec || !applied) return [];
       const reasons: string[] = [];
       const markers = runSpec.markers ?? [];
+      // A failed swap's table may be live: the MCU may run the abandoned
+      // geometry (Timed: the camera deliberately keeps the shorter exposure,
+      // so the clamp check would misreport it). Settled by the next landed
+      // swap.
+      const unconfirmed = siblingIds.size > 0;
+      if (unconfirmed) reasons.push(MISMATCH.swapUnconfirmed);
       if (timed) {
         const want0 = runRaw[0]?.pulseUs ?? 0;
         if (
-          exposureMismatch(applied.L.exposure_us, want0) ||
-          exposureMismatch(applied.R.exposure_us, want0)
+          !unconfirmed &&
+          (exposureMismatch(applied.L.exposure_us, want0) ||
+            exposureMismatch(applied.R.exposure_us, want0))
         )
           reasons.push(MISMATCH.timedClamp);
         if (runRaw.some((m) => exposureMismatch(want0, m.pulseUs)))
@@ -1717,7 +1729,10 @@ export default function mirrorLinkSession(
           }
         }
       }
-      if (sameSpec(built.spec, runSpec)) {
+      // Not while a failed swap's table MAY be live (`siblingIds`): the MCU
+      // might run the abandoned geometry, so even the running spec must be
+      // swapped in again to settle it (and, Timed, re-time the camera).
+      if (sameSpec(built.spec, runSpec) && siblingIds.size === 0) {
         // Nothing for the MCU — but the REQUESTED windows may still have
         // changed (Timed: every marker carries marker 0's pulse, so a falling
         // END edit builds the same spec): the mismatch checks read them.

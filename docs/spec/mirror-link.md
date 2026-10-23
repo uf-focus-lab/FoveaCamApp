@@ -349,7 +349,8 @@ mode therefore re-writes a SHRINKING exposure BEFORE the swap (the running table
 pulses cover it) and a GROWING one AFTER the swap (the swapped-in table carries the
 predicted exposure — the pulse clamped to each eye's `exposure_range`; should the camera
 take another value, the next replace swaps the markers onto it). A swap that fails after a
-pre-swap write writes the previous exposure back, so camera and running table agree again.
+pre-swap write writes the previous exposure back, so camera and running table agree again
+(not while the new table may be live — §actuation).
 
 **Restore** (`restoreTiming`, after `disableHardwareTrigger`): `ExposureMode` first (so a
 Timed exposure is writable again; the generic feature write when the typed setter refuses
@@ -392,6 +393,7 @@ order, null without a mismatch:
 | `exposures closer than the sensor readout` | triangle: an end-to-end spacing below the readout time (`SensorReadoutTime`, else `1 / frame_rate_range.max`) |
 | `exposure windows too close for reliable flipping at this frequency` | triangle: the flip tolerance floor exceeds its cap (§triangle-flip) |
 | `controller clock calibration lapsed` | the controller clock went uncalibrated mid-scan (§lifecycle; no stop) |
+| `replacement swap unconfirmed — the mirror may run the previous edit` | a live edit's swap failed in a way that may have landed (§actuation); cleared by the next landed swap |
 
 A mismatch warns once until it clears (`report("mirror-link", "the cameras cannot take
 the exposure windows as asked: <reason>…", "warning")`).
@@ -697,10 +699,15 @@ not-yet-seen one — resolves to the in-flight spec. A FAILED swap that left its
 id routed (`TrajectoryReplaceError.replacement`, controller.md's decision table) is scored
 the same way, against the spec that table carries: for the grace when it can never be live
 (`maybeLive: false`), open-ended while it may be (`maybeLive: true`) until the next landed
-swap — the controller STOPs such a sibling first — or the run's end retires it. In the
-Timed fallback a pre-swap exposure shrink is written back only when the new table can
-never be live: while it may be, the shorter exposure is safe under either table and the
-longer one could overrun its pulse.
+swap — an atomic START replaces whichever table plays, the STOP/START pair STOPs each
+sibling — or the run's end retires it. While such a sibling exists the MCU may be running
+the abandoned geometry, so `scan.mismatch` names "replacement swap unconfirmed — the mirror
+may run the previous edit" and an edit back to the running geometry still swaps (the
+identical-spec shortcut is suspended) so the next landed swap settles it. In the Timed
+fallback a pre-swap exposure shrink is written back only when the new table can never be
+live: while it may be, the shorter exposure is safe under either table and the longer one
+could overrun its pulse; the clamp check is suspended meanwhile (the camera deliberately
+differs from the running table).
 
 **`perf.trajectory`** (`TrajectoryTelemetry`, published with `perf` at the
 `VOLT_TELEMETRY_INTERVAL_MS` throttle; counters reset per scan): `running` (scan active and

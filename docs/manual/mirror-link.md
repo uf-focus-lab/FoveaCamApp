@@ -221,6 +221,7 @@ current settings would run.
 | Timed exposure would run into the next trigger | On a timed-fallback camera the exposure the camera can take is longer than a whole sweep (its minimum exposure is above one sweep — the **Scan Frequency** period; a triangle's full period is two sweeps), so a frame would still be exposing when the next trigger arrives — lower **Scan Frequency**. Shortening the windows does not help: the app already keeps a shorter exposure inside its sweep. |
 | Timed exposure clamped to the camera's exposure range | On a timed-fallback camera the window is longer or shorter than the camera can expose — change the window's length. |
 | controller clock calibration lapsed | The controller's clock link stopped answering mid-scan, so the frames can no longer be timed against the path — check the controller's connection. |
+| replacement swap unconfirmed — the mirror may run the previous edit | A live edit did not get through cleanly and the controller may be running either the old or the new path. Make any edit (even back to the same value): the next one that lands settles it. On a timed-fallback camera the exposure stays at the shorter window meanwhile. |
 
 If **Start Scan** is refused the status line reads *idle — refused* and its
 hover carries the reason: no cameras leased; no controller connected; the

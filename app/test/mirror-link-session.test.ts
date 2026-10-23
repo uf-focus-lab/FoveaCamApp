@@ -1274,6 +1274,43 @@ describe("failed replace: the routed new id is scored against ITS spec", () => {
     expect(h.triple.leases.L.camera.exposure).toBe(50_000);
   });
 
+  it("possibly live: mismatch names the unconfirmed swap; an edit back to the running geometry still swaps and settles it", async () => {
+    const h = await harness({
+      state: { scan_mode: "triangle", tri_window_sync: false },
+    });
+    h.triple.leases.R.camera.modes.splice(1); // R: Timed only
+    await h.setState("tri_window_rise", [0.1, 0.9]);
+    await h.setState("tri_window_fall", [0.1, 0.9]);
+    await h.call("startScan");
+    await settle();
+    ctl.replaceError = await replaceErrorWith(7, true);
+    await h.setState("tri_window_rise", [0.1, 0.6]);
+    await vi.advanceTimersByTimeAsync(0);
+    await settle();
+    expect(h.traj().replaceCalls).toBe(1);
+    expect(h.triple.leases.L.camera.exposure).toBe(50_000);
+    // The camera deliberately differs from the running table: not a clamp.
+    expect(h.tele.scan.mismatch).toBe(true);
+    expect(h.tele.scan.mismatch_reason).toBe(
+      "replacement swap unconfirmed — the mirror may run the previous edit",
+    );
+    expect(ctl.reports.some((r) => r.includes("clamped to the camera"))).toBe(
+      false,
+    );
+    // Back to the running geometry: identical to runSpec, but a sibling may be
+    // live — the swap goes out anyway, the exposure grows back AFTER it, and
+    // the sibling is retired.
+    ctl.replaceError = null;
+    perfNow += 200;
+    await h.setState("tri_window_rise", [0.1, 0.9]);
+    await vi.advanceTimersByTimeAsync(200);
+    await settle();
+    expect(h.traj().replaceCalls).toBe(2);
+    expect(h.triple.leases.L.camera.exposure).toBe(80_000);
+    expect(h.tele.scan.mismatch).toBe(false);
+    expect(h.tele.scan.mismatch_reason).toBeNull();
+  });
+
   it("Timed, never live: the pre-swap shrink IS written back", async () => {
     const h = await harness({
       state: { scan_mode: "triangle", tri_window_sync: false },

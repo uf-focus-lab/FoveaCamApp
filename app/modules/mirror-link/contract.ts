@@ -59,8 +59,8 @@ export type ScanTelemetry = {
    *  mode (every marker then carries marker 0's pulse), a Timed exposure
    *  overrunning the next trigger, a trigger rate above a camera's maximum
    *  frame rate, two exposures closer end-to-end than the sensor readout,
-   *  triangle windows too close for reliable flipping, or the controller
-   *  clock calibration lapsing mid-scan. */
+   *  triangle windows too close for reliable flipping, the controller clock
+   *  calibration lapsing mid-scan, or a live edit's swap left unconfirmed. */
   mismatch: boolean;
   /** One sentence naming WHY `mismatch` is set; null when it is not. */
   mismatch_reason: string | null;
