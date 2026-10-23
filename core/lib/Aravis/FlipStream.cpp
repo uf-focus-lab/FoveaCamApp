@@ -7,13 +7,16 @@
 // Flip NAPI seam: the native per-frame VERTICAL FLIP brick (FlipStream.h),
 // chained on a convert / undistort / fovea / scale pipe's OwnedFrame tap.
 // Modelled 1:1 on ScaleStream.cpp:
-//   attachFlipPipe(sourcePipeId, pipeId, { toleranceNs: bigint, anchorCap? })
+//   attachFlipPipe(sourcePipeId, pipeId,
+//                  { toleranceNs: bigint, anchorCap?: integer, anchorFrom? })
 //     sourcePipeId = a live convert | undistort | fovea | scale pipe id (or a
 //                    pairing test source — test-only, empty in production).
-//   pushFlipAnchor(pipeId, { tExposure: bigint, flip: boolean })
-//   flipProbe(pipeId)  — meter + { frames, flipped, unmatched, anchorPoolSize }
-//                        (+ anchorDrops, toleranceNs), or null if unknown.
-//   flipProbeAll()     — the same rows keyed by pipeId (perf/workload fold).
+//   pushFlipAnchor(pipeId, { tStart: bigint, tEnd: bigint, flip: boolean })
+//   flipProbe(pipeId)  — meter + { frames, flipped, unmatched, anchorPoolSize,
+//                        anchorDrops, toleranceNs, matchedSkewNs } (every
+//                        counter a Number; RESETS the skew window), or null.
+//   flipProbeAll()     — the same rows keyed by pipeId (perf/workload fold —
+//                        JSON-stringified, hence Numbers only; PEEKS the skew).
 //   detachFlipPipe(pipeId) — idempotent.
 // The gated `PipeOfferSubscriber` is MAX-BOUND against the advertised
 // footprint (the session advertises the SOURCE pipe's own spec, so a fixed
@@ -56,8 +59,14 @@ FlipStream::Ptr findFlip(const std::string &pipeId) {
   return it != g_pipes.end() ? it->second.stream : nullptr;
 }
 
-// Probe row: meter snapshot + the brick's counters.
-static Napi::Object flipProbeRow(Napi::Env env, const FlipStream::Ptr &s) {
+// Probe row: meter snapshot + the brick's counters. EVERY field is a Number:
+// the `flipProbeAll` rows land in the perf snapshot's workloads, which the
+// orchestrator client JSON-stringifies (a BigInt would throw there).
+// `toleranceNs` is a configured window far below 2^53 ns (~104 days), so the
+// double is exact. `takeSkew`: reset the matched-skew window (flipProbe) or
+// only peek at it (flipProbeAll).
+static Napi::Object flipProbeRow(Napi::Env env, const FlipStream::Ptr &s,
+                                 bool takeSkew) {
   auto o = meterSnapshotToJs(env, s->probe()).As<Napi::Object>();
   o.Set("frames", Napi::Number::New(env, static_cast<double>(s->frames())));
   o.Set("flipped", Napi::Number::New(env, static_cast<double>(s->flipped())));
@@ -67,8 +76,22 @@ static Napi::Object flipProbeRow(Napi::Env env, const FlipStream::Ptr &s) {
         Napi::Number::New(env, static_cast<double>(s->anchorPoolSize())));
   o.Set("anchorDrops",
         Napi::Number::New(env, static_cast<double>(s->anchorDrops())));
-  o.Set("toleranceNs", convert(env, s->toleranceNs())); // int64 -> BigInt
+  o.Set("toleranceNs",
+        Napi::Number::New(env, static_cast<double>(s->toleranceNs())));
+  o.Set("matchedSkewNs",
+        Napi::Number::New(env, takeSkew ? s->takeMatchedSkewNs()
+                                        : s->peekMatchedSkewNs()));
   return o;
+}
+
+// A BigInt-only int64 read: `convert<int64_t>` would accept a Number and
+// truncate it to int32, silently corrupting a ns timestamp.
+static bool readBigInt64(const Napi::Value &v, int64_t &out) {
+  if (!v.IsBigInt())
+    return false;
+  bool lossless = false;
+  out = v.As<Napi::BigInt>().Int64Value(&lossless);
+  return lossless;
 }
 
 // ---- attach: resolve the source brick (any ConvertedFrame producer), gate --
@@ -84,20 +107,32 @@ FN(attachFlipPipe) {
     JS_ASSERT(info[2].IsObject(), TypeError,
               "attachFlipPipe: options object required", env.Undefined());
     const auto opts = info[2].As<Napi::Object>();
-    JS_ASSERT(opts.Has("toleranceNs") && !opts.Get("toleranceNs").IsUndefined(),
-              TypeError, "attachFlipPipe: `toleranceNs` (bigint ns) required",
+    int64_t toleranceNs = 0;
+    JS_ASSERT(readBigInt64(opts.Get("toleranceNs"), toleranceNs), TypeError,
+              "attachFlipPipe: `toleranceNs` must be a bigint (ns)",
               env.Undefined());
-    const int64_t toleranceNs = convert<int64_t>(opts.Get("toleranceNs"));
     JS_ASSERT(toleranceNs >= 0, RangeError,
               "attachFlipPipe: `toleranceNs` must be >= 0", env.Undefined());
+    // anchorCap: an integer, clamped to [1, kMaxAnchorCap] (a non-integer or
+    // non-number is a caller bug and throws; an out-of-range integer clamps).
+    constexpr size_t kMaxAnchorCap = 1024;
     size_t anchorCap = 16;
     if (opts.Has("anchorCap") && !opts.Get("anchorCap").IsUndefined()) {
-      JS_ASSERT(opts.Get("anchorCap").IsNumber(), TypeError,
-                "attachFlipPipe: `anchorCap` must be a number", env.Undefined());
-      const double cap = opts.Get("anchorCap").As<Napi::Number>().DoubleValue();
-      JS_ASSERT(cap >= 1 && std::isfinite(cap), RangeError,
-                "attachFlipPipe: `anchorCap` must be >= 1", env.Undefined());
-      anchorCap = static_cast<size_t>(cap);
+      const auto v = opts.Get("anchorCap");
+      const double cap = v.IsNumber() ? v.As<Napi::Number>().DoubleValue() : NAN;
+      JS_ASSERT(std::isfinite(cap) && std::floor(cap) == cap, TypeError,
+                "attachFlipPipe: `anchorCap` must be an integer",
+                env.Undefined());
+      anchorCap = cap < 1 ? 1
+                  : cap > double(kMaxAnchorCap) ? kMaxAnchorCap
+                                                : static_cast<size_t>(cap);
+    }
+    std::string anchorFrom;
+    if (opts.Has("anchorFrom") && !opts.Get("anchorFrom").IsUndefined()) {
+      JS_ASSERT(opts.Get("anchorFrom").IsString(), TypeError,
+                "attachFlipPipe: `anchorFrom` must be a string (node id)",
+                env.Undefined());
+      anchorFrom = opts.Get("anchorFrom").As<Napi::String>().Utf8Value();
     }
 
     auto &hub = Pipe::PipeHub::instance();
@@ -129,8 +164,16 @@ FN(attachFlipPipe) {
                env.Undefined());
 
     auto stream = FlipStream::create(std::move(source), srcId, pipeId,
-                                     toleranceNs, anchorCap);
-    FlipBinding replaced; // a re-attach's old binding, destructed OUTSIDE the lock
+                                     toleranceNs, anchorCap,
+                                     std::move(anchorFrom));
+    // A re-attach's old binding. Its gated subscriber writes the SAME sink the
+    // new one will, so it is RESET (unsubscribed) before the gate below can
+    // subscribe the new stream — never two producers on one ring, as
+    // ScaleStream does. The reset runs OUTSIDE g_mutex (unsubscribing may wait
+    // out an in-flight offer); the old stream is held until return so its
+    // closeChain()/join also runs outside the lock, after the subscriber that
+    // referenced it is gone.
+    FlipBinding replaced;
     {
       std::scoped_lock lock(g_mutex);
       auto &b = g_pipes[pipeId];
@@ -141,6 +184,7 @@ FN(attachFlipPipe) {
       b.maxW = maxW;
       b.maxH = maxH;
     }
+    replaced.subscriber.reset(); // old producer off the sink BEFORE the gate
     // Register the gate OUTSIDE the lock (fires immediately with the current
     // consumer state, re-locking g_mutex).
     hub.setConsumerGate(pipeId, [pipeId](bool active) {
@@ -170,13 +214,15 @@ FN(pushFlipAnchor) {
     JS_ASSERT(info[1].IsObject(), TypeError,
               "pushFlipAnchor: anchor object required", env.Undefined());
     const auto o = info[1].As<Napi::Object>();
-    JS_ASSERT(o.Has("tExposure") && !o.Get("tExposure").IsUndefined(), TypeError,
-              "pushFlipAnchor: `tExposure` (bigint ns) required",
-              env.Undefined());
-    JS_ASSERT(o.Has("flip") && o.Get("flip").IsBoolean(), TypeError,
-              "pushFlipAnchor: `flip` (boolean) required", env.Undefined());
     FlipAnchor a;
-    a.tExposure = convert<int64_t>(o.Get("tExposure"));
+    JS_ASSERT(readBigInt64(o.Get("tStart"), a.tStart), TypeError,
+              "pushFlipAnchor: `tStart` (bigint ns) required", env.Undefined());
+    JS_ASSERT(readBigInt64(o.Get("tEnd"), a.tEnd), TypeError,
+              "pushFlipAnchor: `tEnd` (bigint ns) required", env.Undefined());
+    JS_ASSERT(a.tEnd >= a.tStart, RangeError,
+              "pushFlipAnchor: `tEnd` must be >= `tStart`", env.Undefined());
+    JS_ASSERT(o.Get("flip").IsBoolean(), TypeError,
+              "pushFlipAnchor: `flip` (boolean) required", env.Undefined());
     a.flip = o.Get("flip").As<Napi::Boolean>().Value();
     auto stream = findFlip(pipeId);
     if (!stream)
@@ -191,6 +237,8 @@ FN(pushFlipAnchor) {
 FN(detachFlipPipe) {
   auto env = info.Env();
   try {
+    JS_ASSERT(info[0].IsString(), TypeError,
+              "detachFlipPipe: pipeId (string) required", env.Undefined());
     const auto pipeId = info[0].As<Napi::String>().Utf8Value();
     Pipe::PipeHub::instance().setConsumerGate(pipeId, nullptr);
     FlipBinding removed; // destructed OUTSIDE the lock (unsubscribe + join)
@@ -211,11 +259,13 @@ FN(detachFlipPipe) {
 FN(flipProbe) {
   auto env = info.Env();
   try {
+    JS_ASSERT(info[0].IsString(), TypeError,
+              "flipProbe: pipeId (string) required", env.Undefined());
     const auto pipeId = info[0].As<Napi::String>().Utf8Value();
     auto stream = findFlip(pipeId);
     if (!stream)
       return env.Null();
-    return flipProbeRow(env, stream);
+    return flipProbeRow(env, stream, /*takeSkew=*/true);
   }
   JS_EXCEPT(env.Undefined())
 }
@@ -227,7 +277,7 @@ FN(flipProbeAll) {
   for (const auto &[pipeId, b] : g_pipes) {
     if (!b.stream)
       continue;
-    out.Set(pipeId, flipProbeRow(env, b.stream));
+    out.Set(pipeId, flipProbeRow(env, b.stream, /*takeSkew=*/false));
   }
   return out;
 }
@@ -242,6 +292,17 @@ void appendFlipReports(Napi::Env env, Napi::Array &rows,
     auto row = Topology::node(env, pipeId, "flip", "native");
     Topology::addInput(env, row, b.stream->sourceId(), "frame",
                        Topology::frameType(env, "RGBA8", "U8"));
+    // The anchor edge (attach option `anchorFrom`): the native row REPLACES a
+    // session-registered row for this id (graph-topology.ts
+    // mergeReportLayers), so the edge must come from here. Typed as the
+    // trajectory node's record stream (session.ts TRAJECTORY_STREAM).
+    if (!b.stream->anchorFrom().empty()) {
+      auto anchorType = Napi::Object::New(env);
+      anchorType.Set("kind", Napi::String::New(env, "analysis"));
+      anchorType.Set("schema", Napi::String::New(env, "trajectory"));
+      Topology::addInput(env, row, b.stream->anchorFrom(), "anchor",
+                         anchorType);
+    }
     if (!Topology::decoratePipe(env, row, pipeId))
       row.Set("output", Topology::frameType(env, "RGBA8", "U8"));
     row.Set("stats", meterSnapshotToJs(env, b.stream->probe()));
