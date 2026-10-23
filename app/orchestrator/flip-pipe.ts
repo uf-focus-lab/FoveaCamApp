@@ -15,31 +15,47 @@
 
 import type { PipeSpec } from "@lib/orchestrator/pipe-contract.js";
 
-/** One trigger the brick may match a frame to. `tExposure` is the marker
- *  push's OWNER-APPLIED trusted host-steady ns (the same domain as a frame's
- *  `deviceTimestamp` after the owner's clock dt), `flip` whether a frame
- *  exposed by this trigger is flipped. */
+/** One trigger the brick may match a frame to. `tStart`/`tEnd` are the
+ *  exposure's start (the marker push's `tExposure`, the strobe-rise latch)
+ *  and end (`tExposure + pulse`), both OWNER-APPLIED trusted host-steady ns
+ *  (the same domain as a frame's `deviceTimestamp` after the owner's clock
+ *  dt). The brick matches a frame to the NEAREST of either edge, so it is
+ *  right whether the camera stamps its frames at exposure start or at
+ *  exposure end — which edge the Blackfly S uses is not documented in this
+ *  repo; `FlipProbe.matchedSkewNs` tells. `flip`: whether a frame exposed by
+ *  this trigger is flipped. */
 export interface FlipAnchor {
-  tExposure: bigint;
+  tStart: bigint;
+  tEnd: bigint;
   flip: boolean;
 }
 
 export interface FlipPipeOptions {
-  /** Match tolerance: a frame flips iff an anchor lies within this of its
-   *  timestamp (nearest wins). The session derives it from the marker
-   *  spacing (a fraction of the sweep time T). */
+  /** Match tolerance: a frame matches an anchor iff one of that anchor's
+   *  edges lies within this of its timestamp (nearest edge wins). The session
+   *  derives it from the marker spacing, floored for clock alignment. */
   toleranceNs: bigint;
-  /** Bounded anchor pool (drop-oldest); default a few periods' worth. */
+  /** Bounded anchor pool (drop-oldest); default 16, max 1024. */
   anchorCap?: number;
+  /** Graph node id the anchors come from (the controller's trajectory node),
+   *  reported as the brick's `anchor` input in the native topology row. */
+  anchorFrom?: string;
 }
 
-/** Brick-side counters, for `perf.trajectory.flipped` / `.unmatched`. */
+/** Brick-side counters, for `perf.trajectory.flipped` / `.unmatched` /
+ *  `.skew_us`. Plain Numbers only — these rows are JSON-exported with the
+ *  perf snapshot, which cannot carry a BigInt. */
 export interface FlipProbe {
   frames: number;
   flipped: number;
-  /** Frames with no anchor inside the tolerance — passed through unflipped. */
+  /** Frames with no anchor edge inside the tolerance — passed through unflipped. */
   unmatched: number;
   anchorPoolSize: number;
+  /** Anchors evicted by `anchorCap` (climbs harmlessly while parked). */
+  anchorDrops: number;
+  /** Mean signed (frame stamp − matched edge) over matched frames since the
+   *  last probe, ns as a Number; 0 when nothing matched. */
+  matchedSkewNs: number;
 }
 
 /** The seam this helper drives — `advertise`/`unadvertise` MUST be the pipe
@@ -77,7 +93,12 @@ export function createFlipPipe(
   opts: FlipPipeOptions,
 ): FlipHandle {
   seam.advertise({ ...sourceSpec, id: pipeId });
-  seam.attach(sourcePipeId, pipeId, opts);
+  try {
+    seam.attach(sourcePipeId, pipeId, opts);
+  } catch (e) {
+    seam.unadvertise(pipeId); // never leave an advertised pipe with no producer
+    throw e;
+  }
   return {
     pipeId,
     pushAnchor: (a) => seam.pushAnchor(pipeId, a),

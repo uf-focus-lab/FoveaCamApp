@@ -52,9 +52,13 @@ export type ScanTelemetry = {
    *  TriggerWidth mode) and the camera's readback frame rate limit. */
   exposure_us: { L: number; R: number };
   frame_rate: { L: number; R: number };
-  /** Set when the cameras cannot take the requested window (Timed clamp, or
-   *  unequal triangle windows in Timed mode). */
+  /** Set when the cameras cannot take the requested windows as asked: a
+   *  Timed clamp, unequal triangle windows in Timed mode (every marker then
+   *  carries marker 0's pulse), a trigger rate above a camera's maximum frame
+   *  rate, or two exposures closer end-to-end than the sensor readout. */
   mismatch: boolean;
+  /** One sentence naming WHY `mismatch` is set; null when it is not. */
+  mismatch_reason: string | null;
 };
 
 /** Scan pattern family (spec §scan-patterns). */
@@ -74,9 +78,18 @@ export type TrajectoryTelemetry = {
   /** Phase-continuous re-uploads this run (steer / slider moves while active). */
   reuploads: number;
   /** Triangle mode: frames the flip bricks flipped / could not match to a
-   *  marker, per eye (0 in ellipse mode). */
+   *  marker, per eye (0 in ellipse mode). Accumulated across brick rebuilds
+   *  within one run. */
   flipped: { L: number; R: number };
   unmatched: { L: number; R: number };
+  /** Triangle mode: the matched frames' signed offset from the anchor edge
+   *  they matched (frame stamp − edge, µs, mean over the probe window), per
+   *  eye. Near 0 = the camera stamps the edge the anchor describes; a value
+   *  near ±pulse means it stamps the other edge (the brick matches either);
+   *  anything else is a clock-alignment problem. */
+  skew_us: { L: number; R: number };
+  /** The flip bricks' match tolerance this run (µs). */
+  flip_tolerance_us: number;
 };
 
 /** Matched fovea footprint + confidence, lifted into wide-frame pixels — the
@@ -168,9 +181,12 @@ export const mirrorLink = defineContract({
      *  Empty uncalibrated; republished on every geometry change, never per
      *  tick (spec §views). */
     scan_path: { L: [], R: [] } as { L: Pos[]; R: Pos[] },
-    /** The same path projected into WIDE px for the center view overlay
-     *  (ellipse closed, line/triangle open); empty uncalibrated. */
+    /** The same path projected into WIDE px for the center view overlay;
+     *  empty uncalibrated. `scan_path_closed` says whether to close it (an
+     *  ellipse with ratio > 0) — published WITH the path so the renderer never
+     *  pairs an old path with a new rule. */
     scan_path_px: [] as Point2d[],
+    scan_path_closed: false as boolean,
     /** The EXPOSED portions of the path in wide px, one polyline per marker
      *  window (drawn emphasized; the rest of the path dim). */
     scan_window_px: [] as Point2d[][],
@@ -224,6 +240,8 @@ export const mirrorLink = defineContract({
         reuploads: 0,
         flipped: { L: 0, R: 0 },
         unmatched: { L: 0, R: 0 },
+        skew_us: { L: 0, R: 0 },
+        flip_tolerance_us: 0,
       } as TrajectoryTelemetry,
     },
     // Capture manifest telemetry (spec §capture); image data pulled via
@@ -256,7 +274,8 @@ export const mirrorLink = defineContract({
      *  Released with `false`, which re-seeds both controllers from the final
      *  slider values. */
     holdDof: cmd<boolean>(),
-    /** Start the circular scan + the per-fovea exposure override. Resolves
+    /** Start the scan (upload + run the pattern trajectory, arm the fovea
+     *  triggers). Resolves
      *  `false` when refused, with the reason on `telemetry.scan_blocked`. */
     startScan: cmd<void, boolean>(),
     /** Stop the scan and restore the pre-scan camera timing. */

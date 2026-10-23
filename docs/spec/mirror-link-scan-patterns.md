@@ -177,3 +177,60 @@ back to back.
 Shared: `contract.ts` (done here; J and K consume it, additive edits only
 with a note), `flip-pipe.ts` (done here; H implements the seam, J consumes
 the helper).
+
+## Review round 1 (2026-10-23) — findings and decisions
+
+Four independent reviews (timing/protocol vs firmware, orchestrator lifecycle,
+UI vs the request, native brick) on 9a5ed54. Decisions taken for the fix
+round; the per-finding detail lives in the fix commits.
+
+### Decisions
+
+- **Sync means identical timing.** `tri_window_fall` mirrors
+  `tri_window_rise`'s fractions. With an asymmetric window the two frames
+  therefore expose opposite ends of the line (the rising frame the start of
+  the sweep, the falling frame the end); the hover and the manual say so. The
+  alternative ("same stretch", `fall = [1 − end, 1 − start]`) is one line to
+  switch to if the owner prefers it.
+- **The flip stays vertical**, as asked. The exact reversal of a falling sweep
+  is a reflection across the line PERPENDICULAR to the scan axis through the
+  center, which equals the vertical flip only for a vertical axis; the spec
+  text that said "across the axis" was wrong and is corrected.
+- **Anchors carry both exposure edges.** Which instant the Blackfly S stamps
+  a frame with (exposure start or end) is not documented here. The flip brick
+  matches a frame to the nearest of `tStart`/`tEnd` within the tolerance, so
+  the match is right either way, and reports the signed skew of matched
+  frames (`perf.trajectory.skew_us`) so the bench can see which edge it is.
+- **Atomic trajectory swap in firmware (protocol 2.2.1).** `START {id = b,
+  t_start, cycles}` while table `a` runs is ACCEPTED iff `b` is committed,
+  `b.period == a.period` and `t_start == a.t_start` (exact µs): the firmware
+  switches the playing table in place, keeping the phase clock and the
+  marker crossing state (no HOLD, no missed marker, no push). Any other START
+  while running still REJs "already running". Host `replace` tries that first
+  and falls back to STOP(a) + START(b) on REJ (older firmware). Pushes from
+  an in-flight capture of the old table keep arriving after the swap, so the
+  host keeps the old id routed for a grace period (max pulse + 5 ms + slack)
+  and does not reuse it meanwhile.
+- **Sensor readout is modelled.** `TriggerOverlap = ReadOut` is set (and
+  restored) with the triggered timing; the trigger rate `1/T` must stay at or
+  below each fovea's maximum frame rate (else `mismatch` with the reason); in
+  the triangle the two exposures' end-to-end spacing must exceed the readout
+  time (`1 / frame_rate_range.max`) or `mismatch` names it.
+- **Timed fallback gives every marker the same pulse** (marker 0's), so the
+  firmware's per-marker strobe timeout matches the camera's single exposure.
+- **Flip tolerance floor 1 ms**, capped at 0.45 × the marker spacing; when the
+  floor exceeds the cap the windows are too close for reliable flipping at
+  that frequency and `mismatch` names it.
+- **No scan before the controller clock is calibrated**; the MCU↔host offset
+  is re-pinged every 30 s like the cameras' (`sessions/controller.ts`).
+- **Lifecycle:** a run ending (detached / ready) during an in-flight replace
+  or start aborts the scan once the await settles; geometry/period changes
+  during a start are reconciled at the commit point; the replace throttle
+  keeps at most one queued op; every stop path reaches the camera restore
+  (`try/finally`, best-effort per feature); START is never sent after a stop
+  or teardown was requested; teardown stops the scan before closing the idle
+  position input so the mirror returns to the center.
+- **UI:** the axis handle is drawn and hit-tested at least 15 strokes from
+  the center regardless of amplitude; the axis slider's range is
+  [−179.5, 180]; ratio gets a detent at 0; `scan_path_closed` travels with
+  the path; the disabled dual slider ignores pointer events.
