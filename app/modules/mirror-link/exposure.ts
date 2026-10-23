@@ -25,6 +25,8 @@ export interface TimingCamera {
   setExposureMode(mode: string): boolean;
   getFeature(name: string): string;
   setFeature(name: string, value: string): void;
+  /** Integer GenICam read (`Camera.getFeatureInt`) — optional on the seam. */
+  getFeatureInt?(name: string): number;
 }
 
 /** How the cameras take the window (contract `ScanTelemetry.exposure_mode`). */
@@ -52,7 +54,56 @@ export type TriggeredTiming = {
   frame_rate: number;
 };
 
+/** The camera's limits under the TRIGGERED timing, for the feasibility checks
+ *  (spec §exposure-windows): the maximum frame rate (Infinity = unknown) and
+ *  the sensor readout time in µs from GenICam `SensorReadoutTime` (null when
+ *  the node is not readable — the checks then use `1 / frame_rate_max`). */
+export type TimingLimits = { frame_rate_max: number; readout_us: number | null };
+
+/** Nothing known: no check fires. */
+export const UNKNOWN_LIMITS: TimingLimits = { frame_rate_max: Infinity, readout_us: null };
+
+/** A positive finite number, else null. */
+const positive = (v: number): number | null => (Number.isFinite(v) && v > 0 ? v : null);
+
+/**
+ * Read {@link TimingLimits} — call it AFTER {@link applyTriggeredTiming}, in
+ * the SAME reconfigure: the pre-scan exposure caps `frame_rate_range.max`,
+ * so a read before the triggered timing would judge the scan by the wrong
+ * camera state. `SensorReadoutTime` is best-effort: an IFloat node on the
+ * Blackfly S, which the string API (`getFeature`) may refuse — then the
+ * integer read is tried, then null.
+ */
+export function readTimingLimits(cam: TimingCamera): TimingLimits {
+  let frameRateMax = Infinity;
+  try {
+    frameRateMax = positive(cam.frame_rate_range.max) ?? Infinity;
+  } catch {
+    // unknown — no rate / readout check from it
+  }
+  let readout: number | null = null;
+  try {
+    readout = positive(Number.parseFloat(cam.getFeature("SensorReadoutTime")));
+  } catch {
+    // not a string-readable node on this model
+  }
+  if (readout === null && cam.getFeatureInt)
+    try {
+      readout = positive(cam.getFeatureInt("SensorReadoutTime"));
+    } catch {
+      // not readable at all — the 1/frame_rate_max fallback stands
+    }
+  return { frame_rate_max: frameRateMax, readout_us: readout };
+}
+
+/** The readout spacing an exposure END needs from the previous one (µs):
+ *  `SensorReadoutTime` when readable, else `1 / frame_rate_max`; 0 unknown. */
+export function readoutSpacingUs(l: TimingLimits): number {
+  return l.readout_us ?? (Number.isFinite(l.frame_rate_max) ? 1e6 / l.frame_rate_max : 0);
+}
+
 /** Default mismatch tolerance: 2 % of the requested window. */
+
 const DEFAULT_MISMATCH_TOL = 0.02;
 
 const clamp = (v: number, r: { min: number; max: number }): number =>

@@ -15,6 +15,8 @@ import { describe, expect, it } from "vitest";
 import {
   applyTriggeredTiming,
   exposureMismatch,
+  readoutSpacingUs,
+  readTimingLimits,
   restoreTiming,
   snapshotTiming,
   type TimingCamera,
@@ -343,7 +345,48 @@ describe("restoreTiming — best-effort per feature", () => {
   });
 });
 
+describe("readTimingLimits — read AFTER the triggered timing", () => {
+  /** A Timed-only camera whose maximum frame rate is capped by its CURRENT
+   *  exposure (the Blackfly S readback): a long pre-scan exposure caps it low. */
+  const capped = (): FakeCamera => {
+    const cam = new FakeCamera(["Timed"]).seed(true, 4, 200_000, "Off");
+    Object.defineProperty(cam, "frame_rate_range", {
+      get: () => ({ min: 1, max: Math.min(MAX_RATE, 1e6 / cam.exposure) }),
+    });
+    return cam;
+  };
+
+  it("sees the rate the TRIGGERED exposure allows, not the pre-scan one", () => {
+    const cam = capped();
+    expect(readTimingLimits(cam).frame_rate_max).toBe(5); // 200 ms pre-scan
+    applyTriggeredTiming(cam, { pulseUs: 50_000, preferTriggerWidth: true });
+    expect(readTimingLimits(cam)).toEqual({ frame_rate_max: 20, readout_us: null });
+  });
+
+  it("takes SensorReadoutTime when readable (string, else integer), best-effort", () => {
+    const str = new FakeCamera().seed(true, 30, 12_000, "Off", { SensorReadoutTime: "8123.5" });
+    expect(readTimingLimits(str)).toEqual({ frame_rate_max: MAX_RATE, readout_us: 8123.5 });
+    const int = Object.assign(new FakeCamera(), {
+      getFeatureInt: (n: string) => (n === "SensorReadoutTime" ? 9000 : 0),
+    });
+    expect(readTimingLimits(int).readout_us).toBe(9000);
+    const none = Object.assign(new FakeCamera(), {
+      getFeatureInt: (): number => {
+        throw new Error("Not a ArvGcInteger");
+      },
+    });
+    expect(readTimingLimits(none).readout_us).toBeNull();
+  });
+
+  it("readoutSpacingUs: the readout time, else 1 / max fps, else 0", () => {
+    expect(readoutSpacingUs({ frame_rate_max: 50, readout_us: 7_000 })).toBe(7_000);
+    expect(readoutSpacingUs({ frame_rate_max: 50, readout_us: null })).toBe(20_000);
+    expect(readoutSpacingUs({ frame_rate_max: Infinity, readout_us: null })).toBe(0);
+  });
+});
+
 describe("exposureMismatch", () => {
+
   it("tolerates 2 % of the window and flags beyond it", () => {
     expect(exposureMismatch(49_900, 50_000)).toBe(false);
     expect(exposureMismatch(49_100, 50_000)).toBe(false); // 1.8 %
