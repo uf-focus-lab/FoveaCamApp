@@ -6,7 +6,9 @@ revolution. A light source that blinks on and off at its own rate therefore
 paints a **dashed ring** in every fovea frame: the gaps in the ring are the
 source's off-periods, so the ring itself is the decoded signal. Use it to read a
 free-running optical transmitter, or simply to see a blink pattern you cannot
-resolve frame by frame.
+resolve frame by frame. The circle is the default; the **Scan Pattern** pane
+also offers an ellipse, a straight line, and a triangle sweep that runs out and
+back along a line (see *To scan*).
 
 **Prerequisites:** a full calibration present (see [Calibration](./calibration.md))
 and all three cameras connected (see [Manage Cameras](./manage-cameras.md)). On
@@ -19,31 +21,35 @@ Three live columns sit across the top:
 
 - **Left Fovea** (cyan) — the left fovea view, a one-line ring readout, and a
   voltage bar. The view is the raw camera image, deliberately *not* straightened:
-  a frame that integrates a whole revolution has no single mirror position to
-  straighten it against, and the un-straightened ring is what you are here to
-  read. The readout row appears only with **Ring Reader** on (see *Reading the
-  emitter*). The voltage bar draws the scan path the mirror is commanded to
-  follow, with the crosshair on the ring's center.
+  a frame that integrates a stretch of the scan has no single mirror position to
+  straighten it against, and the un-straightened path is what you are here to
+  read. (In triangle mode every second frame arrives flipped upright — see
+  *To scan*.) The readout row appears only with **Ring Reader** on (see
+  *Reading the emitter*). The voltage bar draws the scan path the mirror is
+  commanded to follow, with the crosshair on the path's center.
 - **Center Wide** (orange) — the wide view you steer on. It carries a crosshair
-  at the scan center with its angle in degrees, the scan ring, and a small cyan
-  and greenyellow circle showing where each fovea is currently aimed. Below it
-  sit the **Start Scan** button and the scan status readout, then the
-  **Ring View** selector and its two decoder strips (see *Looking inside the
-  decoder*).
+  at the scan center with its angle in degrees, the scan path with its exposed
+  stretches drawn thicker, the **axis handle** (a short spoke from the center
+  ending in a dot), and a small cyan and greenyellow circle showing where each
+  fovea is currently aimed. Below it sit the **Start Scan** button and the scan
+  status readout, then the **Ring View** selector and its two decoder strips
+  (see *Looking inside the decoder*).
 - **Right Fovea** (greenyellow) — the mirror image of the left column.
 
-A pull-up **drawer** along the bottom holds three columns: the mirror controls
-(**Verge Distance**, **Vertical Shift**) on the left; the **Auto Vergence** loop with
-its PID sliders in the middle; and the **Gain** slider, the scan sliders, the
-**Ring Reader** switch and a **Status** row repeating the scan readout on the
-right. Click the tab at the bottom edge to open it — `Ctrl-\`` toggles it from
-the keyboard — then drag the grip to resize it.
+A pull-up **drawer** along the bottom holds four columns, left to right: the
+mirror controls (**Verge Distance**, **Vertical Shift**); the **Auto Vergence**
+loop with its PID sliders; the **Scan Pattern** pane (the shape of the scan and
+where along it the cameras expose); and the **Gain** slider, **Scan Frequency**,
+the **Ring Reader** switch and a **Status** row repeating the scan readout.
+Click the tab at the bottom edge to open it — `Ctrl-\`` toggles it from the
+keyboard — then drag the grips between the columns to resize them.
 
 ### To aim
 
-Press and drag anywhere on the **Center Wide** view. Both foveas follow the
-cursor; a crosshair with a degree readout marks the scan center and the dashed
-ring previews the path the mirrors will trace. Release to leave the mirrors
+Press and drag anywhere on the **Center Wide** view — anywhere except the axis
+handle's dot, which turns the scan instead (see *To scan*). Both foveas follow
+the cursor; a crosshair with a degree readout marks the scan center and the
+dashed path previews what the mirrors will trace. Release to leave the mirrors
 parked there. The depth the two eyes converge on comes from the **Verge
 Distance** slider, not from the drag.
 
@@ -51,7 +57,7 @@ On an uncalibrated rig the crosshair still follows your drag, but the mirrors do
 not move and the aim markers stay hidden — there is no calibration to turn a
 pixel into a mirror angle.
 
-Aiming works the same whether or not the scan is running: the ring simply moves
+Aiming works the same whether or not the scan is running: the path simply moves
 to the new center.
 
 ### To converge the foveas by hand
@@ -113,51 +119,89 @@ refused engage leaves the status at `off — refused` with the reason in its hov
 
 ### To scan
 
-1. Set **Scan Frequency** (1–100 Hz) and **Scan Amplitude** (0–2°, the ring's
-   radius) in the drawer's right column.
-2. Press **Start Scan** (it stays disabled until the three cameras are leased —
-   hover the row to see what it is waiting for). The ring goes solid and the
+The scan's shape lives in the drawer's **Scan Pattern** pane; its speed is
+**Scan Frequency** in the column to its right. The path on the **Center Wide**
+view always previews what the current settings will trace — dashed before you
+start, solid while it runs — and the stretches drawn thicker are the parts the
+cameras actually expose.
+
+1. Pick a **Mode**: **Ellipse** (a closed loop — the circle, an ellipse or a
+   straight line) or **Triangle** (a straight sweep out and back).
+2. Point the scan's main axis. Either drag the **Axis** slider (degrees, `0` is
+   the wide view's horizontal), or press on the **axis handle** — the dot at the
+   end of the short spoke from the scan center — and drag it around on the
+   **Center Wide** view: the axis follows the pointer for as long as you hold
+   the button, and the drag does *not* move the scan center. Press anywhere else
+   on the view and you steer as usual. The pointer turns into a hand over the
+   dot.
+3. Set **Amplitude** (0–2°): the radius along the axis for the ellipse, half the
+   sweep for the triangle.
+4. Shape it per mode:
+   - **Ellipse** — **Ratio** is the width across the axis relative to the
+     length along it: `1.00` is a circle, smaller values flatten it into an
+     ellipse, and `0` (the readout says `line`) collapses it onto the axis, a
+     back-and-forth line. **Exposure Window** is a two-ended slider: the part
+     of each revolution the cameras expose, read out in milliseconds within the
+     period (`0.0–95.0 ms` at 10 Hz).
+   - **Triangle** — the mirrors sweep from one end of the axis to the other in
+     one base period and back in the next, so a full triangle takes *twice* the
+     **Scan Frequency** period, and the cameras take two frames per cycle: one
+     on the way out, one on the way back. **Rising Window** and **Falling
+     Window** set what part of each sweep is exposed, in milliseconds within
+     that sweep. With **Sync Windows** on (the default) the falling window
+     simply copies the rising one and its slider is greyed out; turn Sync off to
+     set it separately. The frame from the return sweep is flipped upside down
+     before you (or the ring reader) see it, so both frames of a cycle read the
+     same way up.
+5. Press **Start Scan** (it stays disabled until the three cameras are leased —
+   hover the row to see what it is waiting for). The path goes solid and the
    status line next to the button — repeated in the drawer's **Status** row —
-   shows the applied timing, for example
-   `10.0 Hz · 100.0 ms · L 99.9 ms · R 99.9 ms`: the frequency, one revolution,
-   and each fovea's exposure.
-3. Adjust the frequency or amplitude while it runs; both take effect live
-   (changing the frequency re-applies the exposure override).
-4. Press **Stop Scan** to end it. The mirrors glide back to the aiming center.
+   shows what is running, for example `ellipse · 10.0 Hz · 100.0 ms · 0.0–95.0
+   ms` (mode, frequency, period, exposure window) or `triangle · 10.0 Hz · 200.0
+   ms · 5.0–95.0 + 105.0–195.0 ms` (the two windows, timed within the doubled
+   period). Hover it for the trigger bookkeeping.
+6. Adjust anything while it runs. Axis, amplitude, ratio, the windows, aiming
+   and the vergence controls take effect without interrupting the scan;
+   changing **Mode** or **Scan Frequency** restarts it on the new period.
+7. Press **Stop Scan** to end it. The mirrors glide back to the aiming center.
 
-The commanded circle is exact, but the mirrors themselves roll off at high
-frequency, so the ring you actually see shrinks as you raise the frequency. That
-is physical, not a bug — pick the highest frequency where the ring is still
-usable.
+The scan needs a controller with firmware 2.2.0 or later: the pattern runs on
+the controller itself, which fires the camera triggers at exact points along
+the path. On older firmware **Start Scan** is refused and the hover says why.
 
-The **voltage bars** under the fovea views draw that commanded circle in volt
+The commanded path is exact, but the mirrors themselves roll off at high
+frequency, so the path you actually see shrinks as you raise the frequency. That
+is physical, not a bug — pick the highest frequency where it is still usable.
+
+The **voltage bars** under the fovea views draw that commanded path in volt
 space — faint before you start, solid while it runs — with the crosshair parked
-on the ring's center. They show the shape the mirror is asked to trace, not a
-moving dot: at 10 revolutions per second a marker would only flicker.
+on its center. They show the shape the mirror is asked to trace, not a moving
+dot: at 10 revolutions per second a marker would only flicker.
 
 ### What the exposure override does
 
-While the scan runs MirrorLink takes over both fovea cameras' **exposure** and
-**frame rate** so one frame covers exactly one revolution. It does not change
-anything saved in [Manage Cameras](./manage-cameras.md): the pre-scan exposure,
-frame rate, frame-rate-enable, and auto-exposure values are remembered when the
-scan starts and written back when it stops, when you leave the app, or whenever
-the frequency is re-applied.
+While the scan runs MirrorLink takes over both fovea cameras' **trigger** and
+**exposure**: each camera is triggered by the controller at the start of a
+window and exposes for exactly as long as the window lasts, so a frame covers
+precisely the stretch of path drawn thick on the wide view. It does not change
+anything saved in [Manage Cameras](./manage-cameras.md): the pre-scan settings
+are remembered when the scan starts and written back when it stops or when you
+leave the app.
 
-A camera that cannot reach the requested frequency keeps its own maximum rate
-and still exposes for one revolution (with a gap between frames). If an exposure
-ends up more than 2 % off the revolution time, the status line turns amber and a
-warning appears in the title-bar tray — the ring in that eye covers only part of
-the circle. Hover the status line for the detail; hover it while idle to see what
-the current settings would apply.
+A camera model that cannot take the trigger's length as its exposure falls back
+to a fixed exposure as long as the first window; the status line then ends in
+`· timed`. In triangle mode with unequal windows that fallback cannot honor both,
+so the status line turns amber. It also turns amber when the cameras stop
+answering the trigger, or when an exposure cannot be applied as asked — hover it
+for the detail; hover it while idle to see what the current settings would run.
 
-If **Start Scan** is refused (no cameras leased, or a camera rejected the
-exposure write) the status line reads *idle — refused* and its hover carries the
-reason.
+If **Start Scan** is refused (no cameras leased, firmware too old, or a camera
+rejected the settings) the status line reads *idle — refused* and its hover
+carries the reason.
 
 ### Reading the emitter
 
-The **Ring Reader** switch in the drawer's right column (under the scan sliders, above
+The **Ring Reader** switch in the drawer's right column (under **Scan Frequency**, above
 **Status**) turns the decoder on. It is **off by default** — it reads every fovea frame on
 its own worker thread, so it is only worth paying for when you are actually reading an
 emitter. It becomes available once the cameras are leased.
@@ -182,8 +226,8 @@ on screen:
 |---|---|
 | `no ring` | No circular track was found — the emitter is out of frame, too dim (raise **Gain**), or the scan is not running. |
 | `no leader` | A ring, but no start marker: usually too dim or the emitter is not sending this format. |
-| `below resolution` | The message is too long for the ring you are drawing. Raise **Scan Amplitude**, or shorten the emitter's message. |
-| `low contrast @ bit N` | The chips have blurred together at that point in the message — the dot is too big for the chip arc. Raise **Scan Amplitude**, shorten the message, or improve focus. The hover shows the measured contrast. |
+| `below resolution` | The message is too long for the ring you are drawing. Raise **Amplitude** (Scan Pattern pane), or shorten the emitter's message. |
+| `low contrast @ bit N` | The chips have blurred together at that point in the message — the dot is too big for the chip arc. Raise **Amplitude** (Scan Pattern pane), shorten the message, or improve focus. The hover shows the measured contrast. |
 | `chip period inconsistent with LEN` | What was read as a message does not fill the ring the way its length field says — usually a mis-locked start marker on a noisy frame. |
 | `no terminating gap`, `truncated` | The ring was garbled — check focus, exposure (the **Status** line must not be amber) and that the emitter's cycle matches the scan frequency. |
 | `crc mismatch` | The message arrived damaged. Single frames fail all the time; a *persistent* failure means the emitter's rate and the scan frequency disagree. |
@@ -222,20 +266,14 @@ until the cameras are leased, or if the two cameras share no common gain range.
 Gain is the same kind of temporary override as the exposure: the pre-session
 gain and auto-gain of both foveas are remembered and written back when you leave
 the app, so [Manage Cameras](./manage-cameras.md) keeps whatever you configured
-there. More gain also means more noise — raise the exposure (a lower scan
+there. More gain also means more noise — widen the exposure window (or lower the scan
 frequency) first when you can.
 
 Note that the slider has no right-click reset: that would slam a live camera to
 its minimum gain mid-alignment.
 
-Dragging Gain — or changing the scan frequency, which rewrites both foveas'
-exposure — no longer disturbs a running scan: the circle is generated on its own
-thread, so the mirrors keep turning while the cameras are being written.
-
-If the ring comes out as a polygon rather than a circle, the serial link to the
-controller is throttling the pose rate: the **Status** line under the scan
-button turns amber and its hover says how many poses per revolution are getting
-through and why.
+Dragging Gain does not disturb a running scan: the pattern runs on the
+controller, so the mirrors keep moving while the cameras are being written.
 
 ## Capturing a ring frame
 

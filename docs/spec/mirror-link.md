@@ -227,9 +227,11 @@ not.
 ## Views {#views}
 
 The L/R main views bind the RAW convert pipes (`nodeId.convert(serial)`) directly, at pipe
-rate — deliberately NOT the homography-undistort bricks: a frame that integrates a full
-revolution has no single mirror pose to warp against, and the un-warped ring is the
-readout. While `ring_reader` is on AND the scan is running (and ONLY then — an off
+rate — deliberately NOT the homography-undistort bricks: a frame that integrates a scan
+window has no single mirror pose to warp against, and the un-warped path is the
+readout. While `state.flipPipes.L/R` is set (triangle mode, §triangle-flip) each view
+binds that FLIP pipe instead, so the falling-sweep frame arrives upright; `null` restores
+the raw binding (the renderer reads the state, never builds the pipe). While `ring_reader` is on AND the scan is running (and ONLY then — an off
 feature leaves no phantom row, and an annotation asserts a decode of the CURRENT frame)
 each carries the §reader annotations in FRAME px: the fitted circle (solid on a decode,
 dim + dashed when only the fit succeeded), the LEADER arc in `--warn` (distinct from both
@@ -245,22 +247,34 @@ uncalibrated) and is the ONLY steering surface; no display worker, no
 stereo/composite/heatmap bricks. Overlays on the center view, all in wide px:
 
 - the target dot at `telemetry.target` (center theme color),
-- the scan ring — radius `telemetry.scan_px` (`|A2P.C(A0 + (amp, 0)) − A2P.C(A0)|`,
-  0 uncalibrated) — dashed and faint while idle (a preview of the path), solid while
-  active,
+- the scan PATH — `telemetry.scan_path_px` as one SVG path, CLOSED for the ellipse with
+  `scan_ratio > 0`, OPEN for the line (ratio 0) and the triangle — dashed and faint
+  while idle (a preview), solid while active; on top of it each `telemetry.scan_window_px`
+  polyline (one per marker: the EXPOSED stretch) at twice the stroke and full opacity,
+  dashed with the path while idle. Empty uncalibrated, nothing drawn,
+- the AXIS HANDLE — a spoke (one stroke) from `telemetry.target` to
+  `telemetry.axis_handle_px` (the +amp end of the main axis) and a filled dot of radius
+  `stroke · 3` there; hidden on the `{0,0}` uncalibrated sentinel. Hit rule: the FIRST
+  cursor event of a drag (the press; the StreamView cursor is already in wide frame px)
+  within `stroke · 6` of the handle starts an AXIS drag — every cursor event of that drag
+  calls `setAxis(px)` and none calls `steer`, until release; any other press steers as
+  before. Both are sent per cursor event, fire-and-forget, identically (the session
+  coalesces the trajectory re-upload, §actuation). A grab / grabbing pointer over the
+  hit zone / during the drag is the only affordance,
 - per-eye markers at `L_PX`/`R_PX`, projected from the CENTER pose (`A2P.C ∘ V2A` of the
   offset-free volts, shift included), not the instantaneous scan pose — they show where
   each fovea is aimed, and separate with the verge/shift. Hidden uncalibrated ({0,0}).
 
 The PosViews draw the scan as a STATIC path with a stable crosshair: `telemetry.volt` is
-the commanded pose while idle and the ring's CENTER while scanning (sampling the circle at
+the commanded pose while idle and the path's CENTER while scanning (sampling the path at
 the 30 Hz telemetry throttle reads as random flicker, not motion), and
-`telemetry.scan_path = { L, R }` carries the commanded circle in VOLT space —
-`SCAN_PATH_SAMPLES` (48) points per eye through the pacer's own chain (offset →
-`inverseTriangulate` + shift → `A2V`), which the renderer closes into a loop and draws with
-`Line2D` (faint idle, solid while active). It is republished on every input that moves or
-reshapes the ring (steer, `scan_amp`, `verge`, `baseline`, `shift`, a vergence step's
-write-back, activation) and
+`telemetry.scan_path = { L, R }` carries the commanded path in VOLT space —
+`SCAN_PATH_SAMPLES` points per eye through the trajectory's own chain (offset →
+`inverseTriangulate` + shift → `A2V`), which the renderer closes into a loop for the
+ellipse with `scan_ratio > 0` and leaves open for the line and the triangle (the center
+view's rule), drawn with `Line2D` (faint idle, solid while active). It is republished on
+every input that moves or reshapes the path (steer, `setAxis`, every pattern key,
+`verge`, `baseline`, `shift`, a vergence step's write-back, activation) and
 NEVER per tick; empty without a leased triple. PosViews are read-only here (no split).
 
 Below the center tile: ONE button whose label swaps Start Scan / Stop Scan (the row is a
@@ -268,23 +282,54 @@ GRID with a fixed 9em first track, so neither the label nor the status text can 
 resize it; label tracks `telemetry.scan`; disabled until `ready`, dimmed in place while a
 start/stop round-trip is in flight; solid `--accent` fill idle, solid `--danger` while
 scanning — emphasis is a FILL, never a border, and both pairs clear AA) and
-a compact status span — the applied `hz · period · per-eye exposure` while active,
-`idle` / `idle — refused` otherwise, warn-toned on `mismatch` or a refusal, with the
-detail (and the blocked reason) in its `title` hover. The row is a PLAIN div, never a
+a compact status span — `mode · hz · period · windows` while active (the period is the
+TRAJECTORY period, T or 2T; each `ScanTelemetry.windows` entry as `start–end` ms within
+it, joined by `+`; a trailing `· timed` on the `Timed` exposure fallback), `idle` /
+`idle — refused` otherwise. Warn-toned on `mismatch`, on a run whose
+`perf.trajectory.pushes` show failures and no OK push, or on a refusal. The `title`
+carries the exposure mode with the applied per-eye exposure / frame rate on a mismatch,
+then the `perf.trajectory` bookkeeping (pushes ok / timeout / busy / other, last
+lateness, live re-uploads, and in triangle mode flipped / unmatched per eye) — or, idle,
+what Start would run, or the blocked reason. The row is a PLAIN div, never a
 `<label>`/ConfigEntry: a label would forward a status-span click to the button and
 toggle the hardware override; the button's own explanation rides the ROW's `title`
-(a disabled button suppresses hover). The drawer carries THREE columns (a nested
-`HorizontalDivision`, ≈ 0.26 / 0.31 / 0.43 — the MIDDLE and RIGHT columns carry the most
-rows, the right the longest strings): the mirror controls (Verge Distance, Vertical Shift)
-left; the vergence loop in the middle — the Auto Vergence toggle with its status FIRST
-(the thing you press and the thing you read, above the knobs that tune them), then the
-SHARED tuning block (Pan / Depth / Vertical PID groups, each with a one-line hover on its
-heading and a `faArrowRotateLeft` reset, plus Min Match Score) — the SAME groups, keys,
-defaults, ranges, per-term hovers and reset glyph as Disparity Scope's, out of
-`@lib/vergence/tuning`; and Gain, the scan sliders (frequency,
-amplitude), the Ring Reader toggle and a Status row right, Gain leading because it is
-session-wide, not scan-scoped. The §ring-views strips are NOT in the drawer — they live
-under the center tile.
+(a disabled button suppresses hover). The drawer carries FOUR columns (nested
+`HorizontalDivision`s, ≈ 0.20 / 0.23 / 0.27 / 0.30 — the two right columns carry the
+longest strings: the window readouts, the frequency readout and the status line): the
+mirror controls (Verge Distance, Vertical Shift); the vergence loop — the Auto Vergence
+toggle with its status FIRST (the thing you press and the thing you read, above the knobs
+that tune them), then the SHARED tuning block (Pan / Depth / Vertical PID groups, each
+with a one-line hover on its heading and a `faArrowRotateLeft` reset, plus Min Match
+Score) — the SAME groups, keys, defaults, ranges, per-term hovers and reset glyph as
+Disparity Scope's, out of `@lib/vergence/tuning`; the **Scan Pattern** pane
+(`ScanPatternPane.vue`, below); and Gain, Scan Frequency (the BASE period both modes
+share — its hover says the triangle's period is twice it), the Ring Reader toggle and a
+Status row, Gain leading because it is session-wide, not scan-scoped. The §ring-views
+strips are NOT in the drawer — they live under the center tile.
+
+The Scan Pattern pane writes the session's `state` proxy directly, like every drawer
+control (the session rebuilds the trajectory and, while active, swaps it in, §actuation).
+Rows, top to bottom: a `SCAN PATTERN` group heading; **Mode** — a two-option horizontal
+`SingleSelect` (Ellipse | Triangle) on `scan_mode`; **Axis** — RangeSlider on
+`scan_axis_deg`, −180..180°, step 0.5, neutral 0, readout `+12.5°`, its hover naming the
+center-view handle as the other way to set it; **Amplitude** — `scan_amp`, 0..2°, step
+0.01, neutral 0.5 (moved here from the right column). Then per mode — Ellipse:
+**Ratio** (`scan_ratio`, 0..1, step 0.01, neutral 1, readout `1.00`, `line` at 0) and
+**Exposure Window** (`scan_window`); Triangle: **Rising Window** (`tri_window_rise`),
+**Falling Window** (`tri_window_fall`) and **Sync Windows** (`tri_window_sync`, an Off | On
+`SingleSelect` — the drawer's boolean idiom, as Ring Reader). The window controls are
+`app/src/inputs/dual-range-slider.vue` (model `[start, end]`, 0..`WINDOW_MAX` = 0.95,
+step and `minGap` 0.005, neutral = the contract default), read out as `start–end ms` of
+the base period `T = 1/scan_hz` — of the period for the ellipse, of each sweep for the
+triangle. While synced the falling slider is DISABLED and paints the rising values (its
+proxy reads `tri_window_rise` and refuses writes; the session mirrors the state). The
+dual slider is RangeSlider's twin: the same body, infill (between the thumbs, exclusion
+blend), label slot (two `<span>`s), cursor glyphs; a press grabs the NEARER thumb and
+drags it through a WINDOW `mousemove` listener (no pointer capture), the dragged thumb
+stopping at the range ends and `minGap` short of the other (never pushing it); each thumb
+is its own tab stop and the arrows step it by `step` (×0.1 per modifier); right-click
+resets to `neutral` only when one is declared. Its value math is `app/src/inputs/
+dual-range.ts` (unit-tested).
 
 One STATUS vocabulary across the drawer, scan and vergence alike: `muted` = nothing
 running, `ok` = healthy, `warn` = the operator must look, with a `dim` modifier on `ok` for
