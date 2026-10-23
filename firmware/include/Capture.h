@@ -16,11 +16,12 @@
 // the synchronous ACK/REJ; asynchronous completion (FIN, or REJ on strobe
 // timeout) is sent directly by tick().
 //
-// Camera lines (V0.1 board): each camera's `trigger` drives camera Line2 and
-// its `strobe` reads camera Line3 (ExposureActive). Exposure start/finish are
-// the strobe line becoming asserted/released at Board::STROBE_ACTIVE_LEVEL;
-// Capture never compares a strobe level against a literal. Strobe and opto
-// pins are inputs and are never written (Line3 is the camera's VAUX input).
+// Camera lines (V0.1 board, see Board.h "Cameras"): each camera's `trigger`
+// drives camera Line3 (input only, TriggerSource=Line3) and its `strobe` reads
+// camera Line2 (open-drain ExposureActive output, pulled up on the Teensy).
+// Exposure start/finish are the strobe line becoming asserted/released at
+// Board::STROBE_ACTIVE_LEVEL; Capture never compares a strobe level against a
+// literal. Strobe and opto pins are inputs and are never written.
 namespace Capture {
 
 using Packet::Command::Microseconds;
@@ -47,7 +48,7 @@ void init();
 // completion (or timeout) and sends FIN/REJ, then starts the next queued
 // request. Call every loop() iteration. A timeout REJ reason always starts
 // with "Strobe timeout"; it names a line stuck at the active level (polarity
-// or Line3 configuration) when that is what it saw.
+// or Line2 configuration) when that is what it saw.
 void tick();
 
 // REJects every queued/in-flight request with `reason` and empties the

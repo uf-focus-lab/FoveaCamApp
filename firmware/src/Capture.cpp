@@ -212,8 +212,9 @@ static inline bool duplicateStream(uint8_t stream) {
 }
 
 // Drives the trigger (camera Line3) of every camera in `cameras`. HIGH =
-// asserted (host programs TriggerActivation=RisingEdge). Only ever touches
-// `.trigger` — see the pin-direction asserts above.
+// asserted: the host programs TriggerActivation=LevelHigh in TriggerWidth
+// exposure mode (the HIGH pulse IS the exposure), RisingEdge in the Timed
+// fallback. Only ever touches `.trigger` — see the pin-direction asserts above.
 static void writeTrigger(uint8_t cameras, uint8_t level) {
   for (unsigned i = 0; i < Board::CAMERA_COUNT; i++)
     if (cameras & (1u << i))
