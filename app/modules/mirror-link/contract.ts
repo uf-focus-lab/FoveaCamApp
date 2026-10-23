@@ -193,8 +193,15 @@ export const mirrorLink = defineContract({
     /** The EXPOSED portions of the path in wide px, one polyline per marker
      *  window (drawn emphasized; the rest of the path dim). */
     scan_window_px: [] as Point2d[][],
-    /** The draggable main-axis handle: the +amp end of the axis in wide px
-     *  ({0,0} uncalibrated — hidden). */
+    /** The path's CENTER in wide px — `A0 + pan` projected, the same center
+     *  the trajectory and `setAxis` use (it differs from `target` while the
+     *  vergence loop holds a pan). The overlay's spoke, handle and hit test
+     *  are anchored here. {0,0} uncalibrated. */
+    scan_center_px: { x: 0, y: 0 } as Point2d,
+    /** The draggable main-axis handle: the axis direction from
+     *  `scan_center_px`, in wide px, at a distance of max(amplitude, ε) so it
+     *  always encodes the axis even at amplitude 0 ({0,0} uncalibrated —
+     *  hidden). */
     axis_handle_px: { x: 0, y: 0 } as Point2d,
     // Per-eye wide-px projection of the offset-free CENTER pose (shift
     // included) — where each fovea is aimed; {0,0} uncalibrated (spec §views).

@@ -234,3 +234,52 @@ round; the per-finding detail lives in the fix commits.
   the center regardless of amplitude; the axis slider's range is
   [−179.5, 180]; ratio gets a detent at 0; `scan_path_closed` travels with
   the path; the disabled dual slider ignores pointer events.
+
+## Review round 2 (2026-10-23) — findings and decisions
+
+Four reviews on e8cae9b re-verified every round-1 fix (all resolved except as
+noted) and found the following, fixed in round 2:
+
+- **Regression:** `scan_path_closed` was never published — every ellipse drew
+  with a gap. Published with the path.
+- **Flip tolerance basis was wrong for two-edge anchors.** The brick matches
+  either edge, so the ambiguity gap is between EDGES of different markers
+  (next marker's start − previous marker's end, circularly), not between
+  marker starts. The tolerance cap, the 1 ms floor comparison and the
+  "windows too close" reason now use that edge gap, and the "late anchor →
+  unmatched" claim holds only because the tolerance stays below it.
+- **Timed fallback with unequal, unsynced triangle windows** could run the
+  falling exposure (rising-window length) into the next rising marker. In
+  Timed mode each marker is kept inside its own slope (`start = min(start,
+  slopeEnd − pulse)`), and a would-be overrun is a `mismatch_reason`. The
+  camera's maximum frame rate is read AFTER the triggered timing is applied
+  (the pre-scan exposure caps it otherwise). A growing Timed exposure is
+  written AFTER the table swap, a shrinking one before (the camera exposure
+  must never exceed the MCU pulse plus its margin).
+- **Spec bookkeeping on reused table ids:** ids alternate after their grace,
+  so `specById` entries expire with the controller's grace rule and a
+  reallocated id resolves to the pending spec.
+- **Atomic START transport failure:** a non-REJ failure (timeout, lost ACK)
+  may have swapped on the MCU; the host re-STARTs the old table at the
+  carried `t_start` before reporting, and distinguishes REJ from transport
+  errors. `replace` waits for an in-flight `start`/`stop`. A "now" start
+  becomes atomic-capable after its first fallback START is ACKed.
+- **Lifecycle:** the Timed pulse change made during a start is reconciled
+  at the commit (`scheduleReplace` unconditionally); a replace queued before
+  a stop/teardown no longer runs; a cancelled start no longer arms the
+  cameras; a restart re-checks the run state and the clock; a clock lapse
+  mid-scan is surfaced as a `mismatch_reason`, not a stop; a gain write
+  queued during teardown is ignored; a failed replace after a Timed retime
+  re-arms the retime.
+- **UI:** the spoke, handle and hit test anchor on the published
+  `scan_center_px` (the panned center), the handle encodes the axis even at
+  amplitude 0, the pane shows that the Timed falling window takes the rising
+  length, skew prints as "—" until a frame matched, hover wording, manual
+  refusal and amber-reason lists, the still-capture contradiction, and the
+  checkbox exception in the design language.
+- **Simulator harness:** the C5 backstep check tolerated repeated DAC words
+  (the 1 Hz refresh re-commits an unchanged value), and the C2/C3/C5 timing
+  margins were tightened against host load; the firmware itself was clean.
+  Host docs say "never doubled; a marker moved before the swap phase first
+  fires next cycle" rather than "no missed marker". The BUSY-after-a-missed-
+  strobe behaviour when the post-window gap is under 5 ms is documented.
