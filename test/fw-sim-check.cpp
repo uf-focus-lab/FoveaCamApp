@@ -19,6 +19,8 @@
 //      bytes); UPDATE unknown id REJ.
 //   4. CMD_FRAME two-phase: ACK{queue_position} -> injected strobes -> FIN
 //      {frame_id, t_trigger < t_exposure, positions == live target}.
+//   4b. Trigger released at exposure end when the strobe falls before the
+//      pulse ends (Timed fallback), so the next capture still rises.
 //   5. Strobe-timeout REJ (strobes disarmed).
 //   6. settle_time: SWITCH-frame trigger deferred >= settle (MCU clock);
 //      same-stream frame undeferred; settle 0 switch undeferred.
@@ -667,6 +669,20 @@ int main() {
             "FIN right = stream target");
       std::printf("fw-sim-check: 4 two-phase FIN (frame_id=%u) OK\n",
                   frame.fin.frame_id);
+    }
+
+    // 4b — the trigger line is RELEASED when the exposure ends before the
+    //      pulse does (Timed fallback: a camera exposure shorter than the
+    //      pulse), so the next capture still gets a rising edge. Without the
+    //      release the second frame here times out (the line never fell).
+    {
+      // Strobes still armed at 500/2500 us from stage 4; pulse 10 ms.
+      const auto first = runFrame(wire, 1, 10'000, 0);
+      CHECK(first.finished, "short-exposure frame FINs (strobe fell mid-pulse)");
+      const auto second = runFrame(wire, 1, 10'000, 0);
+      CHECK(second.finished,
+            "next frame FINs: the trigger was released at exposure end");
+      std::printf("fw-sim-check: 4b trigger released at exposure end OK\n");
     }
 
     // 5 — strobe-timeout REJ
