@@ -36,6 +36,12 @@ than polish.
    **`:focus-visible` outlines** (keyboard a11y — never removed) and **primary
    / destructive emphasis**, which is carried by a **solid fill**, not a border
    (e.g. a danger button is a filled red, not a red-bordered ghost).
+   **Accepted exception — MirrorLink's Sync Windows checkbox**
+   (`app/modules/mirror-link/ScanPatternPane.vue`): the owner explicitly asked
+   for a real native checkbox there, so its unchecked resting border is the
+   native control's. Checked, it still takes the accent as a fill
+   (`accent-color`). This is a recorded one-off, not a precedent: other on/off
+   controls stay borderless selectors.
 
 ---
 

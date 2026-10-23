@@ -433,20 +433,28 @@ stereo/composite/heatmap bricks. Overlays on the center view, all in wide px:
   while idle (a preview), solid while active; on top of it each `telemetry.scan_window_px`
   polyline (one per marker: the EXPOSED stretch) at twice the stroke and full opacity,
   dashed with the path while idle. Empty uncalibrated, nothing drawn,
-- the AXIS HANDLE — a spoke (one stroke) from `telemetry.target` to the DRAWN handle and a
-  filled dot of radius `stroke · 3` (`AXIS_HANDLE_DOT`) there. The handle only sets the
-  axis DIRECTION, so its distance need not be the amplitude: it is drawn at
-  `target + unit(axis_handle_px − target) · max(|axis_handle_px − target|, 15 · stroke)`
+- the AXIS HANDLE — a spoke (one stroke) from the scan CENTER to the DRAWN handle and a
+  filled dot of radius `stroke · 3` (`AXIS_HANDLE_DOT`) there. The center is
+  `telemetry.scan_center_px` — the panned path center the trajectory and `setAxis` use,
+  which differs from `target` while the vergence loop holds a pan — falling back to
+  `telemetry.target` only on its `{0,0}` uncalibrated sentinel (`overlay.ts#scanCenterOf`);
+  the spoke, the handle ray and the hit test's center exclusion all anchor there, while
+  the crosshair stays at `target`. The handle only sets the axis DIRECTION
+  (`axis_handle_px` always encodes it, even at amplitude 0), so its distance need not be
+  the amplitude: it is drawn at
+  `center + unit(axis_handle_px − center) · max(|axis_handle_px − center|, 15 · stroke)`
   (`AXIS_HANDLE_MIN_DIST`, `overlay.ts#axisHandleAt`) — at the +amp end of the main axis,
   or further out along it at a small amplitude, so its grab zone never covers the
-  crosshair and its dot never hides the target dot. Hidden on the `{0,0}` uncalibrated
-  sentinel and when `axis_handle_px` coincides with the target (no direction; the overlay
-  stays telemetry-driven and never falls back to `state.scan_axis_deg`). Hit rule: the
+  center. Hidden on the `{0,0}` uncalibrated sentinel and when `axis_handle_px`
+  coincides with the center (no direction; the overlay stays telemetry-driven and never
+  falls back to `state.scan_axis_deg`). A handle pushed off the frame edge (a large
+  amplitude, a center near the edge) is not clamped back in and so cannot be grabbed;
+  the Axis slider remains. Hit rule: the
   FIRST cursor event of a drag (the press; the StreamView cursor is already in wide frame
   px) within `stroke · 6` (`AXIS_HANDLE_HIT`) of the DRAWN handle, and NOT nearer the
-  target than that same radius, starts an AXIS drag — every cursor event of that drag
-  calls `setAxis(px)` and none calls `steer`, until release; any other press (the
-  crosshair always) steers as before. Both are sent per cursor event, fire-and-forget,
+  scan center than that same radius, starts an AXIS drag — every cursor event of that
+  drag calls `setAxis(px)` and none calls `steer`, until release; any other press (the
+  scan center always) steers as before. Both are sent per cursor event, fire-and-forget,
   identically (the session coalesces the trajectory re-upload, §actuation). Affordance:
   a grab / grabbing pointer over the hit zone / during the drag, the handle's opacity
   0.75 → 1 over the hit zone and during the drag, and the dot × 1.3 during the drag,
@@ -476,11 +484,15 @@ TRAJECTORY period, T or 2T; each `ScanTelemetry.windows` entry as `start–end` 
 it, joined by `+`; a trailing `· timed` on the `Timed` exposure fallback), `idle` /
 `idle — refused` otherwise. Warn-toned on `mismatch`, on a run whose
 `perf.trajectory.pushes` show failures and no OK push, or on a refusal. The `title`
-carries, on a mismatch, "the requested window" (ellipse) / "windows" (triangle), the
-`Timed` fallback note, `ScanTelemetry.mismatch_reason` when set and the applied per-eye
-exposure / frame rate; then the `perf.trajectory` bookkeeping (pushes ok / timeout / busy
-/ other, last lateness, live re-uploads, and in triangle mode flipped / unmatched / `skew_us`
-per eye and `flip_tolerance_us`) — or, idle, what Start would run (its period computed
+carries, on a mismatch, the NEUTRAL lead-in "Exposure mismatch — " (not every reason is a
+camera limit: the flip-spacing one is the windows' own geometry) followed by
+`ScanTelemetry.mismatch_reason` with no second colon — or, with no reason, "the cameras
+cannot take the requested window" (ellipse) / "windows" (triangle) — then the `Timed`
+fallback note and the applied per-eye exposure / frame rate; then the `perf.trajectory`
+bookkeeping (pushes ok / timeout / busy / other, last lateness, live re-uploads, and in
+triangle mode flipped / unmatched / `skew_us` per eye — "—" for an eye whose `flipped`
+count is 0, so a never-matched eye does not read as a perfect 0 µs — and
+`flip_tolerance_us`) — or, idle, what Start would run (its period computed
 from `1000 / scan_hz`, doubled for the triangle, then rounded — never from the rounded
 readout), or the blocked reason. The row is a PLAIN div, never a
 `<label>`/ConfigEntry: a label would forward a status-span click to the button and
@@ -513,7 +525,8 @@ session normalizes −180 to 180, which would make the thumb jump to the right e
 (`tri_window_fall`) and **Sync Windows** (`tri_window_sync`, a real `<input
 type="checkbox">`, checked by default — the owner asked for a checkbox, so it is the one
 boolean in the drawer that is not an Off | On `SingleSelect`; checked it fills with
-`--accent`, unchecked its resting border is the native control's). Sync means identical
+`--accent`, unchecked its resting border is the native control's — the accepted exception
+to design-language principle 5). Sync means identical
 TIMING: the falling window takes the rising window's fractions, each counted from the
 start of its own sweep, so an asymmetric window exposes opposite ends of the line on the
 two frames; the Sync hover and the synced Falling Window hover both say so. The window controls are
@@ -521,7 +534,13 @@ two frames; the Sync hover and the synced Falling Window hover both say so. The 
 step and `minGap` 0.005, neutral = the contract default), read out as `start–end ms` of
 the base period `T = 1/scan_hz` — of the period for the ellipse, of each sweep for the
 triangle. While synced the falling slider is DISABLED and paints the rising values (its
-proxy reads `tri_window_rise` and refuses writes; the session mirrors the state). The
+proxy reads `tri_window_rise` and refuses writes; the session mirrors the state). On the
+`Timed` exposure fallback (`index.vue` passes the pane `timed` =
+`telemetry.scan?.exposure_mode === "Timed"`) every marker exposes for the RISING window's
+length, so in triangle mode the Falling Window readout gains a `(timed: rising length)`
+cue and its hover explains it (the falling frame exposes that long from its start, moved
+earlier if it would overrun the sweep); the pane shows nothing more — the windows
+actually applied are on the status line. The
 dual slider is RangeSlider's twin: the same body, infill (between the thumbs, exclusion
 blend), label slot (two `<span>`s), cursor glyphs; a press grabs the NEARER thumb and
 drags it through a WINDOW `mousemove` listener (no pointer capture), the dragged thumb
