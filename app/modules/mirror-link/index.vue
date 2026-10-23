@@ -46,8 +46,8 @@ import RingHistogram from "./RingHistogram.vue";
 import ScanPatternPane from "./ScanPatternPane.vue";
 import {
   AXIS_HANDLE_DOT,
+  axisHandleAt,
   hitsAxisHandle,
-  isClosedPath,
   polylinePath,
   ringGeometry,
   strokeFor,
@@ -93,9 +93,12 @@ const stroke = computed(() => strokeFor(frameC.value?.shape));
 
 // --- steering + the axis handle (spec §targeting, §views) -------------------
 // The StreamView cursor is already in wide FRAME px (the overlay's viewBox).
-// A press landing within `stroke · AXIS_HANDLE_HIT` of the axis handle starts
-// an AXIS drag: every move then turns the main axis (`setAxis`) and steering is
-// suppressed until release. Anywhere else the drag steers, as it always has.
+// The handle is DRAWN at least `AXIS_HANDLE_MIN_DIST` strokes out along the
+// axis (`axisHandleAt` — it only sets a direction), and a press landing within
+// `stroke · AXIS_HANDLE_HIT` of that drawn dot — but never that close to the
+// center itself — starts an AXIS drag: every move then turns the main axis
+// (`setAxis`) and steering is suppressed until release. Anywhere else the drag
+// steers, as it always has.
 // Both go out per cursor event, fire-and-forget, exactly alike — the session
 // coalesces the trajectory re-upload (spec §actuation).
 const cursor = shallowRef<(Rect & { buttons: number }) | null>(null);
@@ -107,21 +110,27 @@ watch(cursor, (c, prev) => {
   }
   // The FIRST event of a drag (null → point) is the press: classify it once.
   if (!prev)
-    axisDrag.value = hitsAxisHandle(c, telemetry.axis_handle_px, stroke.value);
+    axisDrag.value = hitsAxisHandle(
+      c,
+      telemetry.target,
+      telemetry.axis_handle_px,
+      stroke.value,
+    );
   const px = { x: c.x, y: c.y };
   if (axisDrag.value) void session.call("setAxis", px);
   else void session.call("steer", px);
 });
-/** Hidden on the {0,0} uncalibrated sentinel. */
-const handleShown = computed(() => {
-  const h = telemetry.axis_handle_px;
-  return h.x !== 0 || h.y !== 0;
-});
+/** The DRAWN handle; null (hidden) on the {0,0} uncalibrated sentinel or a
+ *  handle with no direction from the center. */
+const handlePx = computed(() =>
+  axisHandleAt(telemetry.target, telemetry.axis_handle_px, stroke.value),
+);
 // Hover affordance: a grab cursor over the handle's hit zone.
 const overHandle = ref(false);
 function onHover(m: { x: number; y: number } | null): void {
   overHandle.value =
-    m !== null && hitsAxisHandle(m, telemetry.axis_handle_px, stroke.value);
+    m !== null &&
+    hitsAxisHandle(m, telemetry.target, telemetry.axis_handle_px, stroke.value);
 }
 
 const drawer_height = ref(0);
@@ -159,8 +168,9 @@ const gainTitle = computed(() =>
 
 // --- scan (spec §lifecycle, §scan-patterns) ---------------------------------
 const scanning = computed(() => telemetry.scan !== null);
-const period_ms = computed(() =>
-  (1000 / Math.max(state.scan_hz, SCAN_HZ_RANGE.min)).toFixed(1),
+/** The base period T in ms, unrounded (readouts format it themselves). */
+const periodMs = computed(
+  () => 1000 / Math.max(state.scan_hz, SCAN_HZ_RANGE.min),
 );
 
 /** One exposure window as `start–end` (ms) within the trajectory period. */
@@ -177,7 +187,9 @@ const trajectoryDetail = computed(() => {
   if (telemetry.scan?.mode === "triangle")
     s +=
       `; flipped L ${p.flipped.L} · R ${p.flipped.R}, ` +
-      `unmatched L ${p.unmatched.L} · R ${p.unmatched.R}`;
+      `unmatched L ${p.unmatched.L} · R ${p.unmatched.R}, ` +
+      `skew L ${p.skew_us.L.toFixed(0)} µs · R ${p.skew_us.R.toFixed(0)} µs ` +
+      `(tolerance ${p.flip_tolerance_us.toFixed(0)} µs)`;
   return s + ".";
 });
 
@@ -197,8 +209,12 @@ const scanStatus = computed<{ text: string; tone: string; title: string }>(
           text,
           tone: "warn",
           title:
-            `The cameras cannot take the requested window${timed ? "s (no TriggerWidth exposure on this model)" : ""}: ` +
-            `applied exposure L ${ms(t.exposure_us.L)} ms · R ${ms(t.exposure_us.R)} ms, ` +
+            `The cameras cannot take the requested ${t.mode === "triangle" ? "windows" : "window"}` +
+            (timed ? " (no TriggerWidth exposure on this model)" : "") +
+            (t.mismatch_reason
+              ? `: ${t.mismatch_reason.replace(/\.\s*$/, "")}. `
+              : ". ") +
+            `Applied exposure L ${ms(t.exposure_us.L)} ms · R ${ms(t.exposure_us.R)} ms, ` +
             `frame rate L ${t.frame_rate.L.toFixed(1)} Hz · R ${t.frame_rate.R.toFixed(1)} Hz. ` +
             trajectoryDetail.value,
         };
@@ -222,7 +238,7 @@ const scanStatus = computed<{ text: string; tone: string; title: string }>(
     }
     const reason = telemetry.scan_blocked;
     const triangle = state.scan_mode === "triangle";
-    const period = (Number(period_ms.value) * (triangle ? 2 : 1)).toFixed(1);
+    const period = (periodMs.value * (triangle ? 2 : 1)).toFixed(1);
     return {
       text: reason ? "idle — refused" : "idle",
       tone: reason ? "warn" : "muted",
@@ -236,10 +252,10 @@ const scanStatus = computed<{ text: string; tone: string; title: string }>(
 
 // The commanded path in volt space, closed back onto its first point for the
 // ellipse so the PosView polyline reads as a loop; the line and the triangle
-// stay open (spec §views). Empty stays empty.
-const closedPath = computed(() =>
-  isClosedPath(state.scan_mode, state.scan_ratio),
-);
+// stay open (spec §views). Whether to close comes from the session WITH the
+// path (`scan_path_closed`), so a mode/ratio write in flight never pairs the
+// old path with the new rule. Empty stays empty.
+const closedPath = computed(() => telemetry.scan_path_closed);
 const closeIf = (path: readonly Pos[]): Pos[] =>
   closedPath.value && path.length > 1 ? [...path, path[0]] : [...path];
 const scanPath = computed(() => ({
@@ -650,21 +666,23 @@ const statusR = computed(() => ringStatus("R"));
           stroke-linejoin="round"
           :stroke-dasharray="scanning ? undefined : stroke * 4"
         />
-        <!-- The main-axis handle: a short spoke from the center to the +amp
-             end and a dot there; press within its hit zone and drag to turn
-             the axis (spec §views). Hidden uncalibrated ({0,0}). -->
-        <g v-if="handleShown" :opacity="overHandle || axisDrag ? 1 : 0.75">
+        <!-- The main-axis handle: a spoke from the center out along the +amp
+             direction and a dot at its end — at the +amp end, or further out
+             when the amplitude is small (`axisHandleAt`: it only sets the
+             direction); press within its hit zone and drag to turn the axis
+             (spec §views). Hidden uncalibrated ({0,0}). -->
+        <g v-if="handlePx" :opacity="overHandle || axisDrag ? 1 : 0.75">
           <line
             :x1="telemetry.target.x"
             :y1="telemetry.target.y"
-            :x2="telemetry.axis_handle_px.x"
-            :y2="telemetry.axis_handle_px.y"
+            :x2="handlePx.x"
+            :y2="handlePx.y"
             :stroke="THEME.C"
             :stroke-width="stroke"
           />
           <circle
-            :cx="telemetry.axis_handle_px.x"
-            :cy="telemetry.axis_handle_px.y"
+            :cx="handlePx.x"
+            :cy="handlePx.y"
             :r="stroke * AXIS_HANDLE_DOT * (axisDrag ? 1.3 : 1)"
             :fill="THEME.C"
           />
@@ -978,7 +996,7 @@ const statusR = computed(() => ringStatus("R"));
                     <span>Scan Frequency</span>
                     <span
                       >{{ state.scan_hz.toFixed(1) }} Hz &middot;
-                      {{ period_ms }} ms</span
+                      {{ periodMs.toFixed(1) }} ms</span
                     >
                   </RangeSlider>
                   <div class="toggle-row" :title="RING_TITLE">
