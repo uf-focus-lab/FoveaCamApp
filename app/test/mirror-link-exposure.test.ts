@@ -4,31 +4,33 @@
 // You may find the full license in project root directory.
 // -------------------------------------------------------
 //
-// Exposure override (spec docs/spec/mirror-link.md §exposure) against a fake
-// camera whose exposure CEILING tracks its frame rate — the constraint the
-// two-sided write order exists for. Every write is checked against the range
-// live at that write, in BOTH directions (raising and lowering the frequency),
-// and apply→restore must land byte-identically on the snapshot.
+// Triggered exposure override (spec docs/spec/mirror-link.md §exposure-windows)
+// against a fake camera whose exposure CEILING tracks its frame rate and whose
+// exposure is only writable in Timed mode — the constraints the write order
+// exists for. TriggerWidth is the primary mode (the pulse IS the exposure), the
+// Timed fallback clamps the pulse, and apply→restore lands byte-identically on
+// the snapshot (exposure mode + TriggerActivation included).
 
 import { describe, expect, it } from "vitest";
 import {
-  applyScanTiming,
+  applyTriggeredTiming,
   exposureMismatch,
   restoreTiming,
-  scanPeriodUs,
   snapshotTiming,
   type TimingCamera,
 } from "@modules/mirror-link/exposure";
 
 /** Exposure ceiling while frame-rate control is ON: one period minus the
- *  readout gap; free-running the camera allows a 30 s exposure. */
+ *  readout gap; free-running (or triggered) the camera allows 30 s. */
 const ceiling = (enabled: boolean, rate: number): number =>
   enabled ? 1e6 / rate - 100 : 30e6;
 
 const MAX_RATE = 60;
+const MIN_EXPOSURE = 20;
 
 class FakeCamera implements TimingCamera {
-  /** Writes that landed OUTSIDE the range live at the moment of the write. */
+  /** Writes that landed OUTSIDE the range live at the moment of the write, or
+   *  on a node the current mode makes read-only. */
   readonly violations: string[] = [];
   /** Every write, in order — the field names alone. */
   readonly writes: string[] = [];
@@ -36,6 +38,19 @@ class FakeCamera implements TimingCamera {
   private _auto: "Off" | "Once" | "Continuous" = "Continuous";
   private _rate = 30;
   private _exposure = 12_000;
+  readonly features: Record<string, string> = {
+    ExposureMode: "Timed",
+    TriggerActivation: "RisingEdge",
+  };
+
+  constructor(
+    /** Modes `setExposureMode` accepts. */
+    private readonly modes: string[] = ["Timed", "TriggerWidth"],
+    /** Feature names whose `setFeature` throws (a model lacking the entry). */
+    private readonly refuse: Set<string> = new Set(),
+    /** Feature names `getFeature` throws on (a model without the node). */
+    private readonly missing: Set<string> = new Set(),
+  ) {}
 
   /** Seed the camera's pre-scan timing without recording the writes. */
   seed(
@@ -43,11 +58,13 @@ class FakeCamera implements TimingCamera {
     rate: number,
     exposure: number,
     auto: FakeCamera["_auto"],
+    features: Partial<Record<string, string>> = {},
   ): this {
     this._enable = enable;
     this._rate = rate;
     this._exposure = exposure;
     this._auto = auto;
+    Object.assign(this.features, features);
     return this;
   }
 
@@ -55,7 +72,7 @@ class FakeCamera implements TimingCamera {
     return { min: 1, max: MAX_RATE };
   }
   get exposure_range(): { min: number; max: number } {
-    return { min: 20, max: ceiling(this._enable, this._rate) };
+    return { min: MIN_EXPOSURE, max: ceiling(this._enable, this._rate) };
   }
   get frame_rate_enable(): boolean {
     return this._enable;
@@ -86,111 +103,199 @@ class FakeCamera implements TimingCamera {
   }
   set exposure(v: number) {
     this.writes.push("exposure");
+    if (this.features.ExposureMode !== "Timed")
+      this.violations.push(`exposure written in ${this.features.ExposureMode} mode`);
     const r = this.exposure_range;
     if (v < r.min || v > r.max)
       this.violations.push(`exposure=${v} outside ${r.min}..${r.max}`);
     this._exposure = v;
   }
+  setExposureMode(mode: string): boolean {
+    this.writes.push(`ExposureMode=${mode}`);
+    if (!this.modes.includes(mode)) return false;
+    this.features.ExposureMode = mode;
+    return true;
+  }
+  getFeature(name: string): string {
+    if (this.missing.has(name)) throw new Error(`[${name}] not found`);
+    const v = this.features[name];
+    if (v === undefined) throw new Error(`[${name}] not found`);
+    return v;
+  }
+  setFeature(name: string, value: string): void {
+    this.writes.push(`${name}=${value}`);
+    if (this.refuse.has(name)) throw new Error(`[${name}] '${value}' not an entry`);
+    this.features[name] = value;
+  }
 }
 
-describe("applyScanTiming", () => {
-  it("keeps every write inside the LIVE range while LOWERING the frequency", () => {
-    // Short period → long exposure: the ceiling only WIDENS after the rate write.
-    const cam = new FakeCamera().seed(true, 50, 15_000, "Off");
-    const applied = applyScanTiming(cam, 2);
-    expect(cam.violations).toEqual([]);
-    expect(applied.frame_rate).toBe(2);
-    expect(applied.exposure_us).toBeCloseTo(ceiling(true, 2), 6);
-  });
-
-  it("keeps every write inside the LIVE range while RAISING the frequency", () => {
-    // A long exposure the new rate could never hold: it must shrink FIRST.
-    const cam = new FakeCamera().seed(true, 2, 400_000, "Off");
-    const applied = applyScanTiming(cam, 50);
-    expect(cam.violations).toEqual([]);
-    expect(applied.frame_rate).toBe(50);
-    expect(applied.exposure_us).toBeCloseTo(ceiling(true, 50), 6);
-  });
-
-  it("writes exposure BEFORE and AFTER the rate, with exposure_auto Off first", () => {
-    const cam = new FakeCamera();
-    applyScanTiming(cam, 10);
+describe("applyTriggeredTiming — TriggerWidth (primary)", () => {
+  it("takes the pulse as the exposure: no exposure write, LevelHigh activation", () => {
+    const cam = new FakeCamera().seed(true, 30, 12_000, "Continuous");
+    const applied = applyTriggeredTiming(cam, { pulseUs: 45_000, preferTriggerWidth: true });
+    expect(applied).toEqual({ exposure_mode: "TriggerWidth", exposure_us: 0, frame_rate: 30 });
+    expect(cam.features.ExposureMode).toBe("TriggerWidth");
+    expect(cam.features.TriggerActivation).toBe("LevelHigh");
     expect(cam.exposure_auto).toBe("Off");
-    expect(cam.frame_rate_enable).toBe(true);
+    expect(cam.frame_rate_enable).toBe(false);
     expect(cam.writes).toEqual([
       "exposure_auto",
-      "exposure",
       "frame_rate_enable",
-      "frame_rate",
-      "exposure",
+      "ExposureMode=TriggerWidth",
+      "TriggerActivation=LevelHigh",
     ]);
-  });
-
-  it("clamps a frequency above the camera's max rate and keeps exposure = period", () => {
-    const cam = new FakeCamera();
-    const hz = 100; // > MAX_RATE
-    const applied = applyScanTiming(cam, hz);
     expect(cam.violations).toEqual([]);
-    expect(applied.frame_rate).toBe(MAX_RATE);
-    // Dead time between frames — the frame still spans exactly one revolution.
-    expect(applied.exposure_us).toBeCloseTo(scanPeriodUs(hz), 6);
-    expect(exposureMismatch(applied.exposure_us, scanPeriodUs(hz))).toBe(false);
-  });
-
-  it("flags a mismatch when the ceiling forces a shorter exposure than the period", () => {
-    const cam = new FakeCamera();
-    const hz = 1; // period 1e6 µs, ceiling at rate 1 is 999900 µs
-    const applied = applyScanTiming(cam, hz);
-    expect(applied.exposure_us).toBeLessThan(scanPeriodUs(hz));
-    // ...but only by 0.01 %, so it is NOT a mismatch at the 2 % tolerance.
-    expect(exposureMismatch(applied.exposure_us, scanPeriodUs(hz))).toBe(false);
-    expect(exposureMismatch(applied.exposure_us, scanPeriodUs(hz), 0)).toBe(
-      true,
-    );
   });
 });
 
-describe("restoreTiming", () => {
-  it("returns the snapshot byte-identically after an apply (both directions)", () => {
+describe("applyTriggeredTiming — Timed fallback", () => {
+  it("falls back when the model refuses TriggerWidth: RisingEdge + exposure = pulse", () => {
+    const cam = new FakeCamera(["Timed"]).seed(true, 30, 12_000, "Off");
+    const applied = applyTriggeredTiming(cam, { pulseUs: 45_000, preferTriggerWidth: true });
+    expect(applied).toEqual({ exposure_mode: "Timed", exposure_us: 45_000, frame_rate: 30 });
+    expect(cam.features.ExposureMode).toBe("Timed");
+    expect(cam.features.TriggerActivation).toBe("RisingEdge");
+    expect(cam.writes).toEqual([
+      "exposure_auto",
+      "frame_rate_enable",
+      "ExposureMode=TriggerWidth",
+      "ExposureMode=Timed",
+      "TriggerActivation=RisingEdge",
+      "exposure",
+    ]);
+    // Rate limit OFF first: a 45 ms exposure never fits the 30 fps ceiling,
+    // but the free-running ceiling holds it.
+    expect(cam.violations).toEqual([]);
+  });
+
+  it("falls back when LevelHigh is not an entry (TriggerWidth would expose for nothing)", () => {
+    const cam = new FakeCamera(undefined, new Set(["TriggerActivation"]));
+    // RisingEdge is refused too by this fake — so the Timed path throws.
+    expect(() =>
+      applyTriggeredTiming(cam, { pulseUs: 1_000, preferTriggerWidth: true }),
+    ).toThrow(/not an entry/);
+    const ok = new FakeCamera();
+    const orig = ok.setFeature.bind(ok);
+    ok.setFeature = (n, v) => {
+      if (v === "LevelHigh") throw new Error("[TriggerActivation] 'LevelHigh' not an entry");
+      orig(n, v);
+    };
+    expect(applyTriggeredTiming(ok, { pulseUs: 1_000, preferTriggerWidth: true }).exposure_mode).toBe(
+      "Timed",
+    );
+  });
+
+  it("uses Timed directly when TriggerWidth is not preferred", () => {
+    const cam = new FakeCamera();
+    const applied = applyTriggeredTiming(cam, { pulseUs: 2_000, preferTriggerWidth: false });
+    expect(applied.exposure_mode).toBe("Timed");
+    expect(cam.writes).not.toContain("ExposureMode=TriggerWidth");
+  });
+
+  it("clamps the pulse to the live exposure range (min and max)", () => {
+    const short = new FakeCamera(["Timed"]);
+    expect(applyTriggeredTiming(short, { pulseUs: 5, preferTriggerWidth: true }).exposure_us).toBe(
+      MIN_EXPOSURE,
+    );
+    const long = new FakeCamera(["Timed"]);
+    expect(
+      applyTriggeredTiming(long, { pulseUs: 60e6, preferTriggerWidth: true }).exposure_us,
+    ).toBe(30e6);
+    expect(short.violations).toEqual([]);
+    expect(long.violations).toEqual([]);
+  });
+
+  it("throws when the model takes neither mode", () => {
+    const cam = new FakeCamera([]);
+    expect(() =>
+      applyTriggeredTiming(cam, { pulseUs: 1_000, preferTriggerWidth: true }),
+    ).toThrow(/refused both/);
+  });
+});
+
+describe("snapshot + restore", () => {
+  it("returns the snapshot byte-identically after an apply (both modes, many seeds)", () => {
     for (const [enable, rate, exposure, auto] of [
       [false, 30, 12_000, "Continuous"],
       [true, 50, 15_000, "Off"],
       [true, 2, 400_000, "Once"],
-    ] as const) {
-      const cam = new FakeCamera().seed(enable, rate, exposure, auto);
-      const snap = snapshotTiming(cam);
-
-      for (const hz of [2, 50, 100]) {
-        applyScanTiming(cam, hz);
-        restoreTiming(cam, snap);
-        expect(snapshotTiming(cam)).toEqual(snap);
+    ] as const)
+      for (const modes of [["Timed", "TriggerWidth"], ["Timed"]]) {
+        const cam = new FakeCamera(modes).seed(enable, rate, exposure, auto, {
+          TriggerActivation: "FallingEdge",
+        });
+        const snap = snapshotTiming(cam);
+        expect(snap.exposure_mode).toBe("Timed");
+        expect(snap.trigger_activation).toBe("FallingEdge");
+        for (const pulseUs of [500, 45_000, 2e6]) {
+          applyTriggeredTiming(cam, { pulseUs, preferTriggerWidth: true });
+          restoreTiming(cam, snap);
+          expect(snapshotTiming(cam)).toEqual(snap);
+        }
+        expect(cam.violations).toEqual([]);
       }
-      expect(cam.violations).toEqual([]);
-    }
   });
 
-  it("writes exposure twice around the rate and exposure_auto LAST", () => {
+  it("restores the mode FIRST, TriggerActivation next, exposure twice around the rate, exposure_auto LAST", () => {
     const cam = new FakeCamera();
-    const snap = snapshotTiming(cam); // exposure_auto "Continuous"
-    applyScanTiming(cam, 20);
+    const snap = snapshotTiming(cam);
+    applyTriggeredTiming(cam, { pulseUs: 10_000, preferTriggerWidth: true });
     cam.writes.length = 0;
     restoreTiming(cam, snap);
     expect(cam.writes).toEqual([
+      "ExposureMode=Timed",
+      "TriggerActivation=RisingEdge",
       "exposure",
       "frame_rate",
       "frame_rate_enable",
       "exposure",
       "exposure_auto",
     ]);
+    // The exposure writes landed in Timed mode (TriggerWidth makes it read-only).
+    expect(cam.violations).toEqual([]);
     expect(cam.exposure_auto).toBe("Continuous");
+  });
+
+  it("skips nodes the model lacks (null in the snapshot, never written back)", () => {
+    const cam = new FakeCamera(undefined, undefined, new Set(["ExposureMode", "TriggerActivation"]));
+    const snap = snapshotTiming(cam);
+    expect(snap.exposure_mode).toBeNull();
+    expect(snap.trigger_activation).toBeNull();
+    applyTriggeredTiming(cam, { pulseUs: 10_000, preferTriggerWidth: false });
+    cam.writes.length = 0;
+    restoreTiming(cam, snap);
+    expect(cam.writes.some((w) => w.startsWith("ExposureMode") || w.startsWith("TriggerActivation"))).toBe(
+      false,
+    );
+  });
+
+  it("falls back to the generic feature write when setExposureMode refuses the saved mode", () => {
+    const cam = new FakeCamera(["Timed", "TriggerWidth"]).seed(false, 30, 12_000, "Off", {
+      ExposureMode: "TriggerControlled",
+    });
+    const snap = snapshotTiming(cam);
+    // Restore the exposure writes in Timed: seed the fake back to Timed after apply.
+    applyTriggeredTiming(cam, { pulseUs: 10_000, preferTriggerWidth: true });
+    cam.writes.length = 0;
+    try {
+      restoreTiming(cam, snap);
+    } catch {
+      // the fake's exposure guard may complain; only the mode write matters here
+    }
+    expect(cam.writes.slice(0, 2)).toEqual([
+      "ExposureMode=TriggerControlled",
+      "ExposureMode=TriggerControlled",
+    ]);
+    expect(cam.features.ExposureMode).toBe("TriggerControlled");
   });
 });
 
 describe("exposureMismatch", () => {
-  it("tolerates 2 % and flags beyond it", () => {
+  it("tolerates 2 % of the window and flags beyond it", () => {
     expect(exposureMismatch(49_900, 50_000)).toBe(false);
     expect(exposureMismatch(49_100, 50_000)).toBe(false); // 1.8 %
     expect(exposureMismatch(48_000, 50_000)).toBe(true); // 4 %
     expect(exposureMismatch(16_566, 10_000)).toBe(true);
+    expect(exposureMismatch(49_900, 50_000, 0)).toBe(true);
   });
 });
