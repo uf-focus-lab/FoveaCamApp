@@ -19,6 +19,7 @@ import {
   axisHandleAt,
   hitsAxisHandle,
   polylinePath,
+  scanCenterOf,
 } from "@modules/mirror-link/overlay";
 
 describe("polylinePath", () => {
@@ -120,5 +121,59 @@ describe("hitsAxisHandle", () => {
     expect(hitsAxisHandle({ x: 100 + big * 5, y: 50 }, target, h, big)).toBe(
       false,
     );
+  });
+});
+
+describe("scanCenterOf + a panned scan center", () => {
+  const stroke = 1;
+  const target = { x: 100, y: 50 };
+  // The vergence loop holds a pan: the path center sits 40 px right of the
+  // crosshair, and the handle encodes +x from THAT center.
+  const center = { x: 140, y: 50 };
+  const handle = { x: 140 + 100, y: 50 };
+
+  it("uses scan_center_px, and falls back to target only on {0,0}", () => {
+    expect(scanCenterOf(center, target)).toEqual(center);
+    expect(scanCenterOf({ x: 0, y: 0 }, target)).toEqual(target);
+  });
+
+  it("draws the handle on the ray from the scan center, not the crosshair", () => {
+    const c = scanCenterOf(center, target);
+    expect(axisHandleAt(c, handle, stroke)).toEqual(handle);
+    // A handle close to the center is pushed out along the axis FROM the
+    // center: anchored on the target the ray would point the same way here,
+    // but the minimum distance would be measured from the wrong point.
+    const near = { x: 142, y: 50 };
+    const at = axisHandleAt(c, near, stroke)!;
+    expect(at.x).toBeCloseTo(140 + AXIS_HANDLE_MIN_DIST * stroke, 9);
+    expect(at.y).toBeCloseTo(50, 9);
+  });
+
+  it("keeps the direction when the handle lies off the target's ray", () => {
+    // Axis straight down (+y) from the panned center: anchored on the target
+    // the drawn direction would tilt toward the target.
+    const down = { x: 140, y: 50 + 3 };
+    const at = axisHandleAt(scanCenterOf(center, target), down, stroke)!;
+    expect(at.x).toBeCloseTo(140, 9);
+    expect(at.y).toBeCloseTo(50 + AXIS_HANDLE_MIN_DIST * stroke, 9);
+  });
+
+  it("excludes presses near the scan center, not near the target", () => {
+    const r = stroke * AXIS_HANDLE_HIT;
+    const near = { x: 142, y: 50 };
+    // The crosshair sits ON the drawn handle (a pan of one handle length):
+    // the exclusion is around the scan center, so the handle still grabs.
+    const c = { x: 140, y: 50 };
+    const at = axisHandleAt(c, near, stroke)!;
+    const onHandle = { ...at };
+    expect(scanCenterOf(c, onHandle)).toEqual(c);
+    expect(hitsAxisHandle(at, scanCenterOf(c, onHandle), near, stroke)).toBe(
+      true,
+    );
+    // A press on the scan center itself always steers.
+    expect(hitsAxisHandle(c, c, near, stroke)).toBe(false);
+    expect(
+      hitsAxisHandle({ x: c.x + r - 0.01, y: c.y }, c, near, stroke),
+    ).toBe(false);
   });
 });

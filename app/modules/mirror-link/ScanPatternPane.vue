@@ -20,9 +20,15 @@ import type { StateOf } from "@lib/orchestrator/protocol";
 import { mirrorLink, type ScanMode, type ScanWindow } from "./contract";
 import { SCAN_AMP_RANGE, SCAN_HZ_RANGE, WINDOW_MAX, WINDOW_MIN } from "./scan";
 
-/** The session's live `state` proxy (`useSession(...).state`): writes go
- *  straight to the session, as with every other drawer control. */
-const props = defineProps<{ state: StateOf<typeof mirrorLink> }>();
+/** `state`: the session's live `state` proxy (`useSession(...).state`) —
+ *  writes go straight to the session, as with every other drawer control.
+ *  `timed`: the running scan is on the Timed exposure fallback (no
+ *  TriggerWidth on this camera model) — every marker then exposes for the
+ *  RISING window's length, so the falling slider says so. */
+const props = defineProps<{
+  state: StateOf<typeof mirrorLink>;
+  timed?: boolean;
+}>();
 const state = props.state;
 
 /** One keyboard step = the narrowest window the session accepts
@@ -83,17 +89,25 @@ const RATIO_TITLE =
 const WINDOW_TITLE =
   "The part of each revolution the foveas expose, as start–end within the period. Right-click resets to neutral.";
 const RISE_TITLE =
-  "The part of the outward sweep the foveas expose, as start–end within the sweep. Right-click resets to neutral.";
+  "The part of the sweep toward the handle the foveas expose, as start–end within the sweep. Right-click resets to neutral.";
 // Sync means identical TIMING (spec review round 1, decided): the falling
 // window takes the rising window's fractions, each counted from the start of
 // its own sweep — so an asymmetric window exposes opposite ends of the line on
 // the two frames.
 const SYNC_MEANS =
   "the same timing within the return sweep, which starts from the far end — so a window not centred in its sweep exposes opposite ends of the line on the two frames";
-const fallTitle = computed(() =>
-  state.tri_window_sync
-    ? `Follows Rising Window while Sync is on: ${SYNC_MEANS}.`
-    : "The part of the return sweep the foveas expose, as start–end within the sweep; that frame arrives flipped vertically. Right-click resets to neutral.",
+/** The Timed fallback exposes a fixed duration per trigger — the rising
+ *  window's length — so the falling slider's end is not what the camera uses
+ *  (the status line shows the windows actually applied). */
+const TIMED_CUE = " (timed: rising length)";
+const TIMED_MEANS =
+  " The camera is on the Timed exposure fallback: every trigger exposes for the rising window's length, so the falling frame exposes that long from the falling start (moved earlier if it would run past the sweep), whatever this slider's end.";
+const fallTitle = computed(
+  () =>
+    (state.tri_window_sync
+      ? `Follows Rising Window while Sync is on: ${SYNC_MEANS}.`
+      : "The part of the return sweep the foveas expose, as start–end within the sweep; that frame arrives flipped vertically. Right-click resets to neutral.") +
+    (props.timed ? TIMED_MEANS : ""),
 );
 const SYNC_TITLE = `Give the falling sweep the rising sweep's window: ${SYNC_MEANS}.`;
 </script>
@@ -192,7 +206,7 @@ const SYNC_TITLE = `Give the falling sweep the rising sweep's window: ${SYNC_MEA
         label="Falling window"
       >
         <span>Falling Window</span>
-        <span>{{ windowMs(fallWindow) }}</span>
+        <span>{{ windowMs(fallWindow) }}{{ timed ? TIMED_CUE : "" }}</span>
       </DualRangeSlider>
       <!-- A real checkbox (owner's ask), checked by default: the drawer's
            other on/off controls are selectors, this one is a plain tick. -->

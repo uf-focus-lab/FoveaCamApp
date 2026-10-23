@@ -49,6 +49,7 @@ import {
   axisHandleAt,
   hitsAxisHandle,
   polylinePath,
+  scanCenterOf,
   ringGeometry,
   strokeFor,
 } from "./overlay";
@@ -99,10 +100,17 @@ const stroke = computed(() => strokeFor(frameC.value?.shape));
 // center itself — starts an AXIS drag: every move then turns the main axis
 // (`setAxis`) and steering is suppressed until release. Anywhere else the drag
 // steers, as it always has.
+// The spoke, the handle ray and the hit test are anchored on the PATH center
+// (`scan_center_px`, the panned center the trajectory and `setAxis` use), not
+// on `target`: the two differ while the vergence loop holds a pan. The
+// crosshair stays at `target`.
 // Both go out per cursor event, fire-and-forget, exactly alike — the session
 // coalesces the trajectory re-upload (spec §actuation).
 const cursor = shallowRef<(Rect & { buttons: number }) | null>(null);
 const axisDrag = ref(false);
+const scanCenter = computed(() =>
+  scanCenterOf(telemetry.scan_center_px, telemetry.target),
+);
 watch(cursor, (c, prev) => {
   if (!c) {
     axisDrag.value = false;
@@ -112,7 +120,7 @@ watch(cursor, (c, prev) => {
   if (!prev)
     axisDrag.value = hitsAxisHandle(
       c,
-      telemetry.target,
+      scanCenter.value,
       telemetry.axis_handle_px,
       stroke.value,
     );
@@ -123,14 +131,14 @@ watch(cursor, (c, prev) => {
 /** The DRAWN handle; null (hidden) on the {0,0} uncalibrated sentinel or a
  *  handle with no direction from the center. */
 const handlePx = computed(() =>
-  axisHandleAt(telemetry.target, telemetry.axis_handle_px, stroke.value),
+  axisHandleAt(scanCenter.value, telemetry.axis_handle_px, stroke.value),
 );
 // Hover affordance: a grab cursor over the handle's hit zone.
 const overHandle = ref(false);
 function onHover(m: { x: number; y: number } | null): void {
   overHandle.value =
     m !== null &&
-    hitsAxisHandle(m, telemetry.target, telemetry.axis_handle_px, stroke.value);
+    hitsAxisHandle(m, scanCenter.value, telemetry.axis_handle_px, stroke.value);
 }
 
 const drawer_height = ref(0);
@@ -177,6 +185,11 @@ const periodMs = computed(
 const windowText = (w: { t_offset_us: number; pulse_us: number }) =>
   `${ms(w.t_offset_us)}–${ms(w.t_offset_us + w.pulse_us)}`;
 
+/** One eye's flip skew — "—" until a frame of that eye matched a marker (a
+ *  0 µs skew would otherwise read as a perfect match). */
+const skewText = (flipped: number, us: number) =>
+  flipped > 0 ? `${us.toFixed(0)} µs` : "—";
+
 /** The MCU run's bookkeeping, for the status hover (spec §actuation). */
 const trajectoryDetail = computed(() => {
   const p = telemetry.perf.trajectory;
@@ -189,7 +202,7 @@ const trajectoryDetail = computed(() => {
     s +=
       `; flipped L ${p.flipped.L} · R ${p.flipped.R}, ` +
       `unmatched L ${p.unmatched.L} · R ${p.unmatched.R}, ` +
-      `skew L ${p.skew_us.L.toFixed(0)} µs · R ${p.skew_us.R.toFixed(0)} µs ` +
+      `skew L ${skewText(p.flipped.L, p.skew_us.L)} · R ${skewText(p.flipped.R, p.skew_us.R)} ` +
       `(tolerance ${p.flip_tolerance_us.toFixed(0)} µs)`;
   return s + ".";
 });
@@ -209,12 +222,15 @@ const scanStatus = computed<{ text: string; tone: string; title: string }>(
         return {
           text,
           tone: "warn",
+          // A neutral lead-in for every reason: not all are camera limits
+          // (the flip-spacing one is the windows' own geometry).
           title:
-            `The cameras cannot take the requested ${t.mode === "triangle" ? "windows" : "window"}` +
-            (timed ? " (no TriggerWidth exposure on this model)" : "") +
+            "Exposure mismatch — " +
             (t.mismatch_reason
-              ? `: ${t.mismatch_reason.replace(/\.\s*$/, "")}. `
-              : ". ") +
+              ? t.mismatch_reason.replace(/\.\s*$/, "")
+              : `the cameras cannot take the requested ${t.mode === "triangle" ? "windows" : "window"}`) +
+            (timed ? " (Timed fallback: no TriggerWidth exposure on this model)" : "") +
+            ". " +
             `Applied exposure L ${ms(t.exposure_us.L)} ms · R ${ms(t.exposure_us.R)} ms, ` +
             `frame rate L ${t.frame_rate.L.toFixed(1)} Hz · R ${t.frame_rate.R.toFixed(1)} Hz. ` +
             trajectoryDetail.value,
@@ -667,15 +683,16 @@ const statusR = computed(() => ringStatus("R"));
           stroke-linejoin="round"
           :stroke-dasharray="scanning ? undefined : stroke * 4"
         />
-        <!-- The main-axis handle: a spoke from the center out along the +amp
+        <!-- The main-axis handle: a spoke from the scan center
+             (`scan_center_px`, not the crosshair) out along the axis
              direction and a dot at its end — at the +amp end, or further out
              when the amplitude is small (`axisHandleAt`: it only sets the
              direction); press within its hit zone and drag to turn the axis
              (spec §views). Hidden uncalibrated ({0,0}). -->
         <g v-if="handlePx" :opacity="overHandle || axisDrag ? 1 : 0.75">
           <line
-            :x1="telemetry.target.x"
-            :y1="telemetry.target.y"
+            :x1="scanCenter.x"
+            :y1="scanCenter.y"
             :x2="handlePx.x"
             :y2="handlePx.y"
             :stroke="THEME.C"
@@ -963,7 +980,10 @@ const statusR = computed(() => ringStatus("R"));
               :min-width-right="0.35"
             >
               <template #left>
-                <ScanPatternPane :state="state" />
+                <ScanPatternPane
+                  :state="state"
+                  :timed="telemetry.scan?.exposure_mode === 'Timed'"
+                />
               </template>
               <template #right>
                 <div class="options fill">
