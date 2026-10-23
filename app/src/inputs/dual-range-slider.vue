@@ -6,7 +6,8 @@
 // listener (no pointer capture — RangeSlider's rule, so a release anywhere ends
 // it); each thumb is its own tab stop, arrows step the focused one.
 //
-//   <DualRangeSlider v-model="window" :min="0" :max="0.95" :step="0.005" :min-gap="0.005">
+//   <DualRangeSlider v-model="window" :min="0" :max="0.95" :step="0.005" :min-gap="0.005"
+//                    label="Exposure window" :value-text="(v) => ms(v)">
 //     <span>Window</span><span>{{ readout }}</span>
 //   </DualRangeSlider>
 //
@@ -66,6 +67,20 @@ const props = defineProps({
     required: false,
     default: "currentColor",
   },
+  /** Accessible name of the whole control (the `role="group"` root); each
+   *  thumb is named `<label> start` / `<label> end`. */
+  label: {
+    type: String,
+    required: false,
+    default: undefined,
+  },
+  /** A thumb's human-readable value (its `aria-valuetext`, e.g. the ms
+   *  readout); omitted, assistive tech reads the raw number. */
+  valueText: {
+    type: Function as PropType<(v: number) => string>,
+    required: false,
+    default: undefined,
+  },
 });
 const emit = defineEmits<{ (e: "update:modelValue", v: Pair): void }>();
 const element = useTemplateRef<HTMLDivElement>("el");
@@ -76,10 +91,13 @@ function bindThumb(i: number, el: unknown) {
   thumbs[i] = (el as HTMLDivElement | null) ?? null;
 }
 
+// `step` is the grid a gap-limited thumb lands on (`./dual-range`), so an
+// emitted `end − start` is never a rounding error short of `minGap`.
 const bounds = computed(() => ({
   min: props.min,
   max: props.max,
   minGap: props.minGap,
+  step: Math.abs(props.step),
 }));
 /** The model as drawn — a stale out-of-range value never paints a thumb past
  *  the track. */
@@ -169,7 +187,11 @@ function handleKeydown(which: Thumb, e: KeyboardEvent) {
   set(which, pair.value[which] + dir * scale * Math.abs(props.step));
 }
 
-const THUMB_LABELS = ["Start", "End"] as const;
+const THUMB_LABELS = computed(() =>
+  props.label
+    ? [`${props.label} start`, `${props.label} end`]
+    : ["Start", "End"],
+);
 /** Per-thumb ARIA bounds: each thumb's travel is limited by the other. */
 const thumbAria = computed(() => {
   const [lo, hi] = pair.value;
@@ -186,6 +208,7 @@ const thumbAria = computed(() => {
     ref="el"
     class="dual-range-slider"
     role="group"
+    :aria-label="label"
     :style="{ color }"
     :aria-disabled="disabled || undefined"
     :class="{ dragging: active !== null }"
@@ -205,11 +228,12 @@ const thumbAria = computed(() => {
       :class="{ active: active === i }"
       role="slider"
       :style="s"
-      :tabindex="disabled ? -1 : 0"
+      :tabindex="disabled ? undefined : 0"
       :aria-label="THUMB_LABELS[i]"
       :aria-valuemin="thumbAria[i].min"
       :aria-valuemax="thumbAria[i].max"
       :aria-valuenow="thumbAria[i].now"
+      :aria-valuetext="valueText?.(thumbAria[i].now)"
       :aria-disabled="disabled || undefined"
       @keydown="handleKeydown(i as Thumb, $event)"
     ></div>
@@ -239,7 +263,9 @@ const thumbAria = computed(() => {
     opacity: 0.5;
     filter: grayscale(0.5);
   }
-  &:hover,
+  // Never on a disabled slider: hover must not lift it back to full strength
+  // (nor can it hold focus — its thumbs drop their tabindex while disabled).
+  &:not([disabled]):hover,
   &.dragging,
   &:focus-within {
     opacity: 1;
@@ -277,6 +303,9 @@ const thumbAria = computed(() => {
     width: 0.2ch;
     transform: translateX(-50%);
     outline: none;
+    // RangeSlider's rule: a press lands on the root, which picks the nearer
+    // thumb and focuses it — a thumb is never a hit target of its own.
+    pointer-events: none;
     // Triangles above and below the slider body (outside)
     &::before,
     &::after {
@@ -303,7 +332,7 @@ const thumbAria = computed(() => {
   }
   // Hover shows both thumbs' glyphs dimmed; the thumb being dragged or holding
   // focus shows them at full strength, so the arrows' target is unambiguous.
-  &:hover .cursor,
+  &:not([disabled]):hover .cursor,
   &.dragging .cursor,
   &:focus-within .cursor {
     &::before,
