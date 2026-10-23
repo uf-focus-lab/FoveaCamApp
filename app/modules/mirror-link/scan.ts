@@ -114,7 +114,10 @@ export function patternOffset(
   if (mode === "triangle")
     return rotate({ x: a * triangleWave(phase01), y: 0 }, axisDeg);
   const phi = 2 * Math.PI * phase01;
-  const r = Math.min(Math.max(ratio, SCAN_RATIO_RANGE.min), SCAN_RATIO_RANGE.max);
+  const r = Math.min(
+    Math.max(ratio, SCAN_RATIO_RANGE.min),
+    SCAN_RATIO_RANGE.max,
+  );
   return rotate({ x: a * Math.cos(phi), y: r * a * Math.sin(phi) }, axisDeg);
 }
 
@@ -145,14 +148,20 @@ export function patternSamples(
     const T = sweepUs(hz);
     return [
       { tOffsetUs: 0, offset: patternOffset(mode, 0, axisDeg, ampDeg, ratio) },
-      { tOffsetUs: T, offset: patternOffset(mode, 0.5, axisDeg, ampDeg, ratio) },
+      {
+        tOffsetUs: T,
+        offset: patternOffset(mode, 0.5, axisDeg, ampDeg, ratio),
+      },
     ];
   }
   const n = Math.min(ELLIPSE_SAMPLES, P);
   const out: PatternSample[] = [];
   for (let k = 0; k < n; k++) {
     const t = Math.round((k * P) / n);
-    out.push({ tOffsetUs: t, offset: patternOffset(mode, t / P, axisDeg, ampDeg, ratio) });
+    out.push({
+      tOffsetUs: t,
+      offset: patternOffset(mode, t / P, axisDeg, ampDeg, ratio),
+    });
   }
   return out;
 }
@@ -188,7 +197,8 @@ export function clampWindow(w: readonly [number, number]): ScanWindow {
 
 /** One unit in the last place of `v` (an upper bound — nudges may skip one
  *  representable value, never fall short). */
-const ulp = (v: number): number => Math.max(Math.abs(v) * Number.EPSILON, Number.MIN_VALUE);
+const ulp = (v: number): number =>
+  Math.max(Math.abs(v) * Number.EPSILON, Number.MIN_VALUE);
 
 /** Tolerance for comparing window ends: far below any pane step (0.005) and
  *  any µs of a marker, far above float noise. */
@@ -280,7 +290,10 @@ export function timedWindowMarkers(
   const pulse = Math.max(1, Math.round(pulseUs));
   const placed = raw.map((m, k) => {
     const slopeStart = mode === "triangle" ? k * T : 0;
-    const t = Math.max(slopeStart, Math.min(m.tOffsetUs, slopeStart + cap - pulse));
+    const t = Math.max(
+      slopeStart,
+      Math.min(m.tOffsetUs, slopeStart + cap - pulse),
+    );
     return { tOffsetUs: t, pulseUs: pulse };
   });
   let overrun = false;
@@ -332,7 +345,10 @@ export function flipEdges(
  * included. Overlapping exposures give 0. No pair of different flip (the
  * ellipse, or one marker) → `P`.
  */
-export function minFlipEdgeGapUs(markers: readonly FlipMarkerEdges[], P: number): number {
+export function minFlipEdgeGapUs(
+  markers: readonly FlipMarkerEdges[],
+  P: number,
+): number {
   let gap = P;
   for (const a of markers)
     for (const b of markers) {
@@ -366,18 +382,53 @@ export const FLIP_TOLERANCE_CAP_FRACTION = 0.45;
  * {@link FLIP_TOLERANCE_FLOOR_US} and capped at `0.45 × gap`. When the floor
  * exceeds the cap the windows are too close for reliable flipping at this
  * frequency: `tooClose` is set (the session flags `mismatch`; the scan still
- * runs) and the tolerance is the cap.
+ * runs) and the tolerance is the cap. `capUs` is that cap — the widest
+ * tolerance that keeps the no-mis-flip guarantee ({@link flipRebuildNeeded}).
  */
 export function flipToleranceUs(
   periodUs: number,
   sweepUs: number,
   markers: readonly FlipMarkerEdges[],
-): { toleranceUs: number; tooClose: boolean } {
+): FlipTolerance {
   const gap = minFlipEdgeGapUs(markers, periodUs);
   const cap = FLIP_TOLERANCE_CAP_FRACTION * gap;
-  const want = Math.max(FLIP_TOLERANCE_FRACTION * Math.min(sweepUs, gap), FLIP_TOLERANCE_FLOOR_US);
-  if (FLIP_TOLERANCE_FLOOR_US > cap) return { toleranceUs: cap, tooClose: true };
-  return { toleranceUs: Math.min(want, cap), tooClose: false };
+  const want = Math.max(
+    FLIP_TOLERANCE_FRACTION * Math.min(sweepUs, gap),
+    FLIP_TOLERANCE_FLOOR_US,
+  );
+  if (FLIP_TOLERANCE_FLOOR_US > cap)
+    return { toleranceUs: cap, capUs: cap, tooClose: true };
+  return { toleranceUs: Math.min(want, cap), capUs: cap, tooClose: false };
+}
+
+/** A run's flip tolerance rule ({@link flipToleranceUs}), µs. */
+export type FlipTolerance = {
+  toleranceUs: number;
+  capUs: number;
+  tooClose: boolean;
+};
+
+/**
+ * Whether the flip bricks, attached with `currentUs`, must be rebuilt for a
+ * live window change whose rule is `next` (spec §triangle-flip). The bricks
+ * are rebuilt only when the tolerance in force is UNSAFE or STALE:
+ *   - tighter, when it exceeds the new cap (`0.45 × edge gap`: the
+ *     no-mis-flip guarantee would no longer hold);
+ *   - wider, when it is below the 1 ms floor while the floor fits under the
+ *     new cap (windows dragged close, then apart again), or below half the
+ *     new tolerance.
+ * In between the bricks keep their value — a rebuild rebinds the views and
+ * restarts the ring worker, so a window being dragged must not rebuild on
+ * every throttled replace. After a rebuild (`currentUs = next.toleranceUs`)
+ * none of the three holds, so the rule never oscillates.
+ */
+export function flipRebuildNeeded(
+  currentUs: number,
+  next: FlipTolerance,
+): boolean {
+  if (currentUs > next.capUs) return true;
+  if (currentUs < FLIP_TOLERANCE_FLOOR_US && !next.tooClose) return true;
+  return currentUs < next.toleranceUs / 2;
 }
 
 /**
@@ -451,7 +502,9 @@ export function windowPaths(
     const k = Math.max(2, Math.ceil(span * n) + 1);
     const out: Point2d[] = [];
     for (let i = 0; i < k; i++)
-      out.push(patternOffset(mode, p0 + (span * i) / (k - 1), axisDeg, ampDeg, ratio));
+      out.push(
+        patternOffset(mode, p0 + (span * i) / (k - 1), axisDeg, ampDeg, ratio),
+      );
     return out;
   });
 }

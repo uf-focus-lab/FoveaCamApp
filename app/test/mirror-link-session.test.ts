@@ -64,6 +64,8 @@ const ctl = vi.hoisted(() => ({
     edges: unknown[];
   }>,
   workers: [] as Array<{ init: { pipes: Array<{ role: string }> } }>,
+  /** When set, every worker's `sendParams` throws it. */
+  sendParamsError: null as Error | null,
   hostNs: 1_000_000_000n,
   /** The triple `acquireTriple` hands out — built per test (fake cameras). */
   triple: null as unknown,
@@ -284,7 +286,9 @@ vi.mock("@orchestrator/vision-worker-host", () => ({
     const w = { init };
     ctl.workers.push(w);
     return {
-      sendParams: () => {},
+      sendParams: () => {
+        if (ctl.sendParamsError) throw ctl.sendParamsError;
+      },
       terminate: () => {
         const i = ctl.workers.indexOf(w);
         if (i >= 0) ctl.workers.splice(i, 1);
@@ -547,6 +551,7 @@ async function harness(
   ctl.reports.length = 0;
   ctl.wirings.length = 0;
   ctl.workers.length = 0;
+  ctl.sendParamsError = null;
   ctl.positionUpdates = 0;
   const triple = makeTriple(opts);
   ctl.triple = triple;
@@ -1122,6 +1127,29 @@ describe("live geometry → replace", () => {
   });
 });
 
+describe("scan.amp_deg", () => {
+  it("is the RUNNING amplitude: a failed replace leaves it at the old one", async () => {
+    const h = await harness({ state: { scan_amp: 0.5 } });
+    await h.call("startScan");
+    expect(h.tele.scan.amp_deg).toBe(0.5);
+    ctl.replaceError = new Error("upload REJ");
+    await h.setState("scan_amp", 0.9);
+    await vi.advanceTimersByTimeAsync(0);
+    await settle();
+    expect(h.traj().replaceCalls).toBe(1);
+    expect(h.tele.scan.amp_deg).toBe(0.5);
+    await h.tick();
+    expect(h.tele.scan.amp_deg).toBe(0.5);
+    // ...and a replace that lands publishes the new one.
+    ctl.replaceError = null;
+    perfNow += 200;
+    await h.setState("scan_amp", 0.8);
+    await vi.advanceTimersByTimeAsync(200);
+    await settle();
+    expect(h.tele.scan.amp_deg).toBe(0.8);
+  });
+});
+
 describe("period change", () => {
   it("scan_hz while active: stop → rebuild → start, keeping the camera config", async () => {
     const h = await harness();
@@ -1361,6 +1389,103 @@ describe("triangle flip", () => {
     await settle();
     expect(ok.flipSeam.attached[0]!.toleranceNs).toBe(4_000_000n);
     expect(ok.tele.scan.mismatch).toBe(false);
+  });
+
+  it("a tightened tolerance widens back once the windows move apart (round-3 hysteresis)", async () => {
+    // 50 Hz, T = 20 ms: rising [0.8, 0.88] → a 2.4 ms edge gap → the 1 ms floor.
+    const h = await harness({
+      maxFps: 500,
+      state: { scan_mode: "triangle", tri_window_sync: false, scan_hz: 50 },
+    });
+    await h.setState("tri_window_rise", [0.8, 0.88]);
+    await h.setState("tri_window_fall", [0, 0.5]);
+    await h.call("startScan");
+    await settle();
+    expect(h.flipSeam.attached.map((a) => a.toleranceNs)).toEqual([
+      1_000_000n,
+      1_000_000n,
+    ]);
+    // Dragged close: a 1 ms edge gap → the 0.45 ms cap, too close.
+    await h.setState("tri_window_rise", [0.88, 0.95]);
+    await vi.advanceTimersByTimeAsync(0);
+    await settle();
+    expect(h.flipSeam.attached).toHaveLength(4);
+    expect(h.flipSeam.attached.at(-1)!.toleranceNs).toBe(450_000n);
+    expect(h.tele.scan.mismatch_reason).toBe(
+      "exposure windows too close for reliable flipping at this frequency",
+    );
+    // ...and apart again: 450 µs is below the floor that fits again → wider.
+    perfNow += 200;
+    await h.setState("tri_window_rise", [0.8, 0.88]);
+    await vi.advanceTimersByTimeAsync(200);
+    await settle();
+    expect(h.flipSeam.attached).toHaveLength(6);
+    expect(h.flipSeam.attached.at(-1)!.toleranceNs).toBe(1_000_000n);
+    expect(h.tele.scan.mismatch).toBe(false);
+    expect(h.tele.scan.mismatch_reason).toBeNull();
+    await h.tick();
+    expect(h.tele.perf.trajectory.flip_tolerance_us).toBe(1000);
+  });
+
+  it("sync on: small rising-window widenings keep the bricks while the tolerance fits the cap", async () => {
+    // 10 Hz defaults: a 10 ms edge gap → 4 ms (cap 4.5 ms).
+    const h = await harness({
+      state: { scan_mode: "triangle", ring_reader: true },
+    });
+    await h.call("startScan");
+    await settle();
+    expect(h.flipSeam.attached).toHaveLength(2);
+    const workers = ctl.workers.length;
+    const flipPipes = h.state.flipPipes;
+    // Each widening (mirrored into the falling window) shrinks the gap by
+    // 0.2 ms: caps 4.41 → 4.14 ms, all above the 4 ms in force.
+    for (const start of [0.048, 0.046, 0.044, 0.042]) {
+      perfNow += 200;
+      await h.setState("tri_window_rise", [start, 0.95]);
+      await vi.advanceTimersByTimeAsync(200);
+      await settle();
+    }
+    expect(h.traj().replaced).toHaveLength(4);
+    expect(h.traj().replaced.at(-1)!.markers![1]!.tOffsetUs).toBe(104_200);
+    expect(h.flipSeam.attached).toHaveLength(2); // no rebuild
+    expect(h.flipSeam.detached).toEqual([]);
+    expect(h.state.flipPipes).toBe(flipPipes);
+    expect(ctl.workers.length).toBe(workers);
+    expect(h.tele.scan.mismatch).toBe(false);
+    await h.tick();
+    expect(h.tele.perf.trajectory.flip_tolerance_us).toBe(4000);
+  });
+
+  it("buildFlips is all or nothing: the second eye's attach fails → the first retires, start refused", async () => {
+    const h = await harness({ state: { scan_mode: "triangle" } });
+    const attach = h.flipSeam.attach;
+    h.flipSeam.attach = (src, id, o) => {
+      if (id === "camera/SR/convert/flip")
+        throw new Error("native attach failed");
+      attach(src, id, o);
+    };
+    expect(await h.call("startScan")).toBe(false);
+    await settle();
+    expect(h.flipSeam.attached.map((a) => a.id)).toEqual([
+      "camera/SL/convert/flip",
+    ]);
+    // The first eye's brick retired; the second never left an advertised pipe.
+    expect(h.flipSeam.detached).toEqual(["camera/SL/convert/flip"]);
+    expect(h.flipSeam.unadvertised).toEqual([
+      "camera/SR/convert/flip",
+      "camera/SL/convert/flip",
+    ]);
+    expect(h.state.flipPipes ?? { L: null, R: null }).toEqual({
+      L: null,
+      R: null,
+    });
+    expect(h.tele.scan_blocked).toBe(
+      "trajectory start failed: native attach failed",
+    );
+    expect(h.tele.scan).toBeFalsy();
+    expect(ctl.triggerOff).toEqual(["SL", "SR"]);
+    expect(h.traj().startCalls).toBe(0);
+    expect(h.traj().closes).toBe(1);
   });
 
   it("accumulates flip counters across brick rebuilds within a run; skew from the probe", async () => {
@@ -1964,6 +2089,27 @@ describe("lifecycle: no START after a stop or teardown was requested", () => {
     expect(h.traj().startCalls).toBe(0);
     expect(h.traj().closes).toBe(1);
     expect(ctl.triggerOff).toEqual(["SL", "SR"]);
+  });
+
+  it("teardown with a throwing scan-stop step still disarms the cameras and restores the gain", async () => {
+    const h = await harness({ state: { ring_reader: true } });
+    await h.call("startScan");
+    await h.setState("gain", 12);
+    expect(h.triple.leases.L.camera.gain).toBe(12);
+    // The reader's enable-off (`sendParams`) throws inside the scan stop.
+    ctl.sendParamsError = new Error("worker gone");
+    h.session.unsubscribe(h.server);
+    await settle(60);
+    expect(ctl.triggerOff).toEqual(["SL", "SR"]);
+    expect(h.triple.leases.L.camera.features.TriggerMode).toBe("Off");
+    expect(h.triple.leases.L.camera.gain).toBe(3);
+    expect(h.triple.leases.R.camera.gain).toBe(3);
+    expect(h.traj().closes).toBe(1);
+    expect(
+      ctl.reports.some(
+        (r) => r.includes("ring enable failed") && r.includes("worker gone"),
+      ),
+    ).toBe(true);
   });
 
   it("teardown stops the scan BEFORE closing the idle position input", async () => {

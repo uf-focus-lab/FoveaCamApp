@@ -374,7 +374,9 @@ says why it cannot run as asked):
   which the rate check covers.) `WINDOW_MAX` stays 0.95: the readout limit is the
   camera's, so it is checked, not baked into the cap.
 
-**Telemetry.** `ScanTelemetry` = `mode`, `hz`, `amp_deg`, `period_us` (T or 2T), `windows`
+**Telemetry.** `ScanTelemetry` = `mode`, `hz`, `amp_deg` (the RUNNING amplitude, held
+with the run's spec — a failed re-upload leaves it at the value the MCU plays), `period_us`
+(T or 2T), `windows`
 (`{ t_offset_us, pulse_us }` per marker, as the MCU runs them — republished after every
 re-upload / restart), `exposure_mode` (`TriggerWidth`, or `Timed` when either eye fell
 back), the per-eye applied `exposure_us` (0 in TriggerWidth) and readback `frame_rate`,
@@ -387,7 +389,7 @@ order, null without a mismatch:
 | `unequal windows: Timed exposure gives both the rising window's length` | Timed: the requested windows differ in length (every marker carries marker 0's pulse) |
 | `Timed exposure would run into the next trigger` | Timed: the equal pulse overruns the next marker's start even from its slope start (clamped there) |
 | `trigger rate above the camera's maximum frame rate` | `1/T` > either fovea's maximum frame rate |
-| `exposures closer than the sensor readout` | triangle: an end-to-end spacing below `1 / frame_rate_range.max` |
+| `exposures closer than the sensor readout` | triangle: an end-to-end spacing below the readout time (`SensorReadoutTime`, else `1 / frame_rate_range.max`) |
 | `exposure windows too close for reliable flipping at this frequency` | triangle: the flip tolerance floor exceeds its cap (§triangle-flip) |
 | `controller clock calibration lapsed` | the controller clock went uncalibrated mid-scan (§lifecycle; no stop) |
 
@@ -758,9 +760,14 @@ farther than the tolerance from its own edge has no such guarantee. When the flo
 exceeds the cap — an edge gap under ~2.2 ms (the defaults at 100 Hz: a 1 ms gap) — the
 cap is used and `scan.mismatch` names "exposure windows too close for reliable flipping at
 this frequency"; the scan still runs. `perf.trajectory.flip_tolerance_us` shows the value in force. The
-brick takes it at attach, so a restart with a new sweep time rebuilds the bricks, and a
-live window change that would leave the tolerance too wide rebuilds them tighter (a wider
-spacing keeps them — the nearest edge wins anyway). `flipped` / `unmatched` ACCUMULATE
+brick takes it at attach, so a restart with a new sweep time rebuilds the bricks. A live
+window change rebuilds them only when the tolerance in force is UNSAFE or STALE
+(`flipRebuildNeeded`, scan.ts): tighter when it exceeds the new cap (`0.45 · edge gap`),
+wider when it is below the 1 ms floor while the floor fits under the new cap (windows
+dragged close and apart again), or below half the new tolerance. In between the bricks
+keep their value — `flip_tolerance_us` shows it — so dragging a window does not rebind
+the views and restart the ring worker on every throttled replace; the "too close"
+mismatch follows the rule for the new windows, not the brick. `flipped` / `unmatched` ACCUMULATE
 across such rebuilds within one scan (a retired brick's final counters fold into the
 run's); only a new `startScan` resets them.
 

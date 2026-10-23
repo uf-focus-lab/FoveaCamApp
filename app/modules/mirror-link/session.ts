@@ -154,6 +154,7 @@ import {
   axisHandleOffset,
   clampWindow,
   flipEdges,
+  flipRebuildNeeded,
   flipToleranceUs,
   minExposureEndSpacingUs,
   normalizeAxisDeg,
@@ -559,10 +560,13 @@ export default function mirrorLinkSession(
     /** A built pattern: the spec the MCU runs, plus the markers as the WINDOWS
      *  ask for them (`raw`) — they differ only in the Timed fallback, where
      *  every marker carries marker 0's applied exposure, kept inside its
-     *  slope (`overrun`: it still ran into the next trigger and was clamped). */
+     *  slope (`overrun`: it still ran into the next trigger and was clamped).
+     *  `amp` is the amplitude the samples were built for (`scan.amp_deg`
+     *  publishes the RUNNING one, not the edited one). */
     type BuiltScan = {
       mode: ScanMode;
       hz: number;
+      amp: number;
       spec: TrajectorySpec;
       raw: WindowMarker[];
       overrun: boolean;
@@ -574,6 +578,9 @@ export default function mirrorLinkSession(
      *  and the window markers it was built from. */
     let runSpec: TrajectorySpec | null = null;
     let runRaw: WindowMarker[] = [];
+    /** The amplitude (°) `runSpec` was built for — a failed replace leaves it
+     *  at the value the MCU plays. */
+    let runAmp = 0;
     /** The run's Timed markers overran the next trigger (a mismatch). */
     let runOverrun = false;
     let runMode: ScanMode = "ellipse";
@@ -703,6 +710,7 @@ export default function mirrorLinkSession(
       return {
         mode,
         hz,
+        amp: g.amp,
         raw,
         overrun,
         spec: {
@@ -939,6 +947,7 @@ export default function mirrorLinkSession(
       trajectory = traj;
       runSpec = built.spec;
       runRaw = built.raw;
+      runAmp = built.amp;
       runOverrun = built.overrun;
       runMode = built.mode;
       runHz = built.hz;
@@ -999,11 +1008,12 @@ export default function mirrorLinkSession(
 
     /** The run's flip tolerance (scan.ts `flipToleranceUs`: 0.4 × min(T,
      *  closest circular EDGE gap between markers of different flip), floored
-     *  at 1 ms, capped at 0.45 × that gap), in ns, and whether the floor had
-     *  to give way to the cap. The edges are the markers AS THE MCU RUNS
-     *  THEM — the anchors carry exactly those. */
+     *  at 1 ms, capped at 0.45 × that gap), in ns, that cap (`capNs`), and
+     *  whether the floor had to give way to the cap. The edges are the markers
+     *  AS THE MCU RUNS THEM — the anchors carry exactly those. */
     function flipTolerance(built: BuiltScan): {
       ns: bigint;
+      capNs: bigint;
       tooClose: boolean;
     } {
       const r = flipToleranceUs(
@@ -1014,6 +1024,7 @@ export default function mirrorLinkSession(
 
       return {
         ns: BigInt(Math.round(r.toleranceUs * 1000)),
+        capNs: BigInt(Math.round(r.capUs * 1000)),
         tooClose: r.tooClose,
       };
     }
@@ -1328,7 +1339,7 @@ export default function mirrorLinkSession(
       const scan: ScanTelemetry = {
         mode: runMode,
         hz: runHz,
-        amp_deg: patternParams().amp,
+        amp_deg: runAmp,
         period_us: runSpec.periodUs,
         windows: markers.map((m) => ({
           t_offset_us: m.tOffsetUs,
@@ -1475,8 +1486,10 @@ export default function mirrorLinkSession(
     /** Stop (spec §lifecycle): the trajectory first (the node re-takes the DAC
      *  for the idle pose), the flip pipes, then the cameras back to free-run and
      *  their pre-scan timing — the camera restore runs whatever threw before
-     *  it. Serialized via {@link queueScanOp}. MUST run while the leases are
-     *  live — the restore rides `lease.reconfigure`. */
+     *  it. The reader steps (enable off, readouts dropped) are best-effort:
+     *  reported, never fatal to the stop. Serialized via {@link queueScanOp}.
+     *  MUST run while the leases are live — the restore rides
+     *  `lease.reconfigure`. */
     async function stopScanNow(): Promise<void> {
       const wasActive = scanActive;
       scanActive = false;
@@ -1485,8 +1498,19 @@ export default function mirrorLinkSession(
         cancelReplace();
         await closeTrajectory();
         retireFlips();
-        pushRingEnabled();
-        resetRingTelemetry();
+        for (const [what, fn] of [
+          ["ring enable", pushRingEnabled],
+          ["ring readout reset", resetRingTelemetry],
+        ] as const)
+          try {
+            fn();
+          } catch (e) {
+            report(
+              "mirror-link",
+              `scan stop: ${what} failed: ${errorLine(e)}`,
+              "warning",
+            );
+          }
       } finally {
         if (t) await disarmCameras(t);
         if (wasActive) {
@@ -1694,6 +1718,7 @@ export default function mirrorLinkSession(
       }
       runSpec = built.spec;
       runRaw = built.raw;
+      runAmp = built.amp;
       runOverrun = built.overrun;
       if (traj.id !== oldId) retireSpec(oldId, oldSpec);
       rememberSpec(traj.id, built.spec);
@@ -1713,11 +1738,25 @@ export default function mirrorLinkSession(
       }
       // Atomic (firmware 2.2.1) or the STOP/START pair — the node's row says.
       lastSwap = controllerNode().trajectorySnapshot?.()?.lastSwap ?? lastSwap;
-      // Markers moved closer than the flip bricks' tolerance allows: rebuild
-      // them tighter (a wider spacing keeps the bricks — nearest wins anyway).
+      // The flip bricks are rebuilt only when the tolerance in force is UNSAFE
+      // (above the new cap) or STALE (below the floor that fits again, or
+      // below half the new tolerance) — scan.ts `flipRebuildNeeded`, spec
+      // §triangle-flip. In between they keep it: a dragged window must not
+      // rebind the views and restart the ring worker on every replace.
+      // `tooClose` follows the rule, not the brick. Both sides go through the
+      // same ns rounding, so a brick built from this rule compares equal.
       const tol = flipTolerance(built);
       flipTooClose = runMode === "triangle" && tol.tooClose;
-      if (runMode === "triangle" && tol.ns < flipToleranceNs) {
+      const us = (ns: bigint): number => Number(ns) / 1000;
+      if (
+        runMode === "triangle" &&
+        (flips.L || flips.R) &&
+        flipRebuildNeeded(us(flipToleranceNs), {
+          toleranceUs: us(tol.ns),
+          capUs: us(tol.capNs),
+          tooClose: tol.tooClose,
+        })
+      ) {
         try {
           syncFlips(true, tol.ns);
         } catch (e) {
@@ -2843,13 +2882,26 @@ export default function mirrorLinkSession(
         // for the idle input, so the mirror returns to the center), the flip
         // pipes retire, the cameras go back to free-run + their pre-scan
         // timing (the restore rides `lease.reconfigure`) — then the gain
-        // override (spec §gain).
+        // override (spec §gain). Exception-safe per step: a throwing vergence
+        // stop never skips the scan stop, nor a throwing scan stop the gain
+        // restore (each failure is reported).
         scanAllowed = false;
         gainAllowed = false;
         await queueScanOp(async () => {
-          stopVergenceNow(); // the loop's workers + pid node go first
-          await stopScanNow();
-          await restoreGainNow();
+          try {
+            stopVergenceNow(); // the loop's workers + pid node go first
+          } catch (e) {
+            report(
+              "mirror-link",
+              `vergence stop failed on teardown: ${errorLine(e)}`,
+              "warning",
+            );
+          }
+          try {
+            await stopScanNow();
+          } finally {
+            await restoreGainNow();
+          }
         });
       });
 

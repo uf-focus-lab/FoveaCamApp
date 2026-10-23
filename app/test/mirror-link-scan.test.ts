@@ -23,13 +23,13 @@ vi.mock("serialport", () => ({ SerialPort: { list: async () => [] } }));
 import {
   activeWindows,
   AXIS_HANDLE_MIN_DEG,
-
   axisDegFromPixelRay,
   axisHandleOffset,
   clampWindow,
   ELLIPSE_SAMPLES,
   FLIP_TOLERANCE_FLOOR_US,
   flipEdges,
+  flipRebuildNeeded,
   flipToleranceUs,
   minExposureEndSpacingUs,
   minFlipEdgeGapUs,
@@ -74,13 +74,17 @@ const oldCircle = (phase: number, ampDeg: number): Point2d => ({
 
 describe("patternOffset — ellipse", () => {
   it("reproduces the old circle at ratio 1, axis 0", () => {
-    for (const p of [0, 0.1, 0.25, 0.5, 0.77]) close(patternOffset("ellipse", p, 0, 0.75, 1), oldCircle(p, 0.75));
+    for (const p of [0, 0.1, 0.25, 0.5, 0.77])
+      close(patternOffset("ellipse", p, 0, 0.75, 1), oldCircle(p, 0.75));
   });
 
   it("traces a circle of RADIUS amp at ratio 1 for ANY axis", () => {
     for (const axis of [0, 33, -120, 180])
       for (const p of [0, 0.13, 0.5, 0.9])
-        expect(radius(patternOffset("ellipse", p, axis, 0.75, 1))).toBeCloseTo(0.75 * DEG, 12);
+        expect(radius(patternOffset("ellipse", p, axis, 0.75, 1))).toBeCloseTo(
+          0.75 * DEG,
+          12,
+        );
   });
 
   it("collapses to a LINE along the axis at ratio 0", () => {
@@ -90,7 +94,10 @@ describe("patternOffset — ellipse", () => {
       const o = patternOffset("ellipse", p, axis, 1, 0);
       // Perpendicular component vanishes; along-axis is a cos(2πφ).
       expect(o.x * -dir.y + o.y * dir.x).toBeCloseTo(0, 12);
-      expect(o.x * dir.x + o.y * dir.y).toBeCloseTo(DEG * Math.cos(2 * Math.PI * p), 12);
+      expect(o.x * dir.x + o.y * dir.y).toBeCloseTo(
+        DEG * Math.cos(2 * Math.PI * p),
+        12,
+      );
     }
   });
 
@@ -108,7 +115,10 @@ describe("patternOffset — ellipse", () => {
   });
 
   it("clamps an out-of-range ratio and degenerates at zero amplitude", () => {
-    close(patternOffset("ellipse", 0.25, 0, 1, 3), patternOffset("ellipse", 0.25, 0, 1, 1));
+    close(
+      patternOffset("ellipse", 0.25, 0, 1, 3),
+      patternOffset("ellipse", 0.25, 0, 1, 1),
+    );
     expect(patternOffset("ellipse", 0.3, 40, 0, 1)).toEqual({ x: 0, y: 0 });
     expect(patternOffset("triangle", 0.3, 40, 0, 1)).toEqual({ x: 0, y: 0 });
   });
@@ -249,10 +259,14 @@ describe("flip tolerance + exposure spacing", () => {
     // Default windows [0.05, 0.95]: the rising end (0.95 T) → the falling
     // start (1.05 T), and the falling end (1.95 T) → the next rising start
     // (2.05 T): 0.1 T either way — not the T between the marker starts.
-    expect(minFlipEdgeGapUs(edges(10, [0.05, 0.95], [0.05, 0.95]), 2 * T)).toBe(0.1 * T);
+    expect(minFlipEdgeGapUs(edges(10, [0.05, 0.95], [0.05, 0.95]), 2 * T)).toBe(
+      0.1 * T,
+    );
     // The wrap alone can be the closest: falling [0, 0.95] ends at 1.95 T,
     // rising [0.01, 0.5] starts 0.01 T into the next period → 0.06 T.
-    expect(minFlipEdgeGapUs(edges(10, [0.01, 0.5], [0, 0.95]), 2 * T)).toBeCloseTo(0.06 * T, 9);
+    expect(
+      minFlipEdgeGapUs(edges(10, [0.01, 0.5], [0, 0.95]), 2 * T),
+    ).toBeCloseTo(0.06 * T, 9);
     // Same flip never counts; one marker (the ellipse) → the period.
     expect(
       minFlipEdgeGapUs(
@@ -263,7 +277,9 @@ describe("flip tolerance + exposure spacing", () => {
         100,
       ),
     ).toBe(100);
-    expect(minFlipEdgeGapUs(flipEdges(windowMarkers("ellipse", 10, [[0, 0.95]])), T)).toBe(T);
+    expect(
+      minFlipEdgeGapUs(flipEdges(windowMarkers("ellipse", 10, [[0, 0.95]])), T),
+    ).toBe(T);
     // Overlapping exposures → 0.
     expect(
       minFlipEdgeGapUs(
@@ -278,8 +294,11 @@ describe("flip tolerance + exposure spacing", () => {
 
   it("defaults at 10 Hz: 0.4 × the 0.1 T edge gap", () => {
     const T = sweepUs(10);
-    expect(flipToleranceUs(2 * T, T, edges(10, [0.05, 0.95], [0.05, 0.95]))).toEqual({
+    expect(
+      flipToleranceUs(2 * T, T, edges(10, [0.05, 0.95], [0.05, 0.95])),
+    ).toEqual({
       toleranceUs: 0.04 * T, // 4 ms (cap 4.5 ms)
+      capUs: 0.045 * T,
       tooClose: false,
     });
   });
@@ -297,7 +316,7 @@ describe("flip tolerance + exposure spacing", () => {
     // called it fine), the EDGES 1 ms → cap 0.45 ms < floor.
     const T = sweepUs(50);
     const r = flipToleranceUs(2 * T, T, edges(50, [0.88, 0.95], [0, 0.5]));
-    expect(r).toEqual({ toleranceUs: 450, tooClose: true });
+    expect(r).toEqual({ toleranceUs: 450, capUs: 450, tooClose: true });
   });
 
   it("floors at 1 ms, capped at 0.45 × the edge gap", () => {
@@ -306,13 +325,21 @@ describe("flip tolerance + exposure spacing", () => {
       { startUs: 1_000 + gap, endUs: 2_000 + gap, flip: true },
     ];
     // 3 ms gap: 0.4·3 = 1.2 ms (above the floor, below the 1.35 ms cap).
-    expect(flipToleranceUs(20_000, 10_000, e(3_000))).toEqual({ toleranceUs: 1_200, tooClose: false });
+    expect(flipToleranceUs(20_000, 10_000, e(3_000))).toEqual({
+      toleranceUs: 1_200,
+      capUs: 1_350,
+      tooClose: false,
+    });
     // 2.4 ms gap: 0.96 ms → floored to 1 ms (cap 1.08 ms).
     const r = flipToleranceUs(20_000, 10_000, e(2_400));
     expect(r.toleranceUs).toBe(FLIP_TOLERANCE_FLOOR_US);
     expect(r.tooClose).toBe(false);
     // 2 ms gap: cap 0.9 ms < floor → too close.
-    expect(flipToleranceUs(20_000, 10_000, e(2_000))).toEqual({ toleranceUs: 900, tooClose: true });
+    expect(flipToleranceUs(20_000, 10_000, e(2_000))).toEqual({
+      toleranceUs: 900,
+      capUs: 900,
+      tooClose: true,
+    });
     // min(T, gap): a wide gap is bounded by the sweep.
     expect(flipToleranceUs(20_000, 5_000, e(8_000)).toleranceUs).toBe(2_000);
   });
@@ -331,10 +358,42 @@ describe("flip tolerance + exposure spacing", () => {
         return Math.min(d, 2 * T - d);
       };
       for (const own of m)
-        for (const stamp of [own.startUs - tol, own.startUs + tol, own.endUs - tol, own.endUs + tol])
+        for (const stamp of [
+          own.startUs - tol,
+          own.startUs + tol,
+          own.endUs - tol,
+          own.endUs + tol,
+        ])
           for (const other of m.filter((o) => o.flip !== own.flip))
             for (const edge of [other.startUs, other.endUs])
               expect(dist(stamp, edge)).toBeGreaterThan(tol);
+    }
+  });
+
+  it("rebuild only an UNSAFE or STALE tolerance (round-3 hysteresis)", () => {
+    const rule = (gap: number, sweep = 10_000) =>
+      flipToleranceUs(20_000, sweep, [
+        { startUs: 0, endUs: 1_000, flip: false },
+        { startUs: 1_000 + gap, endUs: 2_000 + gap, flip: true },
+      ]);
+    // Unsafe: the tolerance in force exceeds the new cap → tighter.
+    expect(flipRebuildNeeded(1_200, rule(2_400))).toBe(true); // cap 1.08 ms
+    expect(flipRebuildNeeded(1_000, rule(2_000))).toBe(true); // cap 0.9 ms
+    // Stale below the floor: a tightened 450 µs once the floor fits again.
+    expect(flipRebuildNeeded(450, rule(3_000))).toBe(true);
+    // ...but not while the floor still exceeds the cap (the cap IS the rule).
+    expect(flipRebuildNeeded(900, rule(2_000))).toBe(false);
+    expect(flipRebuildNeeded(800, rule(2_000))).toBe(false);
+    // Stale: below half the new tolerance (windows moved far apart).
+    expect(flipRebuildNeeded(1_000, rule(6_000))).toBe(true); // wants 2.4 ms
+    // In between the brick keeps its value: a shrinking gap still above the
+    // current tolerance's cap, and a growing one not yet twice as wide.
+    expect(flipRebuildNeeded(1_200, rule(2_800))).toBe(false); // cap 1.26 ms
+    expect(flipRebuildNeeded(1_200, rule(5_000))).toBe(false); // wants 2 ms
+    // After a rebuild the rule's own tolerance is always kept (no oscillation).
+    for (const gap of [500, 2_000, 2_400, 3_000, 6_000, 40_000]) {
+      const r = rule(gap);
+      expect(flipRebuildNeeded(r.toleranceUs, r)).toBe(false);
     }
   });
 
@@ -346,7 +405,9 @@ describe("flip tolerance + exposure spacing", () => {
     ]);
     // ends at 0.9 T and 1.5 T: 0.6 T = T(1 + 0.5 − 0.9) and 1.4 T across the wrap.
     expect(minExposureEndSpacingUs(2 * T, m)).toBe(Math.round(0.6 * T));
-    expect(minExposureEndSpacingUs(T, windowMarkers("ellipse", 10, [[0, 0.5]]))).toBe(T);
+    expect(
+      minExposureEndSpacingUs(T, windowMarkers("ellipse", 10, [[0, 0.5]])),
+    ).toBe(T);
   });
 });
 
@@ -369,7 +430,9 @@ describe("timedWindowMarkers (the Timed fallback)", () => {
     ]);
     for (const [k, m] of r.markers.entries()) {
       expect(m.tOffsetUs).toBeGreaterThanOrEqual(k * T);
-      expect(m.tOffsetUs + m.pulseUs).toBeLessThanOrEqual(k * T + WINDOW_MAX * T);
+      expect(m.tOffsetUs + m.pulseUs).toBeLessThanOrEqual(
+        k * T + WINDOW_MAX * T,
+      );
     }
   });
 
@@ -381,7 +444,10 @@ describe("timedWindowMarkers (the Timed fallback)", () => {
     // A clamp-lengthened exposure (97 ms > 0.95 T) starts AT the slope and
     // still fits before the next trigger (T) — no overrun.
     const r = timedWindowMarkers("ellipse", 10, raw, 97_000);
-    expect(r).toEqual({ markers: [{ tOffsetUs: 0, pulseUs: 97_000 }], overrun: false });
+    expect(r).toEqual({
+      markers: [{ tOffsetUs: 0, pulseUs: 97_000 }],
+      overrun: false,
+    });
   });
 
   it("a pulse that still runs into the next trigger is clamped there and flagged", () => {
@@ -474,13 +540,17 @@ describe("activeWindows (sync mirroring)", () => {
     ]);
   });
   it("triangle unsynced: the two windows stand on their own", () => {
-    expect(activeWindows("triangle", { ...w, tri_window_sync: false })).toEqual([
-      [0.2, 0.6],
-      [0.3, 0.5],
-    ]);
+    expect(activeWindows("triangle", { ...w, tri_window_sync: false })).toEqual(
+      [
+        [0.2, 0.6],
+        [0.3, 0.5],
+      ],
+    );
   });
   it("clamps what the state holds", () => {
-    expect(activeWindows("ellipse", { ...w, scan_window: [0.5, 1] })).toEqual([[0.5, WINDOW_MAX]]);
+    expect(activeWindows("ellipse", { ...w, scan_window: [0.5, 1] })).toEqual([
+      [0.5, WINDOW_MAX],
+    ]);
   });
 });
 
@@ -497,7 +567,9 @@ describe("drawn paths", () => {
 
   it("draws the ellipse through the pattern's own offsets", () => {
     const p = patternPath("ellipse", 15, 1, 0.5, 8);
-    p.offsets.forEach((o, k) => close(o, patternOffset("ellipse", k / 8, 15, 1, 0.5)));
+    p.offsets.forEach((o, k) =>
+      close(o, patternOffset("ellipse", k / 8, 15, 1, 0.5)),
+    );
   });
 
   it("draws one exposed polyline per marker, spanning exactly its window", () => {
@@ -510,7 +582,15 @@ describe("drawn paths", () => {
     close(rise!.at(-1)!, { x: 0, y: 0 }); // half the rising sweep
     close(fall![0]!, { x: DEG, y: 0 });
     close(fall!.at(-1)!, { x: 0, y: 0 });
-    const [e] = windowPaths("ellipse", 10, 0, 1, 1, windowMarkers("ellipse", 10, [[0, 0.5]]), 48);
+    const [e] = windowPaths(
+      "ellipse",
+      10,
+      0,
+      1,
+      1,
+      windowMarkers("ellipse", 10, [[0, 0.5]]),
+      48,
+    );
     expect(e!.length).toBeGreaterThanOrEqual(2);
     close(e![0]!, { x: DEG, y: 0 });
     close(e!.at(-1)!, { x: -DEG, y: 0 });

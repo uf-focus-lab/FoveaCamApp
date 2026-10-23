@@ -34,6 +34,9 @@ export type ScanTelemetry = {
    *  for the ellipse and `2/hz` for the triangle (one rising + one falling
    *  sweep per cycle). */
   hz: number;
+  /** The amplitude (°) the RUNNING table was built for — held with the run's
+   *  spec, so a failed re-upload leaves it at the value the MCU plays, not
+   *  the edited `scan_amp` (spec §exposure-windows, telemetry). */
   amp_deg: number;
   /** The TRAJECTORY period on the MCU (µs): T, or 2T for the triangle. */
   period_us: number;
