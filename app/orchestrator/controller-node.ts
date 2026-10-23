@@ -158,8 +158,10 @@ export interface NodeTrajectory {
    *  while running (stop first). The new spec is what `reupload()` sends;
    *  `reuploads` in the stats row counts successful swaps and `lastSwap`
    *  says whether the last running one was atomic (firmware 2.2.1) or the
-   *  STOP/START pair. Pushes from the retired table during its grace still
-   *  arrive here (scored against the retired spec). Calls made while
+   *  STOP/START pair. Pushes from a retired table during its grace still
+   *  arrive here, scored against THAT table's spec (per id, from the swap
+   *  instant — also while the swap's DELETE is still out, and for every
+   *  table still in grace after a second swap). Calls made while
    *  a swap is in flight COALESCE (latest spec wins, sent once the in-flight
    *  swap lands; every coalesced caller settles with it). `stop()` waits for
    *  in-flight + pending swaps; `close()` rejects the pending one and waits
@@ -1035,9 +1037,17 @@ class NodeTrajectoryImpl implements NodeTrajectory {
   private heldPushes = 0;
   private reuploads = 0;
   private lastSwap: TrajectorySwapKind | null = null;
-  /** The table the last swap retired, while its grace runs: its straggler
-   *  pushes (a capture in flight at the swap) are scored against ITS spec. */
-  private retired: { id: number; spec: TrajectorySpec; untilNs: bigint } | null = null;
+  /** Table ids other than the current one that may still push, each scored
+   *  against ITS OWN spec: every id a swap retired, while its grace runs
+   *  (`untilNs` = the controller's grace from the swap instant — set at the
+   *  swap itself via `onSwap`, before `replace` resolves; one entry per id,
+   *  so a second swap inside the first's grace keeps both), and an ambiguous
+   *  replacement that may be live (`untilNs: null`, until the next swap or
+   *  the run's end graces it). */
+  private readonly retired = new Map<
+    number,
+    { spec: TrajectorySpec; untilNs: bigint | null }
+  >();
   // replace(): ONE swap in flight; further calls COALESCE into a single
   // pending batch whose spec is the latest one (every coalesced caller
   // resolves/rejects with that batch). `replacingSpec` is the in-flight
@@ -1169,6 +1179,10 @@ class NodeTrajectoryImpl implements NodeTrajectory {
   /** Run over (STOP ack / ENDED / run-level CANCELLED): inputs re-take the DAC. */
   private endRun(): void {
     if (this._state !== "running") return;
+    // A possibly-live replacement is done with once the run ends (the
+    // controller's stop() STOPs it and graces its id).
+    for (const [id, r] of this.retired)
+      if (r.untilNs === null) this.graceRetired(id, r.spec, trajectoryGraceUs(r.spec));
     this.setState("ready");
     this.node.resumeInputs();
   }
@@ -1192,6 +1206,7 @@ class NodeTrajectoryImpl implements NodeTrajectory {
     this.owner = null;
     this.setState("closed");
     this.frameListeners.clear();
+    this.retired.clear();
     if (h) {
       try {
         if (wasRunning) await h.stop();
@@ -1286,28 +1301,71 @@ class NodeTrajectoryImpl implements NodeTrajectory {
     const oldId = h.id;
     const oldSpec = this.spec;
     this.replacingSpec = spec;
+    // The swap lands INSIDE h.replace (the controller's `onSwap`, before the
+    // old table's DELETE and before replace resolves): from that instant the
+    // new id is current (scored against `spec`) and each retired id is
+    // scored against its own spec for exactly the controller's grace.
+    let swapped = false;
+    const landSwap = (to: number, retired: ReadonlyArray<{ id: number; graceUs: number }>) => {
+      if (swapped || this.handle !== h) return;
+      swapped = true;
+      for (const r of retired)
+        this.graceRetired(
+          r.id,
+          r.id === oldId ? oldSpec : (this.retired.get(r.id)?.spec ?? oldSpec),
+          r.graceUs,
+        );
+      this.retired.delete(to);
+      this.spec = spec;
+    };
     try {
-      await h.replace(spec);
+      await h.replace(spec, { onSwap: (e) => landSwap(e.to, e.retired) });
     } catch (error) {
-      // The swap failed after STOP(old) and the old table could not be
-      // re-STARTed: the run is over — inputs re-take the DAC.
-      if ((error as { running?: boolean } | null)?.running === false && this.handle === h)
-        this.endRun();
+      const e = error as {
+        running?: boolean;
+        replacement?: { id: number; maybeLive: boolean } | null;
+      } | null;
+      // The replacement table id stays routed here after the failure (it may
+      // have played for a moment, or may be live): its pushes belong to `spec`.
+      if (e?.replacement && this.handle === h) {
+        if (e.replacement.maybeLive) this.retired.set(e.replacement.id, { spec, untilNs: null });
+        else this.graceRetired(e.replacement.id, spec, trajectoryGraceUs(spec));
+      }
+      // The swap failed and the old table could not be re-STARTed: the run
+      // is over — inputs re-take the DAC.
+      if (e?.running === false && this.handle === h) this.endRun();
       throw error;
     } finally {
       this.replacingSpec = null;
     }
+    // A handle without the `onSwap` hook: the swap is seen only now.
+    if (!swapped && h.id !== oldId)
+      landSwap(h.id, [{ id: oldId, graceUs: trajectoryGraceUs(oldSpec) }]);
     // Running stays running (inputs stay held, no resume); the new spec is
     // what reupload() sends and what lateness is scored against.
     this.spec = spec;
     this.reuploads++;
     this.lastSwap = h.lastSwap ?? this.lastSwap;
-    if (h.id !== oldId)
-      this.retired = {
-        id: oldId,
-        spec: oldSpec,
-        untilNs: hostNowNs() + BigInt(trajectoryGraceUs(oldSpec)) * 1000n,
-      };
+  }
+
+  /** Score `id`'s pushes against `spec` for `graceUs` from now (0: forget). */
+  private graceRetired(id: number, spec: TrajectorySpec, graceUs: number): void {
+    if (graceUs <= 0) this.retired.delete(id);
+    else
+      this.retired.set(id, { spec, untilNs: hostNowNs() + BigInt(Math.ceil(graceUs)) * 1000n });
+  }
+
+  /** The spec a push of table `id` is scored against: the current table's;
+   *  a retired / possibly-live id's own (inside its grace); mid-swap, any
+   *  other id is the new table — the in-flight spec. */
+  private specForPush(id: number): TrajectorySpec {
+    if (id === this.handle?.id) return this.spec;
+    const r = this.retired.get(id);
+    if (r) {
+      if (r.untilNs === null || hostNowNs() < r.untilNs) return r.spec;
+      this.retired.delete(id); // expired — the controller unrouted it too
+    }
+    return this.replacingSpec ?? this.spec;
   }
 
   /** Wait until no replace is in flight or pending (errors are the callers'). */
@@ -1360,17 +1418,9 @@ class NodeTrajectoryImpl implements NodeTrajectory {
       if (f.cycle + 1 > this.cyclesSeen) this.cyclesSeen = f.cycle + 1;
     }
     if (f.status === "OK" && f.marker !== null) {
-      // A straggler from the table the last swap retired (in its grace)
-      // belongs to that table's spec; mid-swap, pushes from the NEW table
-      // belong to the in-flight spec.
-      const current = f.trajectoryId === this.handle?.id;
-      const retired = this.retired;
-      const spec =
-        !current && retired && f.trajectoryId === retired.id && hostNowNs() <= retired.untilNs
-          ? retired.spec
-          : !current && this.replacingSpec
-            ? this.replacingSpec
-            : this.spec;
+      // Scored per table id (`specForPush`): a retired table's straggler
+      // against its own spec, the new table mid-swap against the in-flight one.
+      const spec = this.specForPush(f.trajectoryId);
       const marker = spec.markers?.[f.marker];
       if (marker && this.startHostNs !== null)
         this.lastLatenessUs =
