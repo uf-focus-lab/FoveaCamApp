@@ -570,7 +570,7 @@ Rows, top to bottom: a `SCAN PATTERN` group heading; **Mode** — a two-option h
 `SingleSelect` (Ellipse | Triangle) on `scan_mode`; **Axis** — RangeSlider on
 `scan_axis_deg`, −179.5..180°, step 0.5, neutral 0, readout `+12.5°`, its hover naming
 the center-view handle as the other way to set it (the left end is −179.5, not −180: the
-session normalizes −180 to 180, which would make the thumb jump to the right edge); **Amplitude** — `scan_amp`, 0..2°, step
+session normalizes −180 to 180, which would make the thumb jump to the right edge; the slider's v-model clamps a handle-dragged angle in (−180, −179.5) to −179.5 on read, the state keeps the exact angle); **Amplitude** — `scan_amp`, 0..2°, step
 0.01, neutral 0.5 (moved here from the right column). Then per mode — Ellipse:
 **Ratio** (`scan_ratio`, 0..1, step 0.01, neutral 1, readout `1.00`, `line` at 0, a
 `detents: [0]` so a drag can land on the line exactly) and **Exposure Window**
