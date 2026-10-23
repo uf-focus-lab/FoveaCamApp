@@ -508,7 +508,10 @@ declare module "core/Aravis" {
     /** Frames matched to a `flip: true` anchor (rows reversed). */
     flipped: number;
     /** Frames with NO anchor edge inside the tolerance — passed through
-     *  unflipped (also a frame processed before its anchor arrived). */
+     *  unflipped. A frame processed before its anchor arrived counts here
+     *  too, provided the tolerance stays below the edge gap between
+     *  neighbouring markers (which the session guarantees: 0.45 × that gap);
+     *  a wider window could match the neighbouring marker's edge instead. */
     unmatched: number;
     /** Live anchor pool size (pruned per frame; bounded by `anchorCap`). */
     anchorPoolSize: number;

@@ -395,7 +395,10 @@ Teensy DMAMEM, 80 KB, first-fit), `MAX_MARKERS = 8` per table.
   through the Capture engine: the same strobe tracking, exposure-averaged
   positions (start/finish latches see the trajectory-driven DAC) and
   `pulse + STROBE_MARGIN_US` timeout as CMD_FRAME. It needs an idle engine; a
-  marker that finds a host CMD_FRAME in flight pushes `BUSY`.
+  marker that finds a host CMD_FRAME in flight pushes `BUSY`. After a missed
+  strobe the engine stays busy until that timeout (pulse + 5 ms after the
+  trigger), so a next marker due within 5 ms of the previous marker's window end
+  pushes `BUSY` too.
 - A finite run ends holding phase 0 and pushes `ENDED`. `STOP` holds the last
   position. After either, the mirror stays put (`Owner::HOLD`, surviving the
   1 Hz MEMS refresh) until the next stream write — UPDATE, an applied keyframe,
@@ -430,7 +433,8 @@ Teensy DMAMEM, 80 KB, first-fit), `MAX_MARKERS = 8` per table.
   gets it (older firmware) falls back to `STOP(a)` + `START(b, original t_start)`
   back to back, which joins in progress (markers due between the two are lost).
   Host: `TrajectoryHandle.replace` (`app/orchestrator/controller.ts`). Guarded by
-  `test/fw-sim-check.cpp` stage C5.
+  `test/fw-sim-check.cpp` stages C5 (swap mid-capture, `b`'s marker later) and C6
+  (`b`'s marker earlier than the swap phase; `b` with more markers than `a`).
 
 REJ reasons: `Trajectory id out of range (max 4 tables)`, `Trajectory is running
 (STOP it first)`, `Trajectory needs at least one sample`, `Trajectory too long (max

@@ -289,10 +289,10 @@ static bool cancelling = false;
 
 static void finishActive(const char *rejectReason) {
   // The pulse may outlive the exposure: in the Timed fallback the camera's
-  // exposure (and so the strobe) can end before `pulse` elapses, and a strobe
-  // timeout ends the request mid-pulse. Release the trigger line here, or it
-  // stays asserted and the next capture's `writeTrigger(HIGH)` produces no
-  // rising edge — that capture then times out, every other frame.
+  // exposure (and so the strobe) can end before `pulse` elapses. Release the
+  // trigger line here, or it stays asserted and the next capture's
+  // `writeTrigger(HIGH)` produces no rising edge — that capture then times
+  // out, every other frame.
   if (!triggerDropped) {
     writeTrigger(active.cameras, LOW);
     triggerDropped = true;

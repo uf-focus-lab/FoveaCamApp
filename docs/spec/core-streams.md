@@ -210,8 +210,10 @@ frames matched to an anchor marked `flip`.
   edge) or, with no winner, every anchor with `tEnd < ts − toleranceNs`.
 - **Late anchors.** Matching happens once, when the brick processes the frame. A frame
   processed before its anchor was pushed (the FIN push lost the race with the frame)
-  passes through UNFLIPPED and counts `unmatched`; the anchor arriving afterwards is
-  pruned by a later frame. The session pushes the anchor synchronously on the FIN, which
+  passes through UNFLIPPED and counts `unmatched` — provided the tolerance stays below
+  the edge gap between neighbouring markers, which the session guarantees (0.45 × that
+  gap); a wider window could match the neighbouring marker's edge instead. The anchor
+  arriving afterwards is pruned by a later frame. The session pushes the anchor synchronously on the FIN, which
   precedes the frame's arrival in practice; a rising `unmatched` share is the symptom
   when it does not.
 - **Tolerance (as the session computes it).** `toleranceNs = 0.4 · min(T, closest marker
