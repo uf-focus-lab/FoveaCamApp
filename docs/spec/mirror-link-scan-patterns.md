@@ -375,3 +375,35 @@ blockers. Fixed in round 4:
   only); `core-streams.md` notes the hysteresis band (the brick's tolerance
   may differ from the formula after a live window change; round 3);
   contract comments (`shift` ±2°, `frame_rate` is a readback).
+
+## Review round 5 (2026-10-23) — findings and decisions
+
+Four reviews on 51c5532 re-verified every round-4 fix (all hold; mutation
+checks confirmed the new harness checks catch what they claim). No blockers,
+one should-fix (a vacuous test). Fixed in round 5:
+
+- **Stall-clear republish** carries the clearing push's lateness (ordering).
+- **Failed atomic swap, "run is over" branch:** STOPs every sibling too
+  (one may be the table actually playing) before the DELETE; the decision
+  table row says so.
+- **Node detach test** pushes from the forgotten id while it is NOT current,
+  so it fails without `retired.clear()`; the START-REJ classification test
+  lists every text in `TRAJECTORY_START_REJ_TEXTS`.
+- **Status line:** a run that never answered keeps its "not answering"
+  sentence after two periods (stalled + `ok === 0`); a mismatch hover also
+  names a stall.
+- **`AXIS_SLIDER_RANGE`** is exported from `scan.ts` and shared by the
+  session's `setAxis` fold and the pane.
+- **Firmware `claim()`** flips the DAC owner and seeds the drive position
+  inside one interrupt-free block (a strobe edge never pairs TRAJECTORY
+  ownership with the previous run's position).
+- **Harness:** a check for `noteReinit()` / the V_BIAS seed (MEMS reset +
+  START + STOP in one burst → the refresh re-commits the bias, never 0 or
+  the stream value); fixture misses under host load re-arm and retry
+  instead of failing (firmware-fault checks stay strict); C1's keyframe
+  timing check gets the same treatment / a round-trip-based margin.
+- **Docs:** the spec's Axis-drag paragraph names the fold; the swap
+  fallback applies "on REJ 'already running', and always below 2.2.1";
+  v2.2.1 tags on the Actuate/Trigger/START refusals and the HOLD Actuate
+  in both protocol docs; the manual's overrun row says one sweep; the
+  `replace` doc's lead says atomic first.
