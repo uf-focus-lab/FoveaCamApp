@@ -290,6 +290,59 @@ describe("snapshot + restore", () => {
   });
 });
 
+describe("TriggerOverlap = ReadOut", () => {
+  it("is set in both modes where the node exists, and restored verbatim", () => {
+    for (const modes of [["Timed", "TriggerWidth"], ["Timed"]]) {
+      const cam = new FakeCamera(modes).seed(true, 30, 12_000, "Off", { TriggerOverlap: "Off" });
+      const snap = snapshotTiming(cam);
+      expect(snap.trigger_overlap).toBe("Off");
+      applyTriggeredTiming(cam, { pulseUs: 10_000, preferTriggerWidth: true });
+      expect(cam.features.TriggerOverlap).toBe("ReadOut");
+      expect(restoreTiming(cam, snap)).toEqual([]);
+      expect(cam.features.TriggerOverlap).toBe("Off");
+      expect(snapshotTiming(cam)).toEqual(snap);
+    }
+  });
+
+  it("is skipped silently on a model without the node (no write, null snapshot)", () => {
+    const cam = new FakeCamera();
+    const snap = snapshotTiming(cam);
+    expect(snap.trigger_overlap).toBeNull();
+    applyTriggeredTiming(cam, { pulseUs: 10_000, preferTriggerWidth: true });
+    restoreTiming(cam, snap);
+    expect(cam.writes.some((w) => w.startsWith("TriggerOverlap"))).toBe(false);
+  });
+
+  it("a refused ReadOut entry does not fail the apply", () => {
+    const cam = new FakeCamera(undefined, new Set(["TriggerOverlap"])).seed(true, 30, 12_000, "Off", {
+      TriggerOverlap: "Off",
+    });
+    expect(applyTriggeredTiming(cam, { pulseUs: 10_000, preferTriggerWidth: true }).exposure_mode).toBe(
+      "TriggerWidth",
+    );
+  });
+});
+
+describe("restoreTiming — best-effort per feature", () => {
+  it("keeps writing after a refused feature and returns the failures", () => {
+    const cam = new FakeCamera().seed(true, 30, 12_000, "Continuous", { TriggerOverlap: "Off" });
+    const snap = snapshotTiming(cam);
+    applyTriggeredTiming(cam, { pulseUs: 10_000, preferTriggerWidth: true });
+    const orig = cam.setFeature.bind(cam);
+    cam.setFeature = (n, v) => {
+      if (n === "TriggerActivation") throw new Error("[TriggerActivation] locked\nstack");
+      orig(n, v);
+    };
+    const failed = restoreTiming(cam, snap);
+    expect(failed).toEqual(["TriggerActivation: [TriggerActivation] locked"]);
+    // Everything after the refused write still landed.
+    expect(cam.features.TriggerOverlap).toBe("Off");
+    expect(cam.frame_rate_enable).toBe(true);
+    expect(cam.exposure).toBe(12_000);
+    expect(cam.exposure_auto).toBe("Continuous");
+  });
+});
+
 describe("exposureMismatch", () => {
   it("tolerates 2 % of the window and flags beyond it", () => {
     expect(exposureMismatch(49_900, 50_000)).toBe(false);

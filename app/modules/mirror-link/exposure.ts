@@ -6,10 +6,11 @@
 //
 // Per-fovea TRIGGERED exposure override: each trajectory marker's trigger pulse
 // IS the exposure window (`ExposureMode = TriggerWidth`), with a Timed fallback
-// for a model without TriggerWidth. Pure over a `Camera`-shaped timing seam, so
-// it unit-tests with a fake. The trigger mode itself (TriggerMode/Source, the
-// strobe line) is programmed by `enableHardwareTrigger` in the session, not
-// here. Vue-free, core-free.
+// for a model without TriggerWidth, and the sensor readout allowed to overlap
+// the next exposure (`TriggerOverlap = ReadOut`). Pure over a `Camera`-shaped
+// timing seam, so it unit-tests with a fake. The trigger mode itself
+// (TriggerMode/Source, the strobe line) is programmed by
+// `enableHardwareTrigger` in the session, not here. Vue-free, core-free.
 // spec: docs/spec/mirror-link.md#exposure-windows
 
 /** The subset of a leased `Camera` the override touches. */
@@ -30,8 +31,9 @@ export interface TimingCamera {
 export type TriggeredExposureMode = "TriggerWidth" | "Timed";
 
 /** The pre-scan timing, restored verbatim on stop / idle. `exposure_mode` /
- *  `trigger_activation` are null when the model has no such node (the restore
- *  then skips them rather than writing a value it never read). */
+ *  `trigger_activation` / `trigger_overlap` are null when the model has no
+ *  such node (the restore then skips them rather than writing a value it never
+ *  read). */
 export type TimingSnapshot = {
   frame_rate_enable: boolean;
   frame_rate: number;
@@ -39,6 +41,7 @@ export type TimingSnapshot = {
   exposure: number;
   exposure_mode: string | null;
   trigger_activation: string | null;
+  trigger_overlap: string | null;
 };
 
 /** What the camera actually took: the mode, the Timed exposure (0 in
@@ -74,6 +77,9 @@ const readOrNull = (read: () => string): string | null => {
   }
 };
 
+const firstLine = (e: unknown): string =>
+  (e instanceof Error ? e.message : String(e)).split("\n", 1)[0];
+
 /** Read the camera's current timing, to be restored verbatim later. */
 export function snapshotTiming(cam: TimingCamera): TimingSnapshot {
   return {
@@ -83,6 +89,7 @@ export function snapshotTiming(cam: TimingCamera): TimingSnapshot {
     exposure: cam.exposure,
     exposure_mode: readOrNull(() => cam.getFeature("ExposureMode")),
     trigger_activation: readOrNull(() => cam.getFeature("TriggerActivation")),
+    trigger_overlap: readOrNull(() => cam.getFeature("TriggerOverlap")),
   };
 }
 
@@ -92,6 +99,19 @@ function trySetExposureMode(cam: TimingCamera, mode: string): boolean {
     return cam.setExposureMode(mode);
   } catch {
     return false;
+  }
+}
+
+/** `TriggerOverlap = ReadOut`: a trigger may start the next exposure while the
+ *  previous frame is still being read out, so the sensor only needs its
+ *  readout time between exposure ENDS (spec §exposure-windows). Skipped
+ *  silently on a model without the node (or without the entry). */
+function allowReadoutOverlap(cam: TimingCamera): void {
+  if (readOrNull(() => cam.getFeature("TriggerOverlap")) === null) return;
+  try {
+    cam.setFeature("TriggerOverlap", "ReadOut");
+  } catch {
+    // not an entry on this model — the camera keeps its own overlap rule
   }
 }
 
@@ -110,6 +130,7 @@ function trySetExposureMode(cam: TimingCamera, mode: string): boolean {
  *    `TriggerActivation = RisingEdge`, `exposure = clamp(pulseUs,
  *    exposure_range)` (min AND max, read at the write).
  *
+ * Either way `TriggerOverlap = ReadOut` where the model has the node.
  * Throws when neither mode can be set — the session restores and refuses.
  * @returns the values the camera actually took.
  */
@@ -122,6 +143,7 @@ export function applyTriggeredTiming(
   if (preferTriggerWidth && trySetExposureMode(cam, "TriggerWidth")) {
     try {
       cam.setFeature("TriggerActivation", "LevelHigh");
+      allowReadoutOverlap(cam);
       return { exposure_mode: "TriggerWidth", exposure_us: 0, frame_rate: cam.frame_rate };
     } catch {
       // TriggerWidth without a level activation would expose for nothing —
@@ -131,25 +153,45 @@ export function applyTriggeredTiming(
   if (!trySetExposureMode(cam, "Timed"))
     throw new Error("camera refused both ExposureMode=TriggerWidth and ExposureMode=Timed");
   cam.setFeature("TriggerActivation", "RisingEdge");
+  allowReadoutOverlap(cam);
   cam.exposure = clamp(pulseUs, cam.exposure_range);
   return { exposure_mode: "Timed", exposure_us: cam.exposure, frame_rate: cam.frame_rate };
 }
 
 /**
  * Restore {@link snapshotTiming}'s values verbatim: the exposure MODE first (so
- * a Timed exposure is writable again), then TriggerActivation, then the
- * two-sided exposure write around the frame rate (the ceiling moves with the
- * rate), and `exposure_auto` LAST so a `Continuous` mode never re-drives the
- * intermediate writes. Run AFTER `disableHardwareTrigger`.
+ * a Timed exposure is writable again), then TriggerActivation and
+ * TriggerOverlap, then the two-sided exposure write around the frame rate (the
+ * ceiling moves with the rate), and `exposure_auto` LAST so a `Continuous` mode
+ * never re-drives the intermediate writes. Run AFTER `disableHardwareTrigger`.
+ *
+ * Best-effort PER FEATURE: every write runs in its own `try`, so one refused
+ * node (a lease mid-release, a model quirk) never skips the rest.
+ * @returns one line per write that failed (empty when everything landed).
  */
-export function restoreTiming(cam: TimingCamera, snap: TimingSnapshot): void {
-  if (snap.exposure_mode !== null && !trySetExposureMode(cam, snap.exposure_mode))
-    cam.setFeature("ExposureMode", snap.exposure_mode);
-  if (snap.trigger_activation !== null)
-    cam.setFeature("TriggerActivation", snap.trigger_activation);
-  cam.exposure = clamp(snap.exposure, cam.exposure_range);
-  cam.frame_rate = clamp(snap.frame_rate, cam.frame_rate_range);
-  cam.frame_rate_enable = snap.frame_rate_enable;
-  cam.exposure = clamp(snap.exposure, cam.exposure_range);
-  cam.exposure_auto = snap.exposure_auto;
+export function restoreTiming(cam: TimingCamera, snap: TimingSnapshot): string[] {
+  const failed: string[] = [];
+  const step = (name: string, write: () => void): void => {
+    try {
+      write();
+    } catch (e) {
+      failed.push(`${name}: ${firstLine(e)}`);
+    }
+  };
+  const mode = snap.exposure_mode;
+  if (mode !== null)
+    step("ExposureMode", () => {
+      if (!trySetExposureMode(cam, mode)) cam.setFeature("ExposureMode", mode);
+    });
+  const activation = snap.trigger_activation;
+  if (activation !== null)
+    step("TriggerActivation", () => cam.setFeature("TriggerActivation", activation));
+  const overlap = snap.trigger_overlap;
+  if (overlap !== null) step("TriggerOverlap", () => cam.setFeature("TriggerOverlap", overlap));
+  step("exposure", () => void (cam.exposure = clamp(snap.exposure, cam.exposure_range)));
+  step("frame_rate", () => void (cam.frame_rate = clamp(snap.frame_rate, cam.frame_rate_range)));
+  step("frame_rate_enable", () => void (cam.frame_rate_enable = snap.frame_rate_enable));
+  step("exposure", () => void (cam.exposure = clamp(snap.exposure, cam.exposure_range)));
+  step("exposure_auto", () => void (cam.exposure_auto = snap.exposure_auto));
+  return failed;
 }
