@@ -42,7 +42,13 @@
 // stdout control plane: `pty <path>`, `pin <num> <level>` (enable + trigger
 // pins), `dac cs=<-.L.R.LR> <hex word>` (MEMS-SPI capture), `pwm ...` (LPF),
 // `strobe <C|L|R> <level>` (injected edges, incl. idle re-drives),
-// `level <C|L|R> <level>` (probe reply), `ok/err <line>`, `reboot`.
+// `level <C|L|R> <level>` (probe reply), `ok/err <line>`, `reboot`,
+// `stall <gap_us> <mcu_us>` (one service-loop gap longer than
+// STALL_REPORT_US: the loop was descheduled — host load — for `gap_us`, up
+// to MCU time `mcu_us`, the Global::time domain of SYS_TIMESTAMP; emitted
+// before that iteration's DAC words and pushes, so a driver can tell a late
+// marker, a merged crossing or a coarse DAC step the firmware answered a
+// starved loop with from a firmware fault).
 
 #include <algorithm>
 #include <cctype>
@@ -113,6 +119,9 @@ std::mt19937 rng(42); // deterministic across runs
 
 bool running = true;
 uint64_t loopUs = 50;
+// A service-loop gap above this is reported as a `stall` line (the idle loop
+// runs every ~0.1 ms; 2 ms is far outside its jitter).
+constexpr uint64_t STALL_REPORT_US = 2000;
 
 int64_t jitter(uint32_t magnitude) {
   if (magnitude == 0)
@@ -417,11 +426,21 @@ int main(int argc, char **argv) {
   // asynchronous surfaces (host serial ISR = stdin, pin-change ISR = injected
   // edges). `--loop-us` throttles the whole service loop (device-saturation
   // emulation, the serial-rate governor's future sparring partner).
+  uint64_t lastPass = 0; // Sim::nowUs() at the previous iteration's start
   while (running) {
+    const uint64_t pass = Sim::nowUs();
     pumpControl();
     pumpStrobes();
 
     Global::time.update();
+    // Sim-only observability (not in Firmware.cpp): the host clock for the
+    // gap (a SYS_TIMESTAMP SET may move the MCU clock), the MCU clock for
+    // the stamp the driver compares against.
+    if (lastPass != 0 && pass - lastPass > STALL_REPORT_US)
+      Sim::emit("stall %llu %llu",
+                static_cast<unsigned long long>(pass - lastPass),
+                static_cast<unsigned long long>(Global::time.now()));
+    lastPass = pass;
     Streams::housekeeping(); // M1 periodic MEMS config re-assertion (~1 Hz)
     Streams::tick();
     Trajectory::tick(); // v2.2.0: DAC playback + marker triggers
