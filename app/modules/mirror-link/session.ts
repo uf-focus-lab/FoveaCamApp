@@ -5,9 +5,12 @@
 // -------------------------------------------------------
 //
 // MirrorLink session — a calibrated L/C/R triple whose two fovea mirrors trace a
-// fast circular scan around a hand-aimed center while each fovea's exposure spans
-// exactly one revolution. A stripped manual-control: no set-points, no split, no
-// display worker, no capture. Behavior spec: docs/spec/mirror-link.md.
+// fast periodic SCAN PATTERN (ellipse / line / triangle) around a hand-aimed
+// center. The pattern runs on the MCU as the controller node's uploaded
+// trajectory, whose markers trigger both fovea exposures at exact phases (the
+// trigger pulse IS the exposure window); the triangle's falling-sweep frames are
+// flipped by a per-eye flip brick. A stripped manual-control: no set-points, no
+// split, no display worker. Behavior spec: docs/spec/mirror-link.md.
 
 import { type ServerSession } from "@orchestrator/runtime";
 import {
@@ -21,8 +24,11 @@ import {
 import { registerGraphWiring } from "@orchestrator/graph-topology";
 import {
   controllerNode,
+  expectedTriggerNs,
   startPacer,
-  type NativePositionInput,
+  trajectoryNodeId,
+  type NodeTrajectory,
+  type NodeTrajectoryState,
   type PositionInput,
 } from "@orchestrator/controller-node";
 import {
@@ -35,7 +41,16 @@ import {
   radians,
   VOLT_TELEMETRY_INTERVAL_MS,
 } from "@orchestrator/fovea-pipeline";
-import { activeController } from "@orchestrator/controller";
+import {
+  activeController,
+  TrajectoryReplaceError,
+  type TrajectoryFrameOutcome,
+  type TrajectorySpec,
+} from "@orchestrator/controller";
+import {
+  disableHardwareTrigger,
+  enableHardwareTrigger,
+} from "@orchestrator/camera-trigger";
 import { report } from "@orchestrator/diagnostics";
 import {
   advertiseUndistortPipe,
@@ -65,9 +80,7 @@ import type { RingReadout } from "@lib/ring-code";
 import type { PipeBroker } from "@orchestrator/pipe-session";
 import { rawPipeSpec, type RawPipeRegistry } from "@orchestrator/raw-pipe";
 import type { CompressPipeSeam } from "@orchestrator/compress-pipe";
-import type { OrbitHandle, OrbitSeam } from "@orchestrator/orbit-pipe";
-import { registerNativeProbe } from "@orchestrator/native-probes";
-import type { CameraLease } from "@orchestrator/registry";
+import { cameraPipeSpec, type CameraLease } from "@orchestrator/registry";
 import { createTriggerOpChain } from "@lib/trigger-sync";
 import { slewStep, type SlewPair } from "@lib/slew";
 import {
@@ -82,7 +95,12 @@ import {
 } from "@orchestrator/pid-node";
 import { createSlicePipe, type SliceHandle, type SlicePipeSeam } from "@orchestrator/slice-pipe";
 import { createScalePipe, type ScaleHandle, type ScalePipeSeam } from "@orchestrator/scale-pipe";
-import type { FlipPipeSeam } from "@orchestrator/flip-pipe";
+import {
+  createFlipPipe,
+  type FlipAnchor,
+  type FlipHandle,
+  type FlipPipeSeam,
+} from "@orchestrator/flip-pipe";
 import {
   foveaTileSize,
   matchMagnification,
@@ -110,16 +128,38 @@ import { deg } from "@lib/util/math";
 import { RollingStats } from "@lib/util/rolling";
 import type { Point2d, Rect, Size } from "core/Geometry";
 import type { Pos } from "@lib/controller-codec";
-import { mirrorLink, type ScanTelemetry } from "./contract";
-
-import { SCAN_HZ_RANGE, SHIFT_RANGE_DEG, scanAngles, scanOffset } from "./scan";
 import {
-  applyScanTiming,
+  mirrorLink,
+  type ScanMode,
+  type ScanTelemetry,
+  type ScanWindow,
+  type TrajectoryTelemetry,
+} from "./contract";
+
+import {
+  activeWindows,
+  axisDegFromPixelRay,
+  axisHandleOffset,
+  clampWindow,
+  normalizeAxisDeg,
+  patternPath,
+  patternPeriodUs,
+  patternSamples,
+  SCAN_AMP_RANGE,
+  SCAN_HZ_RANGE,
+  SCAN_RATIO_RANGE,
+  scanAngles,
+  WINDOW_MAX,
+  windowMarkers,
+  windowPaths,
+} from "./scan";
+import {
+  applyTriggeredTiming,
   exposureMismatch,
   restoreTiming,
-  scanPeriodUs,
   snapshotTiming,
   type TimingSnapshot,
+  type TriggeredTiming,
 } from "./exposure";
 import {
   applyGain,
@@ -132,31 +172,60 @@ import {
 const SIDES = ["L", "R"] as const;
 type Side = (typeof SIDES)[number];
 
-/** Applied timing per eye, as the cameras actually took it. */
-type AppliedTiming = { exposure_us: number; frame_rate: number };
-
 const clampHz = (hz: number): number =>
   Math.min(Math.max(hz, SCAN_HZ_RANGE.min), SCAN_HZ_RANGE.max);
 
-/** Points per drawn scan loop — dense enough that the polyline reads as a
- *  circle at PosView scale, cheap enough to republish on every slider nudge. */
+/** A window from whatever a client wrote, clamped (spec §exposure-windows). */
+const windowFrom = (v: unknown): ScanWindow =>
+  Array.isArray(v) && v.length === 2
+    ? clampWindow([Number(v[0]), Number(v[1])])
+    : [0, WINDOW_MAX];
+const sameWindow = (a: unknown, b: unknown): boolean =>
+  Array.isArray(a) &&
+  Array.isArray(b) &&
+  a.length === 2 &&
+  b.length === 2 &&
+  a[0] === b[0] &&
+  a[1] === b[1];
+
+/** Points per drawn scan path — dense enough that the polyline reads as an
+ *  ellipse at PosView scale, cheap enough to republish on every slider nudge. */
 const SCAN_PATH_SAMPLES = 48;
 
 /** Voltage envelope assumed while no controller is bound (controller.dv). */
 const DEFAULT_DV = 170.0;
 
-/** JS fallback push interval while the native brick owns the wire: the pacer
- *  still ticks at 1 ms (its gap is the stall meter), but the fallback pose only
- *  tracks the slewed center, which nothing downstream consumes. */
-const FALLBACK_TICK_MS = 10;
+/** Lead between building the START and the trajectory's EXPLICIT host-ns
+ *  start instant: the START must reach the MCU before it is due (a past
+ *  `t_start` would join in progress and lose the exact-lateness reference). */
+const SCAN_START_LEAD_NS = 20_000_000n;
 
-/** The orbit node's advertised output. */
-const PID_STREAM: StreamType = { kind: "analysis", schema: "pid" };
+/** Live re-upload throttle (spec §actuation): at most one `replace` per this,
+ *  latest geometry wins. The node coalesces too; this keeps the wire sane. */
+const REPLACE_INTERVAL_MS = 100;
 
-/** How often the brick + sink meters are read for `perf.orbit`. Far slower than
- *  the telemetry throttle: a probe builds an object on the very loop the brick
- *  exists to keep free. */
-const ORBIT_PROBE_INTERVAL_MS = 1000;
+/** Flip-brick match tolerance (spec §triangle-flip): this fraction of the
+ *  sweep T (the brief's 0.4·T at the default windows), but never more than the
+ *  same fraction of the CLOSEST marker spacing — so a frame whose own anchor
+ *  is late can never match the neighbouring marker (and flip a rising frame).
+ *  The nearest anchor wins inside the tolerance anyway. */
+const FLIP_TOLERANCE_FRACTION = 0.4;
+
+/** No-exposure watchdog: a run with no OK marker push for this many periods
+ *  warns once (spec §exposure-windows). */
+const NO_OK_PERIODS = 2;
+
+/** Unmatched-flip watchdog (spec §triangle-flip): over the last two periods
+ *  (at least this long, so a slow scan still averages a few frames), more than
+ *  this fraction of the flipped + unmatched frames being unmatched warns once
+ *  per run; fewer frames than the floor never judge. */
+const FLIP_WINDOW_MIN_MS = 500;
+const UNMATCHED_WARN_FRACTION = 0.05;
+const FLIP_WINDOW_MIN_FRAMES = 8;
+
+/** The trajectory node's output type (the flip bricks' anchor edge). */
+const TRAJECTORY_STREAM: StreamType = { kind: "analysis", schema: "trajectory" };
+const RGBA_STREAM = { kind: "frame", pixelFormat: "RGBA8", dtype: "U8" } as const;
 
 /** Physical saturation limits for the vergence DOF, in radians (the shared
  *  degree constants). The drawer's Verge/Shift sliders ARE these DOF, so their
@@ -173,15 +242,6 @@ const SEED_PARALLEL_EPS = 1e-9;
  *  manual slider move — no re-seed. */
 const DOF_EPS = 1e-9;
 
-/** Orbit-sink GOVERNOR policy (spec §actuation). The compose path's AIMD
- *  defaults suit a latency-sensitive tracker: halve on ANY pressure signal,
- *  floor 60 Hz. A free-running orbit is different — 60 poses/s at a 10 Hz scan
- *  is a hexagon. Genuine link overload must still back off (`enabled` stays
- *  true), but never below a floor that keeps the ring round, and a busy MCU's
- *  inflated ACK RTT is not overload of the UPDATE path. */
-const ORBIT_GOV_FLOOR_HZ = 500;
-const ORBIT_GOV_RTT_INFLATION = 8;
-
 const errorLine = (e: unknown): string =>
   (e instanceof Error ? e.message : String(e)).split("\n", 1)[0];
 
@@ -189,7 +249,6 @@ export default function mirrorLinkSession(
   broker: PipeBroker,
   undistortSeam: UndistortPipeSeam,
   rawPipes: RawPipeRegistry,
-  orbitSeam: OrbitSeam,
   sliceSeam: SlicePipeSeam,
   scaleSeam: ScalePipeSeam,
   compressSeam?: CompressPipeSeam,
@@ -198,9 +257,6 @@ export default function mirrorLinkSession(
   return defineResourceSession("mirror-link", mirrorLink, (s) => {
     let triple: CalibratedTriple | null = null;
     let posInput: PositionInput | null = null;
-    let nativePos: NativePositionInput | null = null;
-    let orbit: OrbitHandle | null = null;
-    let voltLink: { release(): void } | null = null;
     let stopActuation: (() => void) | null = null;
 
     const now = () => performance.now();
@@ -209,7 +265,7 @@ export default function mirrorLinkSession(
     let target: Point2d = { x: 0, y: 0 };
     let targetAngle: Point2d = { x: 0, y: 0 };
 
-    // Latest commanded voltages (the instantaneous scan pose while active).
+    // Latest commanded voltages (the idle pose; held while the MCU scans).
     const volts: { L: Pos; R: Pos } = {
       L: { ...ORIGIN_POS },
       R: { ...ORIGIN_POS },
@@ -271,46 +327,28 @@ export default function mirrorLinkSession(
     /** ...and as volts — the slew goal while idle and the L_PX/R_PX source. */
     const centerVolts = (): SlewPair => voltsFor(centerAngles());
 
-    /** Finite-difference half-step for the orbit Jacobian (rad). */
-    const J_EPS_RAD = 1e-3;
-
-    /** The angle→volt chain LINEARIZED around offset 0, per eye: row-major 2×2
-     *  volts per radian `[dVx/dox, dVx/doy, dVy/dox, dVy/doy]`. The native brick
-     *  commands `center + J · offset`, so the emitted circle is exact to first
-     *  order; `scan_path` stays the exact chain (spec §scan). */
-    function orbitJacobians(): { jL: number[]; jR: number[] } {
-      const at = (x: number, y: number): SlewPair =>
-        voltsFor(anglesAt({ x, y }));
-      const px = at(J_EPS_RAD, 0);
-      const mx = at(-J_EPS_RAD, 0);
-      const py = at(0, J_EPS_RAD);
-      const my = at(0, -J_EPS_RAD);
-      const d = 2 * J_EPS_RAD;
-      const eye = (k: "l" | "r"): number[] => [
-        (px[k].x - mx[k].x) / d,
-        (py[k].x - my[k].x) / d,
-        (px[k].y - mx[k].y) / d,
-        (py[k].y - my[k].y) / d,
-      ];
-      return { jL: eye("l"), jR: eye("r") };
+    /** The scan's center ray in the WIDE angular frame — `A0 + pan`, the point
+     *  every pattern offset rides on (spec §targeting); `pan` is 0 unless auto
+     *  vergence is engaged. */
+    function scanCenterAngle(): Point2d {
+      const p = heldDof().pan;
+      return { x: targetAngle.x + p.x, y: targetAngle.y + p.y };
     }
 
-    /** Hand the brick the current center + linearization (spec §actuation). */
-    function pushOrbitPose(): void {
-      if (!orbit || !triple) return;
-      const c = centerVolts();
-      const { jL, jR } = orbitJacobians();
-      orbit.setPose({ centerL: c.l, centerR: c.r, jL, jR });
-    }
+    /** The pattern family the state asks for (anything else reads as the
+     *  ellipse; the `scan_mode` watch writes it back). */
+    const scanMode = (): ScanMode =>
+      s.state.scan_mode === "triangle" ? "triangle" : "ellipse";
 
-    /** Hand the brick the ring shape, its tick rate, and whether it runs. */
-    function pushOrbitParams(): void {
-      orbit?.setOrbit({
-        ampRad: radians(s.state.scan_amp),
-        hz: clampHz(s.state.scan_hz),
-        paceHz: s.state.orbit_pace_hz,
-        enabled: scanActive,
-      });
+    /** The pattern's shape parameters, sanitized (spec §scan-patterns). */
+    function patternParams(): { axis: number; amp: number; ratio: number } {
+      const amp = Number.isFinite(s.state.scan_amp) ? s.state.scan_amp : 0;
+      const ratio = Number.isFinite(s.state.scan_ratio) ? s.state.scan_ratio : 1;
+      return {
+        axis: normalizeAxisDeg(s.state.scan_axis_deg),
+        amp: Math.min(Math.max(amp, SCAN_AMP_RANGE.min), SCAN_AMP_RANGE.max),
+        ratio: Math.min(Math.max(ratio, SCAN_RATIO_RANGE.min), SCAN_RATIO_RANGE.max),
+      };
     }
 
     /** Wide-px projection of a commanded volt; {0,0} uncalibrated (A2P.C needs
@@ -330,45 +368,58 @@ export default function mirrorLinkSession(
       };
     }
 
-    /** The scan's DRAWABLE geometry (spec §views): the ring radius in wide px,
-     *  and the commanded circle in volt space per eye. Recomputed on every
-     *  input that moves or reshapes the ring — never per pacer tick. The same
-     *  inputs re-linearize the native brick, so the pose push rides here. */
+    /** The scan's DRAWABLE geometry (spec §views): the commanded path in volt
+     *  space per eye, and — calibrated — the same path, its exposed windows and
+     *  the axis handle in wide px, all off the EXACT chain the trajectory is
+     *  built from. Recomputed on every input that moves or reshapes the
+     *  pattern — never per pacer tick — and, while scanning, the same inputs
+     *  re-upload the trajectory (throttled), so the re-upload rides here. */
     function publishScanGeometry(): void {
-      if (!triple) {
-        s.telemetry({ scan_px: 0, scan_path: { L: [], R: [] } });
+      const t = triple;
+      if (!t) {
+        s.telemetry({
+          scan_path: { L: [], R: [] },
+          scan_path_px: [],
+          scan_window_px: [],
+          axis_handle_px: { x: 0, y: 0 },
+        });
         return;
       }
-      pushOrbitPose();
+      const mode = scanMode();
       const hz = clampHz(s.state.scan_hz);
-      const periodMs = 1000 / hz;
+      const g = patternParams();
+      const path = patternPath(mode, g.axis, g.amp, g.ratio, SCAN_PATH_SAMPLES);
       const L: Pos[] = [];
       const R: Pos[] = [];
-      for (let k = 0; k < SCAN_PATH_SAMPLES; k++) {
-        // The SAME chain the pacer commands: offset → inverseTriangulate +
-        // shift → A2V, so the drawn path is the commanded path.
-        const pose = voltsFor(
-          anglesAt(
-            scanOffset((k / SCAN_PATH_SAMPLES) * periodMs, hz, s.state.scan_amp),
-          ),
-        );
-        // Clamped to the mirror's range, like every commanded pose: the drawn
-        // path is the path the mirror can actually take.
+      for (const o of path.offsets) {
+        // The SAME chain the trajectory samples ride: offset → inverseTriangulate
+        // + shift → A2V, clamped to the mirror's range like every commanded
+        // pose — the drawn path is the path the mirror can actually take.
+        const pose = voltsFor(anglesAt(o));
         L.push(clampVolt(pose.l));
         R.push(clampVolt(pose.r));
       }
-      s.telemetry({ scan_path: { L, R } });
-      if (!triple.undistort) {
-        s.telemetry({ scan_px: 0 });
-        return;
+      let pathPx: Point2d[] = [];
+      let windowPx: Point2d[][] = [];
+      let handlePx: Point2d = { x: 0, y: 0 };
+      if (t.undistort) {
+        const c = scanCenterAngle();
+        const px = (o: Point2d): Point2d =>
+          t.conv.A2P.C({ x: c.x + o.x, y: c.y + o.y }, false);
+        pathPx = path.offsets.map(px);
+        const markers = windowMarkers(mode, hz, activeWindows(mode, s.state));
+        windowPx = windowPaths(mode, hz, g.axis, g.amp, g.ratio, markers, SCAN_PATH_SAMPLES).map(
+          (seg) => seg.map(px),
+        );
+        handlePx = px(axisHandleOffset(g.axis, g.amp));
       }
-      const amp = radians(s.state.scan_amp);
-      const c = triple.conv.A2P.C(targetAngle, false);
-      const edge = triple.conv.A2P.C(
-        { x: targetAngle.x + amp, y: targetAngle.y },
-        false,
-      );
-      s.telemetry({ scan_px: Math.hypot(edge.x - c.x, edge.y - c.y) });
+      s.telemetry({
+        scan_path: { L, R },
+        scan_path_px: pathPx,
+        scan_window_px: windowPx,
+        axis_handle_px: handlePx,
+      });
+      scheduleReplace();
     }
 
     function setTargetFromPixel(px: Point2d): void {
@@ -390,17 +441,17 @@ export default function mirrorLinkSession(
 
     // --- scan lifecycle (spec §lifecycle) ----------------------------------
     // Session-local INTENT: never persisted, never auto-resumed on re-entry.
+    // The pattern runs on the MCU as THE controller node's uploaded trajectory
+    // (spec §actuation); its markers trigger both foveas at exact phases and
+    // each OK marker push comes back with trusted timestamps.
 
     let scanActive = false;
-    let scanT0 = 0;
-    /** Pre-scan timing per eye, captured at start and restored verbatim on
-     *  stop / idle / re-apply — the per-camera config docs are never touched. */
-    const snapshots: Partial<Record<Side, TimingSnapshot>> = {};
     /** False from idle start until the next activate: a queued start must not
      *  re-arm the cameras while teardown drains. */
     let scanAllowed = false;
-    /** FIFO mutex over the lease timing config: a fast toggle must not
-     *  interleave an apply with an in-flight restore (manual-control's idiom). */
+    /** FIFO mutex over the lease timing config AND the trajectory: a fast
+     *  toggle must not interleave an apply with an in-flight restore, nor a
+     *  re-upload with a restart (manual-control's idiom). */
     const queueScanOp = createTriggerOpChain((e) =>
       console.error("[mirror-link] scan op failed:", e),
     );
@@ -410,136 +461,671 @@ export default function mirrorLinkSession(
     }
 
     /** Local mirror of the published `scan` readout — the runtime doesn't hand
-     *  back the last telemetry object, and the amplitude watch patches it. */
+     *  back the last telemetry object, and capture metadata reads it. */
     let activeScan: ScanTelemetry | null = null;
 
-    function publishScanTelemetry(
-      hz: number,
-      applied: Record<Side, AppliedTiming>,
-    ): void {
-      const period_us = scanPeriodUs(hz);
-      const mismatch =
-        exposureMismatch(applied.L.exposure_us, period_us) ||
-        exposureMismatch(applied.R.exposure_us, period_us);
-      const scan: ScanTelemetry = {
+    // -- the trajectory run --------------------------------------------------
+
+    type BuiltScan = { mode: ScanMode; hz: number; spec: TrajectorySpec };
+
+    let trajectory: NodeTrajectory | null = null;
+    let trajectoryUnsubs: Array<() => void> = [];
+    /** The spec the MCU runs NOW (after the last successful start/replace). */
+    let runSpec: TrajectorySpec | null = null;
+    let runMode: ScanMode = "ellipse";
+    let runHz = 0;
+    /** The run's EXPLICIT host-steady start instant — lateness is exact
+     *  against it, and `replace` carries it (the phase continues). */
+    let runStartNs = 0n;
+    /** ...and the same instant on `now()`'s clock, for the watchdogs. */
+    let runStartMs = 0;
+    /** A `replace` is in flight: its state traffic is not a run end. */
+    let replacing = false;
+
+    /**
+     * The pattern as a `TrajectorySpec` (spec §actuation): every sample through
+     * the EXACT chain — `voltsFor(anglesAt(offset))`, clamped like every
+     * commanded pose — never a linearization; one marker per exposure window
+     * (`windowMarkers`), triggering BOTH foveas. `step` stays false: the MCU's
+     * linear interpolation between samples (wrapping last → first) is what
+     * turns the triangle's two samples into the sweep.
+     */
+    function buildScan(): BuiltScan {
+      const mode = scanMode();
+      const hz = clampHz(s.state.scan_hz);
+      const g = patternParams();
+      const samples = patternSamples(mode, hz, g.axis, g.amp, g.ratio).map(
+        ({ tOffsetUs, offset }) => {
+          const v = voltsFor(anglesAt(offset));
+          return { tOffsetUs, left: clampVolt(v.l), right: clampVolt(v.r) };
+        },
+      );
+      const markers = windowMarkers(mode, hz, activeWindows(mode, s.state)).map((m) => ({
+        tOffsetUs: m.tOffsetUs,
+        pulseUs: m.pulseUs,
+        cameras: ["L", "R"] as ("L" | "R")[],
+      }));
+      return {
+        mode,
         hz,
-        amp_deg: s.state.scan_amp,
-        period_us,
+        spec: { periodUs: patternPeriodUs(mode, hz), samples, markers, step: false },
+      };
+    }
+
+    const sameSpec = (a: TrajectorySpec, b: TrajectorySpec): boolean =>
+      JSON.stringify(a) === JSON.stringify(b);
+
+    // -- perf.trajectory -----------------------------------------------------
+
+    const pushes = { ok: 0, timeout: 0, busy: 0, other: 0 };
+    let latenessUs = 0;
+    let reuploads = 0;
+    let lastOkMs = 0;
+    const flipCounts = {
+      flipped: { L: 0, R: 0 },
+      unmatched: { L: 0, R: 0 },
+    };
+    /** Summed flip counters over recent probes — the unmatched watchdog's window. */
+    let flipWindow: { at: number; flipped: number; unmatched: number }[] = [];
+    // Each failure family warns once per run.
+    let warnedNoOk = false;
+    let warnedUnmatched = false;
+    let warnedReplace = false;
+    let warnedMismatch = false;
+    let warnedNoFlipSeam = false;
+
+    /** A new scan: counters and once-per-run warnings start over. */
+    function resetRunStats(): void {
+      pushes.ok = pushes.timeout = pushes.busy = pushes.other = 0;
+      latenessUs = 0;
+      reuploads = 0;
+      lastOkMs = 0;
+      flipCounts.flipped = { L: 0, R: 0 };
+      flipCounts.unmatched = { L: 0, R: 0 };
+      flipWindow = [];
+      warnedNoOk = warnedUnmatched = warnedReplace = warnedMismatch = false;
+    }
+
+    function trajectoryPerf(): TrajectoryTelemetry {
+      return {
+        running: scanActive && trajectory?.state === "running",
+        pushes: { ...pushes },
+        lateness_us: latenessUs,
+        reuploads,
+        flipped: { ...flipCounts.flipped },
+        unmatched: { ...flipCounts.unmatched },
+      };
+    }
+
+    /** Every push of THE run's table (spec §exposure-windows). OK pushes are
+     *  the exposure ground truth: the flip anchor goes out FIRST, synchronously
+     *  — the flip brick never holds a frame back, so a frame processed before
+     *  its anchor arrived passes unflipped (spec §triangle-flip). */
+    function onTrajectoryFrame(f: TrajectoryFrameOutcome): void {
+      if (f.status === "OK") {
+        if (f.marker !== null && (flips.L || flips.R)) {
+          const anchor: FlipAnchor = { tExposure: f.tExposure, flip: f.marker === 1 };
+          flips.L?.pushAnchor(anchor);
+          flips.R?.pushAnchor(anchor);
+        }
+        pushes.ok++;
+        lastOkMs = now();
+        const m = f.marker !== null ? runSpec?.markers?.[f.marker] : undefined;
+        if (m && runSpec)
+          latenessUs =
+            Number(
+              f.tTrigger -
+                expectedTriggerNs(runStartNs, f.cycle, runSpec.periodUs, m.tOffsetUs),
+            ) / 1000;
+        return;
+      }
+      if (f.status === "STROBE_TIMEOUT") pushes.timeout++;
+      else if (f.status === "BUSY") pushes.busy++;
+      else pushes.other++; // run-level ENDED / CANCELLED, UNKNOWN
+    }
+
+    /** The run ended under us (controller unbound/swapped, or the MCU ended or
+     *  cancelled it): the scan is over — restore and say why. */
+    function onTrajectoryState(traj: NodeTrajectory, state: NodeTrajectoryState): void {
+      if (traj !== trajectory || !scanActive || replacing) return;
+      if (state === "running" || state === "uploading") return;
+      const reason =
+        state === "detached"
+          ? "controller disconnected — scan stopped"
+          : "the controller ended the trajectory run — scan stopped";
+      void queueScanOp(() => abortScanNow(reason, traj));
+    }
+
+    /** No OK push for {@link NO_OK_PERIODS} periods → one warning per run. */
+    function watchNoOk(tick: number): void {
+      if (!scanActive || !runSpec || warnedNoOk) return;
+      const since = Math.max(lastOkMs, runStartMs);
+      if (tick - since <= (NO_OK_PERIODS * runSpec.periodUs) / 1000) return;
+      warnedNoOk = true;
+      report(
+        "mirror-link",
+        `no fovea exposure confirmed for ${NO_OK_PERIODS} scan periods ` +
+          `(${pushes.timeout} strobe timeouts, ${pushes.busy} busy) — check the trigger/strobe cabling`,
+        "warning",
+      );
+    }
+
+    /** Read the flip bricks' counters and judge the unmatched share over the
+     *  last two periods (spec §triangle-flip). */
+    function probeFlips(tick: number): void {
+      if (!flips.L && !flips.R) return;
+      for (const side of SIDES) {
+        const p = flips[side]?.probe();
+        if (!p) continue;
+        flipCounts.flipped[side] = p.flipped;
+        flipCounts.unmatched[side] = p.unmatched;
+      }
+      const sample = {
+        at: tick,
+        flipped: flipCounts.flipped.L + flipCounts.flipped.R,
+        unmatched: flipCounts.unmatched.L + flipCounts.unmatched.R,
+      };
+      flipWindow.push(sample);
+      const span = Math.max(FLIP_WINDOW_MIN_MS, (2 * (runSpec?.periodUs ?? 0)) / 1000);
+      // Keep the NEWEST sample at least `span` old as the window base.
+      while (flipWindow.length > 2 && tick - flipWindow[1]!.at >= span) flipWindow.shift();
+      const base = flipWindow[0]!;
+      if (warnedUnmatched || tick - base.at < span) return;
+      const dU = sample.unmatched - base.unmatched;
+      const dF = sample.flipped - base.flipped;
+      if (dU + dF < FLIP_WINDOW_MIN_FRAMES || dU <= UNMATCHED_WARN_FRACTION * (dU + dF)) return;
+      warnedUnmatched = true;
+      report(
+        "mirror-link",
+        `falling-sweep frames arriving before their marker push — they are shown unflipped ` +
+          `(${dU} of ${dU + dF} unmatched over the last ${(span / 1000).toFixed(1)} s)`,
+        "warning",
+      );
+    }
+
+    async function runTrajectory(built: BuiltScan): Promise<void> {
+      const traj = await controllerNode().openTrajectory(built.spec, { name: "mirror-link" });
+      trajectory = traj;
+      runSpec = built.spec;
+      runMode = built.mode;
+      runHz = built.hz;
+      trajectoryUnsubs.push(
+        traj.onFrame(onTrajectoryFrame),
+        traj.onStateChange((state) => onTrajectoryState(traj, state)),
+      );
+      // The flip bricks exist BEFORE the first trigger: the first falling frame
+      // must already find its brick (spec §triangle-flip).
+      syncFlips(built.mode === "triangle", flipTolerance(built.spec));
+      // An EXPLICIT start instant: lateness is exact and replace carries the
+      // phase from it (spec controller.md#trajectory-ownership).
+      const at = hostNowNs() + SCAN_START_LEAD_NS;
+      runStartNs = at;
+      runStartMs = now() + Number(SCAN_START_LEAD_NS) / 1e6;
+      lastOkMs = 0;
+      warnedNoOk = false;
+      warnedUnmatched = false;
+      flipWindow = [];
+      await traj.start(at);
+    }
+
+    /** Stop + close THE run's table (best-effort: the device may be gone). */
+    async function closeTrajectory(): Promise<void> {
+      const traj = trajectory;
+      trajectory = null;
+      runSpec = null;
+      for (const u of trajectoryUnsubs.splice(0)) u();
+      if (!traj) return;
+      try {
+        await traj.stop();
+      } catch {
+        // best-effort — close() stops a running table too
+      }
+      try {
+        await traj.close();
+      } catch {
+        // best-effort — the controller may already be gone
+      }
+    }
+
+    // -- the triangle flip (spec §triangle-flip) -----------------------------
+
+    const flips: Partial<Record<Side, FlipHandle>> = {};
+    let flipToleranceNs = 0n;
+    let flipWiring: (() => void) | null = null;
+
+    /** {@link FLIP_TOLERANCE_FRACTION} of min(sweep, closest circular marker
+     *  spacing), in ns. */
+    function flipTolerance(spec: TrajectorySpec): bigint {
+      const P = spec.periodUs;
+      const offsets = (spec.markers ?? []).map((m) => m.tOffsetUs).sort((a, b) => a - b);
+      let gap = offsets.length > 1 ? P / offsets.length : P; // the sweep T
+      for (let i = 0; i < offsets.length; i++) {
+        const next = i + 1 < offsets.length ? offsets[i + 1]! : offsets[0]! + P;
+        gap = Math.min(gap, next - offsets[i]!);
+      }
+      return BigInt(Math.round(FLIP_TOLERANCE_FRACTION * gap * 1000));
+    }
+
+    /** Advertise + attach one flip brick per eye on its convert pipe (the
+     *  source pipe's own spec — a flip changes no byte), register their graph
+     *  rows, publish `state.flipPipes`, and re-bind the ring reader. All or
+     *  nothing: a failed eye retires the other and rethrows. */
+    function buildFlips(t: CalibratedTriple, toleranceNs: bigint): void {
+      if (!flipSeam) {
+        if (!warnedNoFlipSeam) {
+          warnedNoFlipSeam = true;
+          report(
+            "mirror-link",
+            "triangle flip unavailable (no flip brick in this build) — falling-sweep frames are shown unflipped",
+            "warning",
+          );
+        }
+        return;
+      }
+      const built: Partial<Record<Side, FlipHandle>> = {};
+      try {
+        for (const side of SIDES) {
+          const cam = t.leases[side].camera;
+          built[side] = createFlipPipe(
+            flipSeam,
+            nodeId.convert(cam.serial),
+            cameraPipeSpec(cam),
+            nodeId.flip(cam.serial),
+            { toleranceNs },
+          );
+        }
+      } catch (e) {
+        for (const side of SIDES) built[side]?.retire();
+        throw e;
+      }
+      flips.L = built.L;
+      flips.R = built.R;
+      flipToleranceNs = toleranceNs;
+      flipWindow = []; // fresh bricks count from 0
+      flipWiring = registerGraphWiring({
+        nodes: SIDES.map((side) => ({
+          id: built[side]!.pipeId,
+          kind: "flip",
+          owner: "win/mirror-link",
+          output: RGBA_STREAM,
+          transport: "pipe" as const,
+        })),
+        edges: SIDES.flatMap((side) => [
+          {
+            from: nodeId.convert(t.leases[side].camera.serial),
+            to: built[side]!.pipeId,
+            port: "in",
+            type: RGBA_STREAM,
+          },
+          {
+            from: trajectoryNodeId(),
+            to: built[side]!.pipeId,
+            port: "anchor",
+            type: TRAJECTORY_STREAM,
+          },
+        ]),
+      });
+      s.setState("flipPipes", { L: built.L!.pipeId, R: built.R!.pipeId });
+      rebindRingNode();
+    }
+
+    /** The reverse, consumers first: the views fall back to the raw pipes
+     *  (`flipPipes` → null), the reader lets go of the flip pipes, then the
+     *  bricks retire and the reader re-binds the raw pipes. */
+    function retireFlips(): void {
+      if (!flips.L && !flips.R) return;
+      s.setState("flipPipes", { L: null, R: null });
+      const hadRing = ringNode !== null;
+      if (hadRing) disposeRingNode();
+      flipWiring?.();
+      flipWiring = null;
+      for (const side of SIDES) {
+        flips[side]?.retire();
+        delete flips[side];
+      }
+      // Teardown (`scanAllowed` already false) disposes the reader next anyway.
+      if (hadRing && scanAllowed) buildRingNode();
+    }
+
+    /** Flip pipes exactly in triangle mode while scanning; a tolerance change
+     *  (a new sweep time) rebuilds them — the brick takes it at attach. */
+    function syncFlips(want: boolean, toleranceNs: bigint): void {
+      const have = !!(flips.L || flips.R);
+      if (have && (!want || toleranceNs !== flipToleranceNs)) retireFlips();
+      if (want && !flips.L && !flips.R && triple) buildFlips(triple, toleranceNs);
+    }
+
+    // -- camera programming (spec §exposure-windows) -------------------------
+
+    /** Pre-scan timing per eye, captured once at start and restored verbatim on
+     *  stop / idle — the per-camera config docs are never touched. */
+    const snapshots: Partial<Record<Side, TimingSnapshot>> = {};
+    /** Eyes whose trigger mode was (or may have been partly) programmed. */
+    const triggerArmed: Partial<Record<Side, true>> = {};
+    /** What the cameras took, and the marker-0 pulse a Timed exposure was
+     *  written for (TriggerWidth needs no write per window). */
+    let applied: Record<Side, TriggeredTiming> | null = null;
+    let appliedPulseUs = 0;
+
+    /** Snapshot (once) → trigger mode on (once) → triggered timing, on the
+     *  lease's safe reconfigure path. */
+    async function armEye(
+      side: Side,
+      lease: CameraLease,
+      pulseUs: number,
+      preferTriggerWidth: boolean,
+    ): Promise<TriggeredTiming> {
+      // Reads only — before the trigger write resets TriggerActivation.
+      if (!snapshots[side]) snapshots[side] = snapshotTiming(lease.camera);
+      if (!triggerArmed[side]) {
+        triggerArmed[side] = true; // before the await: a partial write still needs the disable
+        const r = await enableHardwareTrigger(lease);
+        if (r.lineInverter)
+          report(
+            "mirror-link",
+            `${side} strobe LineInverter not written: ${r.lineInverter}`,
+            "warning",
+          );
+      }
+      const box: { v?: TriggeredTiming } = {};
+      await lease.reconfigure(() => {
+        box.v = applyTriggeredTiming(lease.camera, { pulseUs, preferTriggerWidth });
+      });
+      return box.v!;
+    }
+
+    /** Arm L then R. ONE exposure mode for both eyes: a Timed fallback on
+     *  either re-applies the other as Timed, so both expose the same window. */
+    async function armCameras(
+      t: CalibratedTriple,
+      pulseUs: number,
+    ): Promise<Record<Side, TriggeredTiming>> {
+      const a = {} as Record<Side, TriggeredTiming>;
+      for (const side of SIDES) a[side] = await armEye(side, t.leases[side], pulseUs, true);
+      if (a.L.exposure_mode !== a.R.exposure_mode)
+        for (const side of SIDES)
+          if (a[side].exposure_mode === "TriggerWidth")
+            a[side] = await armEye(side, t.leases[side], pulseUs, false);
+      return a;
+    }
+
+    /** Free-run again, then the pre-scan timing verbatim — best-effort per
+     *  step (the lease may be releasing). MUST run while the leases are live. */
+    async function disarmCameras(t: CalibratedTriple): Promise<void> {
+      for (const side of SIDES) {
+        const lease = t.leases[side];
+        if (triggerArmed[side]) {
+          try {
+            await disableHardwareTrigger(lease);
+          } catch {
+            // best-effort — the lease may already be releasing
+          }
+          delete triggerArmed[side];
+        }
+        const snap = snapshots[side];
+        if (snap) {
+          try {
+            await lease.reconfigure(() => restoreTiming(lease.camera, snap));
+          } catch {
+            // best-effort — the lease may already be releasing
+          }
+          delete snapshots[side];
+        }
+      }
+      applied = null;
+      appliedPulseUs = 0;
+    }
+
+    /** A new marker-0 pulse: in TIMED mode the exposure itself moves; in
+     *  TriggerWidth the pulse IS the exposure — nothing to write. */
+    async function retimeIfNeeded(t: CalibratedTriple, spec: TrajectorySpec): Promise<void> {
+      const pulse = spec.markers?.[0]?.pulseUs ?? 0;
+      if (!applied || pulse === appliedPulseUs) return;
+      if (applied.L.exposure_mode === "TriggerWidth" && applied.R.exposure_mode === "TriggerWidth") {
+        appliedPulseUs = pulse;
+        return;
+      }
+      const a = {} as Record<Side, TriggeredTiming>;
+      for (const side of SIDES) a[side] = await armEye(side, t.leases[side], pulse, false);
+      applied = a;
+      appliedPulseUs = pulse;
+    }
+
+    /** Publish the applied scan (non-null exactly while active). In Timed mode
+     *  a clamped exposure, or triangle windows of unequal length (one exposure
+     *  for both), is a `mismatch` — warned once per run. */
+    function publishScanTelemetry(): void {
+      if (!runSpec || !applied) return;
+      const markers = runSpec.markers ?? [];
+      const timed = applied.L.exposure_mode === "Timed" || applied.R.exposure_mode === "Timed";
+      const p0 = markers[0]?.pulseUs ?? 0;
+      const mismatch =
+        timed &&
+        (exposureMismatch(applied.L.exposure_us, p0) ||
+          exposureMismatch(applied.R.exposure_us, p0) ||
+          markers.some((m) => exposureMismatch(p0, m.pulseUs)));
+      const scan: ScanTelemetry = {
+        mode: runMode,
+        hz: runHz,
+        amp_deg: patternParams().amp,
+        period_us: runSpec.periodUs,
+        windows: markers.map((m) => ({ t_offset_us: m.tOffsetUs, pulse_us: m.pulseUs })),
+        exposure_mode: timed ? "Timed" : "TriggerWidth",
         exposure_us: { L: applied.L.exposure_us, R: applied.R.exposure_us },
         frame_rate: { L: applied.L.frame_rate, R: applied.R.frame_rate },
         mismatch,
       };
       activeScan = scan;
       s.telemetry({ scan });
-      if (mismatch)
-        report(
-          "mirror-link",
-          `scan exposure misses the ${(period_us / 1000).toFixed(1)} ms revolution ` +
-            `(L ${(applied.L.exposure_us / 1000).toFixed(1)} ms, ` +
-            `R ${(applied.R.exposure_us / 1000).toFixed(1)} ms) — the ring readout is partial`,
-          "warning",
-        );
-    }
-
-    /** Snapshot (once) + override one eye, on the lease's safe reconfigure path. */
-    async function applyEye(
-      side: Side,
-      lease: CameraLease,
-      hz: number,
-    ): Promise<AppliedTiming> {
-      let applied: AppliedTiming = { exposure_us: 0, frame_rate: 0 };
-      await lease.reconfigure(() => {
-        if (!snapshots[side]) snapshots[side] = snapshotTiming(lease.camera);
-        applied = applyScanTiming(lease.camera, hz);
-      });
-      return applied;
-    }
-
-    /** Restore whatever was snapshotted, best-effort (the lease may be releasing). */
-    async function restoreEyes(t: CalibratedTriple): Promise<void> {
-      for (const side of SIDES) {
-        const snap = snapshots[side];
-        if (!snap) continue;
-        try {
-          await t.leases[side].reconfigure(() =>
-            restoreTiming(t.leases[side].camera, snap),
-          );
-        } catch {
-          // best-effort — the lease may already be releasing
-        }
-        delete snapshots[side];
+      if (!mismatch) {
+        warnedMismatch = false;
+        return;
       }
+      if (warnedMismatch) return;
+      warnedMismatch = true;
+      report(
+        "mirror-link",
+        `the cameras cannot take the exposure windows (Timed fallback: ` +
+          `L ${(applied.L.exposure_us / 1000).toFixed(2)} ms, R ${(applied.R.exposure_us / 1000).toFixed(2)} ms ` +
+          `for ${markers.map((m) => (m.pulseUs / 1000).toFixed(2)).join(" / ")} ms windows)`,
+        "warning",
+      );
     }
 
-    /** Apply L then R; a failure on either restores whatever was applied
-     *  (spec §exposure). Serialized via {@link queueScanOp}. */
-    async function startScanNow(hz: number): Promise<boolean> {
+    // -- start / stop / restart / re-upload ----------------------------------
+
+    /**
+     * Start (spec §lifecycle): a bound v2.2 controller, then BOTH cameras armed
+     * (snapshot → trigger mode → triggered timing), then the trajectory opened
+     * and STARTed at an explicit host instant. Any failure undoes what was done
+     * and refuses with the reason. Serialized via {@link queueScanOp}.
+     */
+    async function startScanNow(): Promise<boolean> {
+      if (scanActive) return true;
       if (!scanAllowed || !triple) {
         publishScanBlocked("no camera triple leased");
         return false;
       }
+      const c = activeController();
+      if (!c) {
+        publishScanBlocked("no controller connected");
+        return false;
+      }
+      if (!c.v22Capable) {
+        publishScanBlocked("controller firmware >= 2.2.0 required");
+        return false;
+      }
       const t = triple;
-      const applied = {} as Record<Side, AppliedTiming>;
+      const built = buildScan();
+      const pulse0 = built.spec.markers?.[0]?.pulseUs ?? 0;
+      resetRunStats();
       try {
-        for (const side of SIDES)
-          applied[side] = await applyEye(side, t.leases[side], hz);
+        applied = await armCameras(t, pulse0);
+        appliedPulseUs = pulse0;
       } catch (e) {
-        await restoreEyes(t);
+        await disarmCameras(t);
         publishScanBlocked(`exposure override failed: ${errorLine(e)}`);
         return false;
       }
       // Idled / re-leased while awaiting — undo, stay out.
       if (!scanAllowed || triple !== t) {
-        await restoreEyes(t);
+        await disarmCameras(t);
         return false;
       }
-      scanT0 = now();
+      try {
+        await runTrajectory(built);
+      } catch (e) {
+        await closeTrajectory();
+        retireFlips();
+        await disarmCameras(t);
+        publishScanBlocked(`trajectory start failed: ${errorLine(e)}`);
+        return false;
+      }
+      if (!scanAllowed || triple !== t) {
+        await closeTrajectory();
+        retireFlips();
+        await disarmCameras(t);
+        return false;
+      }
       scanActive = true;
-      pushOrbitParams();
       pushRingEnabled();
       publishScanBlocked(null);
-      publishScanTelemetry(hz, applied);
+      publishScanTelemetry();
+      publishPerf();
       return true;
     }
 
-    /** Serialized via {@link queueScanOp}. MUST run while the leases are live —
-     *  the restore rides `lease.reconfigure`. */
+    /** Stop (spec §lifecycle): the trajectory first (the node re-takes the DAC
+     *  for the idle pose), the flip pipes, then the cameras back to free-run and
+     *  their pre-scan timing. Serialized via {@link queueScanOp}. MUST run while
+     *  the leases are live — the restore rides `lease.reconfigure`. */
     async function stopScanNow(): Promise<void> {
       const wasActive = scanActive;
       scanActive = false;
-      pushOrbitParams();
+      cancelReplace();
+      await closeTrajectory();
+      retireFlips();
       pushRingEnabled();
       resetRingTelemetry();
-      if (triple) await restoreEyes(triple);
+      if (triple) await disarmCameras(triple);
       if (wasActive) {
         activeScan = null;
         s.telemetry({ scan: null });
       }
+      publishPerf();
     }
 
-    /** Live `scan_hz` change while active: re-apply at the new frequency. The
-     *  two-sided exposure write makes an apply range-safe from ANY current
-     *  timing, and the PRE-SCAN snapshot is kept (never re-taken), so a later
-     *  stop still lands on Manage Cameras' values. */
-    async function reapplyScanNow(hz: number): Promise<void> {
-      if (!scanActive || !triple) return;
+    /** The run ended under us: stop for good and say why. `traj` (when given)
+     *  must still be THE run — a stale notice for a replaced table is moot. */
+    async function abortScanNow(reason: string, traj?: NodeTrajectory): Promise<void> {
+      if (!scanActive) return;
+      if (traj && traj !== trajectory) return;
+      await stopScanNow();
+      publishScanBlocked(reason);
+      report("mirror-link", reason, "warning");
+    }
+
+    /** A PERIOD change while active (`scan_hz`, `scan_mode`): replace cannot
+     *  swap it, so stop → rebuild → start, keeping the camera config (only a
+     *  Timed exposure is re-written, and only for a new pulse). Serialized via
+     *  {@link queueScanOp}. */
+    async function restartScanNow(): Promise<void> {
       const t = triple;
-      const applied = {} as Record<Side, AppliedTiming>;
+      if (!scanActive || !t) return;
+      const built = buildScan();
+      if (runSpec && built.mode === runMode && built.spec.periodUs === runSpec.periodUs)
+        return replaceNow(); // same period after all (e.g. a no-op write)
+      cancelReplace();
+      await closeTrajectory();
       try {
-        for (const side of SIDES)
-          applied[side] = await applyEye(side, t.leases[side], hz);
+        await retimeIfNeeded(t, built.spec);
+        await runTrajectory(built);
       } catch (e) {
-        scanActive = false;
-        pushOrbitParams();
-        pushRingEnabled();
-        resetRingTelemetry();
-        await restoreEyes(t);
-        activeScan = null;
-        s.telemetry({ scan: null });
-        publishScanBlocked(`exposure override failed: ${errorLine(e)}`);
+        await abortScanNow(`scan restart failed: ${errorLine(e)}`);
         return;
       }
-      publishScanTelemetry(hz, applied);
+      publishScanTelemetry();
+    }
+
+    // Live geometry → phase-continuous re-upload, ≤ 10 Hz, latest wins.
+    let replaceTimer: ReturnType<typeof setTimeout> | null = null;
+    let replacePending = false;
+    let lastReplaceAt = -Infinity;
+
+    /** Called by every geometry change: (re)arm the throttle timer; the spec is
+     *  built when the op RUNS, so whatever arrived meanwhile wins. */
+    function scheduleReplace(): void {
+      if (!scanActive) return;
+      replacePending = true;
+      if (replaceTimer) return;
+      const wait = Math.max(0, lastReplaceAt + REPLACE_INTERVAL_MS - now());
+      replaceTimer = setTimeout(() => {
+        replaceTimer = null;
+        if (!replacePending) return;
+        replacePending = false;
+        void queueScanOp(replaceNow);
+      }, wait);
+    }
+
+    function cancelReplace(): void {
+      if (replaceTimer) clearTimeout(replaceTimer);
+      replaceTimer = null;
+      replacePending = false;
+    }
+
+    /** Swap the running table for the current geometry (`NodeTrajectory.
+     *  replace`, spec §actuation). A period change is the restart's job; an
+     *  identical spec is skipped. A failure that left the run going keeps the
+     *  old geometry (warned once); one that ended the run stops the scan. */
+    async function replaceNow(): Promise<void> {
+      const traj = trajectory;
+      const t = triple;
+      if (!scanActive || !traj || !t || !runSpec) return;
+      const built = buildScan();
+      if (built.mode !== runMode || built.spec.periodUs !== runSpec.periodUs) return;
+      if (sameSpec(built.spec, runSpec)) return;
+      lastReplaceAt = now();
+      replacing = true;
+      try {
+        await traj.replace(built.spec);
+      } catch (e) {
+        replacing = false;
+        if (e instanceof TrajectoryReplaceError && !e.running) {
+          await abortScanNow(`live trajectory re-upload ended the run: ${errorLine(e)}`, traj);
+          return;
+        }
+        if (!warnedReplace) {
+          warnedReplace = true;
+          report(
+            "mirror-link",
+            `live trajectory re-upload failed: ${errorLine(e)} — the scan keeps its previous geometry`,
+            "warning",
+          );
+        }
+        return;
+      }
+      replacing = false;
+      if (trajectory !== traj) return;
+      runSpec = built.spec;
+      reuploads++;
+      // Markers moved closer than the flip bricks' tolerance allows: rebuild
+      // them tighter (a wider spacing keeps the bricks — nearest wins anyway).
+      const tol = flipTolerance(built.spec);
+      if (runMode === "triangle" && tol < flipToleranceNs) {
+        try {
+          syncFlips(true, tol);
+        } catch (e) {
+          await abortScanNow(`flip pipe rebuild failed: ${errorLine(e)}`, traj);
+          return;
+        }
+      }
+      try {
+        await retimeIfNeeded(t, built.spec);
+      } catch (e) {
+        await abortScanNow(`exposure re-apply failed: ${errorLine(e)}`, traj);
+        return;
+      }
+      publishScanTelemetry();
     }
 
     // --- gain override (spec §gain) -----------------------------------------
@@ -599,8 +1185,9 @@ export default function mirrorLinkSession(
 
     // --- ring reader (spec §reader) -----------------------------------------
     // An OPTIONAL node (`state.ring_reader`, default OFF): one vision worker
-    // over the two RAW fovea pipes, with the pixel work further gated on the
-    // scan (a frame that didn't integrate a revolution holds no ring).
+    // over the two fovea pipes — the RAW convert pipes, or the triangle scan's
+    // FLIP pipes while they exist (spec §triangle-flip) — with the pixel work
+    // further gated on the scan (an un-scanned frame holds no ring).
 
     let ringWorker: VisionWorkerHandle | null = null;
     let ringNode: { dispose(): void } | null = null;
@@ -658,15 +1245,18 @@ export default function mirrorLinkSession(
       s.telemetry({ ring: { L: null, R: null } });
     }
 
-    /** Connect the two convert pipes, publish the node + its edges, and spawn
-     *  the worker. Idempotent; a no-op without a leased triple. */
+    /** Connect the two fovea pipes (the flip pipes while they exist, else the
+     *  raw convert pipes), publish the node + its edges, and spawn the worker.
+     *  Idempotent; a no-op without a leased triple. The flip transitions
+     *  rebuild it in both directions ({@link rebindRingNode}). */
     function buildRingNode(): void {
       const t = triple;
       if (ringNode || !t) return;
       const node = nodeId.win("mirror-link", "ring");
       const pipeIds: string[] = [];
       const pipes: PipeInput[] = SIDES.map((side) => {
-        const pipeId = nodeId.convert(t.leases[side].camera.serial);
+        const pipeId =
+          flips[side]?.pipeId ?? nodeId.convert(t.leases[side].camera.serial);
         const handle = broker.connect(pipeId);
         pipeIds.push(pipeId);
         const { width, height, channels, bytesPerFrame, maxBytes } = handle.spec;
@@ -728,6 +1318,14 @@ export default function mirrorLinkSession(
       node?.dispose();
     }
 
+    /** Re-bind an EXISTING reader to the current fovea pipes (a flip pipe came
+     *  or went). No reader → nothing to do (it binds right when built). */
+    function rebindRingNode(): void {
+      if (!ringNode) return;
+      disposeRingNode();
+      buildRingNode();
+    }
+
     // --- capture (spec §capture) --------------------------------------------
     // The offline ring analyzer's input: full-depth L/R fovea frames + the
     // undistorted center, with the scan/reader state alongside them.
@@ -744,8 +1342,19 @@ export default function mirrorLinkSession(
       const t = triple;
       const A = t ? centerAngles() : null;
       const V = t ? centerVolts() : null;
+      const g = patternParams();
       return {
         scan: activeScan,
+        // The pattern the frames were exposed on. Capture reads the RAW pipes,
+        // which the triangle flip does NOT touch: a falling-sweep frame is
+        // stored as the camera saw it (spec §triangle-flip).
+        pattern: {
+          mode: scanMode(),
+          axis_deg: g.axis,
+          amp_deg: g.amp,
+          ratio: g.ratio,
+          windows: activeWindows(scanMode(), s.state),
+        },
         ring: { L: ring.L, R: ring.R },
         shift: s.state.shift,
         "shift.unit": "degree",
@@ -769,7 +1378,7 @@ export default function mirrorLinkSession(
     }
 
     /** One capture shot. IDENTITY homographies and a full-frame rect: a frame
-     *  that integrated a whole revolution has no single pose to warp against,
+     *  that integrated a stretch of the path has no single pose to warp against,
      *  and the un-warped ring IS the thing being debugged (spec §capture). */
     function captureSnapshot(reset: boolean, indexed: boolean): CaptureShot {
       const shot = rawTripleShot({
@@ -808,8 +1417,8 @@ export default function mirrorLinkSession(
     // targeting: a target-centered strip sliced out of the C undistort and each
     // RAW fovea scaled to the same px-per-wide-px, matched per eye, joined at
     // ONE pid node that integrates {pan, verge, v_shift}. Its reconstruction IS
-    // the scan CENTER — the orbit brick rides on top of it. Session-local
-    // intent, like the scan: the nodes exist only while engaged.
+    // the scan CENTER — the pattern rides on top of it. Session-local intent,
+    // like the scan: the nodes exist only while engaged.
 
     /** One side's latest match, lifted to absolute undistorted-wide px. */
     type SideMatch = {
@@ -889,7 +1498,7 @@ export default function mirrorLinkSession(
       lastDofWrite = t;
       s.setState("verge", verge.value);
       s.setState("shift", deg(v_shift.value));
-      publishScanGeometry(); // `pan` moves the ring without touching state
+      publishScanGeometry(); // `pan` moves the pattern without touching state
     }
 
     // --- magnification + crop geometry (spec disparity-scope §magnification) --
@@ -1075,8 +1684,7 @@ export default function mirrorLinkSession(
       if (!vergeNode) return;
       outputOf(vergeNode.step(() => vergenceStep(projection)));
       publishVergenceStatus();
-      pushOrbitPose(); // the loop's output IS the orbit brick's center
-      writeBackDof();
+      writeBackDof(); // republishes the geometry → the idle pose + any re-upload
     }
 
     /** Seed the integrators from the CURRENT commanded pose — ANGLES, never a
@@ -1234,7 +1842,9 @@ export default function mirrorLinkSession(
           { from: MATCH_IDS.L, port: "l" },
           { from: MATCH_IDS.R, port: "r" },
         ],
-        outputs: [{ to: nodeId.win("mirror-link", "orbit"), port: "center" }],
+        // Its output is the CENTER pose the "mirror-link" position input (and,
+        // scanning, the trajectory) is built around.
+        outputs: [{ to: nodeId.controller(), port: "mirror-link" }],
         controllers: { pan, verge, v_shift },
       });
 
@@ -1323,71 +1933,27 @@ export default function mirrorLinkSession(
     let lastVoltEmit = 0;
     let lastActuateMs = 0;
     const actuateMsStats = new RollingStats(0.9, 2, "ms");
-    /** Pacer tick INTERVAL: the 1 ms loop is the mirror's clock, so any stall on
-     *  the orchestrator loop (an allocation, a synchronous native call) is a
-     *  straight chord across the scanned ring. Metered so the rig can see it —
-     *  under the native brick it only meters THIS loop, never the scan. */
+    /** Pacer tick INTERVAL: the 1 ms loop slews the idle pose, so any stall on
+     *  the orchestrator loop (an allocation, a synchronous native call) is an
+     *  idle pose that lags. Metered so the rig can see it — the scan itself
+     *  runs on the MCU, so this meters THIS loop, never the pattern. */
     const tickGapMsStats = new RollingStats(0.9, 2, "ms");
 
-    type OrbitPerf = {
-      native: boolean;
-      emitHz: number;
-      sinkHz: number;
-      governor: {
-        state: "off" | "steady" | "seeking" | "backoff";
-        effectiveRateHz: number;
-        backoffs: number;
-        softFails: number;
-        outq: number;
+    /** The whole `perf` telemetry object (one key — a patch replaces it). */
+    function perfTelemetry(): {
+      actuateMs: { mean: number; max: number };
+      tickGapMs: { mean: number; max: number };
+      trajectory: TrajectoryTelemetry;
+    } {
+      return {
+        actuateMs: { mean: actuateMsStats.mean, max: actuateMsStats.max },
+        tickGapMs: { mean: tickGapMsStats.mean, max: tickGapMsStats.max },
+        trajectory: trajectoryPerf(),
       };
-    };
-    let orbitPerf: OrbitPerf = {
-      native: false,
-      emitHz: 0,
-      sinkHz: 0,
-      governor: {
-        state: "off",
-        effectiveRateHz: 0,
-        backoffs: 0,
-        softFails: 0,
-        outq: 0,
-      },
-    };
-    let lastEmitCount = 0;
-    let lastSinkCount = 0;
-    let lastOrbitAt = 0;
+    }
 
-    /** Both ends of the volt path, differenced across probe windows (the
-     *  meters report LIFETIME averages, which would hide a live stall):
-     *  `emitHz` off the brick's thread meter, `sinkHz` off the mirror sink's
-     *  `written` counter — the number that actually reaches the wire, and the
-     *  one the polygon diagnosis turns on (spec §actuation). */
-    function probeOrbit(tick: number): OrbitPerf {
-      const native = voltLink !== null;
-      if (!orbit) return { ...orbitPerf, native, emitHz: 0, sinkHz: 0 };
-      if (tick - lastOrbitAt < ORBIT_PROBE_INTERVAL_MS)
-        return { ...orbitPerf, native };
-      const emits = orbit.probe().outputs.volt?.count ?? 0;
-      const sink = nativePos?.sink?.probe();
-      const writes = sink?.written ?? 0;
-      const dt = tick - lastOrbitAt;
-      const stats = activeController()?.stats;
-      orbitPerf = {
-        native,
-        emitHz: lastOrbitAt > 0 ? ((emits - lastEmitCount) * 1000) / dt : 0,
-        sinkHz: lastOrbitAt > 0 ? ((writes - lastSinkCount) * 1000) / dt : 0,
-        governor: {
-          state: sink?.governorState ?? "off",
-          effectiveRateHz: sink?.effectiveRateHz ?? 0,
-          backoffs: sink?.backoffs ?? 0,
-          softFails: stats?.txSoftFail ?? 0,
-          outq: stats?.outqBytes ?? 0,
-        },
-      };
-      lastEmitCount = emits;
-      lastSinkCount = writes;
-      lastOrbitAt = tick;
-      return orbitPerf;
+    function publishPerf(): void {
+      s.telemetry({ perf: perfTelemetry() });
     }
 
     async function activateSession(scope: ResourceScope): Promise<void> {
@@ -1454,8 +2020,9 @@ export default function mirrorLinkSession(
       publishSerials(t.leases, taps, s);
       scope.defer(() => taps.dispose());
       // The center intrinsic undistort pipe — the steering surface (spec
-      // §views). The L/R views bind the RAW convert pipes directly: a frame
-      // spanning a full revolution has no single mirror pose to warp against.
+      // §views). The L/R views bind the RAW convert pipes (or the triangle's
+      // flip pipes) directly: a frame exposed along a stretch of the scan path
+      // has no single mirror pose to warp against.
       let undistortC: string | null = null;
       if (t.undistort) {
         undistortC = advertiseUndistortPipe(
@@ -1499,8 +2066,8 @@ export default function mirrorLinkSession(
       // here, not per shot: `rawPipes.acquire` on a 0→1 transition advertises
       // the pipe (allocating a CAPTURE_RING_DEPTH × full-depth-frame SHM ring)
       // and runs the native attach, both SYNCHRONOUS on the orchestrator loop
-      // that also runs the 1 ms pacer — tens of ms of stall mid-scan, which the
-      // mirror draws as a straight chord across the ring. Pre-acquired, the
+      // that also runs the 1 ms pacer — tens of ms of stall on the loop that
+      // also feeds the trajectory pushes and the flip anchors. Pre-acquired, the
       // shot path only bumps a refcount + opens the consumer gate. The
       // producers stay PARKED until that gate opens, so this costs nothing
       // while idle and touches no camera setting (attach subscribes to the
@@ -1564,96 +2131,35 @@ export default function mirrorLinkSession(
       monitor.done("recording");
 
       monitor.start("controller");
-      // The NATIVE scan generator (spec §actuation): its own paced thread turns
-      // the linearization into volts, so a synchronous camera write on this loop
-      // can no longer stall a revolution. Its NODE row only — the volt link
-      // reports its own `→ controller` edge (the compose brick's precedent).
-      const orbitId = nodeId.win("mirror-link", "orbit");
-      orbit = orbitSeam.create(orbitId);
-      scope.defer(
-        registerGraphWiring({
-          nodes: [
-            {
-              id: orbitId,
-              kind: "orbit",
-              owner: "win/mirror-link",
-              output: PID_STREAM,
-              transport: "native",
-            },
-          ],
-          edges: [],
-        }),
-      );
-      scope.defer(
-        registerNativeProbe(() => (orbit ? { [orbitId]: orbit.probe() } : {})),
-      );
-      // No `from`: the FALLBACK pose is computed in this session, not by a graph
-      // node — an edge would synthesize a phantom placeholder in the profiler.
+      // The JS position input (spec §actuation): the IDLE center pose. While
+      // the trajectory runs the node holds every push and hands the DAC back
+      // on stop — and the pacer does not push at all then (`scanActive`). No
+      // `from`: the pose is computed in this session, not by a graph node — an
+      // edge would synthesize a phantom placeholder in the profiler.
       posInput = controllerNode().openPosition("mirror-link", {
         initial: { left: { ...volts.L }, right: { ...volts.R } },
         onApplied: (_v, actuateMs) => {
           lastActuateMs = actuateMs;
         },
       });
-      nativePos = controllerNode().openNativePosition("mirror-link", {
-        initial: { left: { ...volts.L }, right: { ...volts.R } },
-        onAttach: (sink) => {
-          // A free-running orbit needs a different AIMD policy from the
-          // latency-sensitive compose path (spec §actuation).
-          try {
-            sink.setGovernor({
-              ceilingHz: s.state.orbit_pace_hz,
-              floorHz: ORBIT_GOV_FLOOR_HZ,
-              rttInflation: ORBIT_GOV_RTT_INFLATION,
-              enabled: true,
-            });
-          } catch {
-            // governor params rejected — the baked defaults still apply
-          }
-          voltLink = orbit ? orbit.volt_out.pipe(sink.pos_in) : null;
-        },
-        onDetach: () => {
-          voltLink?.release();
-          voltLink = null;
-        },
-      });
       scanAllowed = true;
-      publishScanGeometry(); // seeds the brick's first pose (lands, no swoop)
-      pushOrbitParams();
-      // FALLBACK push model (spec §actuation): without a v2 controller the
-      // SESSION still owns the 1 ms cadence — idle slews toward the center pose,
-      // active commands the scan pose DIRECTLY (a smoother would lag and shrink
-      // the circle), and the slew resumes from that last pose on stop. While the
-      // brick owns the wire this path only tracks the CENTER, a tenth as often.
+      publishScanGeometry();
+      // Idle slews the commanded pose toward the center with the shared
+      // first-order smoother (`@lib/slew`); the slew resumes from the last idle
+      // pose once a scan stops. The 1 ms tick is kept because its gap IS the
+      // stall meter (`perf.tickGapMs`).
       let commanded: SlewPair | null = null;
       let lastPaceAt = 0;
-      let lastPushAt = 0;
       stopActuation = startPacer(1, () => {
         const tick = now();
         const dt = lastPaceAt > 0 ? tick - lastPaceAt : 1;
         if (lastPaceAt > 0) tickGapMsStats.push(dt);
         lastPaceAt = tick;
-        const native = controllerNode().nativeEngaged();
-        if (!native || tick - lastPushAt >= FALLBACK_TICK_MS) {
-          const pushDt = lastPushAt > 0 ? tick - lastPushAt : dt;
-          lastPushAt = tick;
-          if (scanActive && !native) {
-            // Phase from the WALL CLOCK — a late tick lands at the right phase.
-            commanded = voltsFor(
-              anglesAt(
-                scanOffset(
-                  tick - scanT0,
-                  clampHz(s.state.scan_hz),
-                  s.state.scan_amp,
-                ),
-              ),
-            );
-          } else {
-            const goal = centerVolts();
-            commanded = commanded
-              ? slewStep(commanded, goal, pushDt).pose
-              : { l: { ...goal.l }, r: { ...goal.r } };
-          }
+        if (!scanActive) {
+          const goal = centerVolts();
+          commanded = commanded
+            ? slewStep(commanded, goal, dt).pose
+            : { l: { ...goal.l }, r: { ...goal.r } };
           const p = posInput!.update({ left: commanded.l, right: commanded.r });
           volts.L = p.left;
           volts.R = p.right;
@@ -1661,30 +2167,22 @@ export default function mirrorLinkSession(
         }
         if (tick - lastVoltEmit >= VOLT_TELEMETRY_INTERVAL_MS) {
           lastVoltEmit = tick;
-          // Per-eye markers come from the CENTER pose (shift included), not the
-          // instantaneous scan pose — they show where each fovea is aimed. The
-          // published `volt` is that same center pose while scanning: sampling
-          // the circle at the telemetry throttle reads as random flicker, and
-          // the ring itself is drawn from `scan_path`.
+          if (scanActive) {
+            probeFlips(tick);
+            watchNoOk(tick);
+          }
+          // Per-eye markers come from the CENTER pose (shift included), not
+          // the instantaneous scan pose — they show where each fovea is aimed.
+          // The published `volt` is that same center pose while scanning (the
+          // MCU owns the pattern; the path itself is drawn from `scan_path`).
           const c = centerVolts();
           s.telemetry({
-            volt:
-              scanActive || native
-                ? { L: { ...c.l }, R: { ...c.r } }
-                : { L: volts.L, R: volts.R },
+            volt: scanActive
+              ? { L: { ...c.l }, R: { ...c.r } }
+              : { L: volts.L, R: volts.R },
             L_PX: projectPx("L", c.l),
             R_PX: projectPx("R", c.r),
-            perf: {
-              actuateMs: { mean: actuateMsStats.mean, max: actuateMsStats.max },
-              tickGapMs: {
-                mean: tickGapMsStats.mean,
-                max: tickGapMsStats.max,
-              },
-              // `native` is the LINK, not `nativeEngaged()`: during the attach
-              // window the JS path is already suppressed and nothing is
-              // driving the mirrors yet.
-              orbit: probeOrbit(tick),
-            },
+            perf: perfTelemetry(),
           });
           actuateMsStats.resetMax();
           tickGapMsStats.resetMax();
@@ -1696,9 +2194,10 @@ export default function mirrorLinkSession(
         triple = null;
         s.telemetry({ ready: false });
       });
-      // Restore the camera timing while the leases are still live (the restore
-      // rides `lease.reconfigure`), after the pacer stopped so nothing re-arms.
-      // Exposure first, then the gain override (spec §gain).
+      // Stop the scan while the leases are still live (the camera restore
+      // rides `lease.reconfigure`), after the pacer stopped: the trajectory
+      // closes, the flip pipes retire, the cameras go back to free-run + their
+      // pre-scan timing — then the gain override (spec §gain).
       scope.defer(async () => {
         scanAllowed = false;
         await queueScanOp(async () => {
@@ -1706,20 +2205,6 @@ export default function mirrorLinkSession(
           await stopScanNow();
           await restoreGainNow();
         });
-      });
-      // Drained in this order (LIFO — reverse of registration): the pacer, then
-      // the volt link, the native input, and last the brick itself.
-      scope.defer(() => {
-        orbit?.release();
-        orbit = null;
-      });
-      scope.defer(() => {
-        void nativePos?.close(); // detach + TERMINATE + disable-iff-last
-        nativePos = null;
-      });
-      scope.defer(() => {
-        voltLink?.release();
-        voltLink = null;
       });
       scope.defer(() => {
         stopActuation?.(); // drains FIRST — stop pushing immediately
@@ -1743,6 +2228,7 @@ export default function mirrorLinkSession(
         volts.L = { ...ORIGIN_POS };
         volts.R = { ...ORIGIN_POS };
         activeScan = null;
+        resetRunStats();
         gainRange = { min: 0, max: 0 };
         ring.L = ring.R = null;
         s.resetTelemetry([
@@ -1753,16 +2239,20 @@ export default function mirrorLinkSession(
           "ring",
           "scan",
           "scan_blocked",
-          "scan_px",
           "scan_path",
+          "scan_path_px",
+          "scan_window_px",
+          "axis_handle_px",
+          "perf",
           "gain_range",
           "L_PX",
           "R_PX",
         ]);
       },
       watch: {
-        // Everything that moves or reshapes the commanded ring republishes the
-        // drawn geometry (the pacer never does — spec §views). Verge and Shift
+        // Everything that moves or reshapes the commanded pattern republishes
+        // the drawn geometry (the pacer never does — spec §views), which while
+        // scanning also re-uploads the trajectory (spec §actuation). Verge and Shift
         // ARE the loop's DOF: while engaged a MANUAL write re-seeds that
         // controller (the write-back's own values compare equal and no-op).
         verge() {
@@ -1793,30 +2283,68 @@ export default function mirrorLinkSession(
             else stopVergenceNow();
           });
         },
-        // Amplitude rides the brick's live params; the drawn ring follows.
+        // Pattern SHAPE (spec §scan-patterns): live while scanning — the drawn
+        // geometry republishes and the trajectory re-uploads phase-continuously
+        // (throttled). Out-of-range values are clamped and written back, so the
+        // pane never shows a value the scan does not run (a server write fires
+        // no watch — the republish below covers it).
         scan_amp() {
-          pushOrbitParams();
           publishScanGeometry();
-          if (activeScan) {
-            activeScan = { ...activeScan, amp_deg: s.state.scan_amp };
-            s.telemetry({ scan: activeScan });
-          }
         },
-        // The generator's tick rate is also the sink governor's ceiling.
-        orbit_pace_hz() {
-          pushOrbitParams();
-          try {
-            nativePos?.sink?.setGovernor({ ceilingHz: s.state.orbit_pace_hz });
-          } catch {
-            // governor params rejected — the baked defaults still apply
-          }
+        scan_ratio(v) {
+          const r = Number.isFinite(v)
+            ? Math.min(Math.max(v, SCAN_RATIO_RANGE.min), SCAN_RATIO_RANGE.max)
+            : SCAN_RATIO_RANGE.max;
+          if (r !== v) s.setState("scan_ratio", r);
+          publishScanGeometry();
         },
-        // Frequency is live on the brick (the phase accumulates across the
-        // change) and re-applies the exposure override (spec §exposure).
-        scan_hz(hz) {
-          pushOrbitParams();
-          if (scanActive)
-            void queueScanOp(() => reapplyScanNow(clampHz(hz as number)));
+        scan_axis_deg(v) {
+          const d = normalizeAxisDeg(v);
+          if (d !== v) s.setState("scan_axis_deg", d);
+          publishScanGeometry();
+        },
+        // Exposure windows (spec §exposure-windows). `tri_window_sync` keeps
+        // the falling window a MIRROR of the rising one: every rising write is
+        // copied over, a falling write while synced snaps back, and turning
+        // sync on copies rise → fall once.
+        scan_window(v) {
+          const w = windowFrom(v);
+          if (!sameWindow(w, v)) s.setState("scan_window", w);
+          publishScanGeometry();
+        },
+        tri_window_rise(v) {
+          const w = windowFrom(v);
+          if (!sameWindow(w, v)) s.setState("tri_window_rise", w);
+          if (s.state.tri_window_sync && !sameWindow(w, s.state.tri_window_fall))
+            s.setState("tri_window_fall", [w[0], w[1]]);
+          publishScanGeometry();
+        },
+        tri_window_fall(v) {
+          const rise = s.state.tri_window_rise;
+          if (s.state.tri_window_sync) {
+            if (!sameWindow(rise, v)) s.setState("tri_window_fall", [rise[0], rise[1]]);
+          } else {
+            const w = windowFrom(v);
+            if (!sameWindow(w, v)) s.setState("tri_window_fall", w);
+          }
+          publishScanGeometry();
+        },
+        tri_window_sync(on) {
+          const rise = s.state.tri_window_rise;
+          if (on && !sameWindow(rise, s.state.tri_window_fall))
+            s.setState("tri_window_fall", [rise[0], rise[1]]);
+          publishScanGeometry();
+        },
+        // A PERIOD change (frequency, or the pattern family — the triangle runs
+        // 2T): replace cannot swap it, so the op chain restarts the run.
+        scan_hz() {
+          if (scanActive) void queueScanOp(restartScanNow);
+          publishScanGeometry();
+        },
+        scan_mode(m) {
+          if (m !== "ellipse" && m !== "triangle") s.setState("scan_mode", "ellipse");
+          if (scanActive) void queueScanOp(restartScanNow);
+          publishScanGeometry();
         },
         // Gain rides the SAME FIFO chain as the exposure ops (spec §gain) — a
         // drag must never interleave with an apply/restore on the same lease.
@@ -1836,6 +2364,18 @@ export default function mirrorLinkSession(
       commands: {
         async steer(px) {
           setTargetFromPixel(px);
+        },
+        // Point the main axis at a wide px (spec §scan-patterns): the direction
+        // from the scan center to it, through the pixel→angle map. A pointer ON
+        // the center (no direction) or an uncalibrated triple keeps the axis.
+        async setAxis(px) {
+          const und = triple?.undistort;
+          if (!und) return;
+          const deg = axisDegFromPixelRay(scanCenterAngle(), und.angular([px], false)[0]);
+          if (deg === null) return;
+          if (deg === s.state.scan_axis_deg) return;
+          s.setState("scan_axis_deg", deg); // a server write fires no watch
+          publishScanGeometry();
         },
         async startVergence() {
           // On the scan ops' FIFO chain: engaging must not interleave with a
@@ -1863,7 +2403,7 @@ export default function mirrorLinkSession(
           if (scanActive) return true;
           let ok = false;
           await queueScanOp(async () => {
-            ok = await startScanNow(clampHz(s.state.scan_hz));
+            ok = await startScanNow();
           });
           return ok;
         },

@@ -37,22 +37,21 @@ export function setRegistryPipeSeam(seam: RegistryPipeSeam | null): void {
   pipeSeam = seam;
 }
 
-/** Advertise a shared camera's `camera:<serial>` RGBA8 pipe + attach B's native
- *  producer. Pure over the seam so it unit-tests without the native
- *  acquire chain. Camera resolution comes from GenICam (no `Camera` accessor). */
-export function advertiseCameraPipe(
-  seam: RegistryPipeSeam,
+/** The advertised spec of a shared camera's `camera/<serial>/convert` RGBA8
+ *  pipe — the ONE place its shape is decided, so a chained same-shape brick
+ *  (MirrorLink's flip pipes) advertises exactly what its source carries.
+ *  Camera resolution comes from GenICam (no `Camera` accessor). */
+export function cameraPipeSpec(
   camera: Pick<Camera, "serial" | "getFeatureInt">,
-): string {
-  // Path-like node id.
-  const pipeId = nodeId.convert(camera.serial);
+): PipeSpec {
   // Width/Height are integer GenICam nodes — `getFeature` (arv_camera_get_string)
   // throws "Not a ArvGcString" on them; use the integer accessor.
   const width = camera.getFeatureInt("Width");
   const height = camera.getFeatureInt("Height");
   const channels = 4;
-  seam.advertise({
-    id: pipeId,
+  return {
+    // Path-like node id.
+    id: nodeId.convert(camera.serial),
     pixelFormat: "RGBA8",
     dtype: "U8",
     width,
@@ -61,9 +60,20 @@ export function advertiseCameraPipe(
     stride: width * channels,
     bytesPerFrame: width * height * channels,
     ringDepth: 4,
-  });
-  seam.attach(camera as Camera, pipeId);
-  return pipeId;
+  };
+}
+
+/** Advertise a shared camera's `camera:<serial>` RGBA8 pipe + attach B's native
+ *  producer. Pure over the seam so it unit-tests without the native
+ *  acquire chain. */
+export function advertiseCameraPipe(
+  seam: RegistryPipeSeam,
+  camera: Pick<Camera, "serial" | "getFeatureInt">,
+): string {
+  const spec = cameraPipeSpec(camera);
+  seam.advertise(spec);
+  seam.attach(camera as Camera, spec.id);
+  return spec.id;
 }
 
 /** Detach B's producer + un-advertise (renderer consumers see CLOSED). */

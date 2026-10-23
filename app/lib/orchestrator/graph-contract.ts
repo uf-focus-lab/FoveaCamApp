@@ -198,6 +198,10 @@ export const nodeId = {
   camera: (serial: string): string => `camera/${serial}`,
   /** RGBA8 converted preview pipe. */
   convert: (serial: string): string => `camera/${serial}/convert`,
+  /** Per-frame VERTICAL FLIP pipe chained on the convert pipe (MirrorLink's
+   *  triangle scan, docs/spec/mirror-link.md#triangle-flip) — nests under
+   *  /convert/ because that IS its input. */
+  flip: (serial: string): string => `camera/${serial}/convert/flip`,
   /** Undistorted stream pipe. */
   undistort: (serial: string): string => `camera/${serial}/undistort`,
   /** Native KCF tracker stream (track results; non-pipe transport). */

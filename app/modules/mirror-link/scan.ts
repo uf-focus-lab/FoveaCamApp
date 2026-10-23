@@ -39,8 +39,9 @@ export const SCAN_RATIO_RANGE = { min: 0, max: 1 } as const;
 export const WINDOW_MAX = 0.95;
 
 /** Shortest exposure window, as a fraction of its slope (a zero-length pulse
- *  is no exposure at all). */
-export const WINDOW_MIN = 0.02;
+ *  is no exposure at all) — the pane's dual slider `minGap`/step, so a value
+ *  the pane can produce is never rewritten by the session's clamp. */
+export const WINDOW_MIN = 0.005;
 
 /** Ellipse trajectory samples per period (linear interpolation on the MCU
  *  between them; 11 CMD_TRAJECTORY DATA chunks). */

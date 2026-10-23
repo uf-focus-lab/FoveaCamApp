@@ -364,20 +364,12 @@ const manualControl = hub.add(
   ),
 );
 
-// --- mirror-link: circular fovea scan with a one-revolution exposure --------
+// --- mirror-link: fovea scan patterns on the MCU trajectory ----------------
 // A stripped manual-control: owns the triple, steers from the center view, and
 // records the raw L/C/R streams — the same broker / undistort seam / raw-pipe
-// registry / compress seam its template receives, plus the native circular-scan
-// brick (a paced volts producer for the controller's native pos_in, so a camera
-// write on this loop cannot stall the scan).
-const orbitSeam: import("./orbit-pipe.js").OrbitSeam = {
-  create: (name) =>
-    (
-      Aravis as unknown as {
-        createOrbitStream(n: string): import("./orbit-pipe.js").OrbitHandle;
-      }
-    ).createOrbitStream(name),
-};
+// registry / compress seam its template receives. The scan itself runs on the
+// controller (an uploaded CMD_TRAJECTORY whose markers trigger the foveas), so
+// no host-side pose generator is injected (docs/spec/mirror-link.md#actuation).
 // The triangle scan's per-frame VERTICAL FLIP brick (FlipStream,
 // docs/spec/core-streams.md#flip-stream): chained on a fovea convert pipe, it
 // flips the frames matched to a falling-sweep marker anchor. Same seam shape as
@@ -404,7 +396,6 @@ const mirrorLink = hub.add(
     asBroker(Pipe),
     undistortSeam,
     rawPipes,
-    orbitSeam,
     sliceSeam,
     scaleSeam,
     compressSeam,

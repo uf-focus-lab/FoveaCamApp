@@ -245,7 +245,7 @@ describe("clampWindow", () => {
   });
 
   it("enforces the minimum length (grows the end, or the start at the cap)", () => {
-    const [a, b] = clampWindow([0.4, 0.405]);
+    const [a, b] = clampWindow([0.4, 0.401]);
     expect(a).toBe(0.4);
     expect(b - a).toBeCloseTo(WINDOW_MIN, 12);
     const [c, d] = clampWindow([0.95, 0.95]);

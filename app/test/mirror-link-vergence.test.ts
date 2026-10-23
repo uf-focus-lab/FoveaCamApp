@@ -5,11 +5,11 @@
 // -------------------------------------------------------
 //
 // The MirrorLink seam between the SHARED vergence loop (@lib/vergence) and the
-// native orbit brick: the session's pose chain (`anglesAt` → A2V) must BE
-// `followTarget`'s forward map at zero offset, and the orbit brick's
-// `center + J·offset` must reproduce that chain to first order — the two facts
-// the app's geometry rests on. Pure: the chain is rebuilt here from the same
-// exported pieces the session composes, over a fake conversion set.
+// scan pattern: the session's pose chain (`anglesAt` → A2V) must BE
+// `followTarget`'s forward map at zero offset, and the trajectory samples
+// (`patternSamples` through that chain) are centred on it — the facts the app's
+// geometry rests on. Pure: the chain is rebuilt here from the same exported
+// pieces the session composes, over a fake conversion set.
 // spec: docs/spec/mirror-link.md#targeting , #actuation
 
 import { describe, expect, it } from "vitest";
@@ -20,10 +20,9 @@ import {
   type VergenceSeed,
 } from "@lib/vergence/vergence";
 import { vergeToDistance } from "@lib/stereo";
-import { scanAngles } from "@modules/mirror-link/scan";
+import { patternSamples, scanAngles } from "@modules/mirror-link/scan";
 
 const BASELINE = 200;
-const J_EPS_RAD = 1e-3; // the session's finite-difference half-step
 const SEED_PARALLEL_EPS = 1e-9;
 
 /** A deliberately NON-linear angle→volt map per eye (the real regressions are),
@@ -88,57 +87,33 @@ describe("mirror-link pose chain = followTarget", () => {
   });
 });
 
-describe("orbit pose bridging (center + J·offset)", () => {
-  /** The session's `orbitJacobians`: row-major 2×2 volts per radian. */
-  function jacobians(): { jL: number[]; jR: number[] } {
-    const px = voltsAt({ x: J_EPS_RAD, y: 0 });
-    const mx = voltsAt({ x: -J_EPS_RAD, y: 0 });
-    const py = voltsAt({ x: 0, y: J_EPS_RAD });
-    const my = voltsAt({ x: 0, y: -J_EPS_RAD });
-    const d = 2 * J_EPS_RAD;
-    const eye = (k: "l" | "r") => [
-      (px[k].x - mx[k].x) / d,
-      (py[k].x - my[k].x) / d,
-      (px[k].y - mx[k].y) / d,
-      (py[k].y - my[k].y) / d,
-    ];
-    return { jL: eye("l"), jR: eye("r") };
-  }
-
-  it("linearizes the exact chain to better than 1 % over the whole amplitude range", () => {
-    const center = voltsAt(ZERO);
-    const { jL, jR } = jacobians();
-    const ampRad = (2 * Math.PI) / 180; // SCAN_AMP_RANGE.max
-    let worst = 0;
-    for (let k = 0; k < 64; k++) {
-      const phi = (2 * Math.PI * k) / 64;
-      const o = { x: ampRad * Math.cos(phi), y: ampRad * Math.sin(phi) };
-      const exact = voltsAt(o);
-      const linear = {
-        l: {
-          x: center.l.x + jL[0]! * o.x + jL[1]! * o.y,
-          y: center.l.y + jL[2]! * o.x + jL[3]! * o.y,
-        },
-        r: {
-          x: center.r.x + jR[0]! * o.x + jR[1]! * o.y,
-          y: center.r.y + jR[2]! * o.x + jR[3]! * o.y,
-        },
-      };
-      const radius = Math.hypot(exact.l.x - center.l.x, exact.l.y - center.l.y);
-      worst = Math.max(
-        worst,
-        Math.hypot(linear.l.x - exact.l.x, linear.l.y - exact.l.y) / radius,
-        Math.hypot(linear.r.x - exact.r.x, linear.r.y - exact.r.y) / radius,
-      );
-    }
-    expect(worst).toBeLessThan(0.01);
+describe("trajectory samples ride the same chain", () => {
+  it("a zero-amplitude pattern commands followTarget at every sample (both modes)", () => {
+    const follow = followTarget(target, held, conv, BASELINE);
+    for (const mode of ["ellipse", "triangle"] as const)
+      for (const { offset } of patternSamples(mode, 10, 30, 0, 0.5)) {
+        const v = voltsAt(offset);
+        close(v.l.x, follow.left.x);
+        close(v.l.y, follow.left.y);
+        close(v.r.x, follow.right.x);
+        close(v.r.y, follow.right.y);
+      }
   });
 
-  it("puts the ring's centre exactly on the commanded pose", () => {
-    const center = voltsAt(ZERO);
-    const { jL } = jacobians();
-    // A zero offset contributes nothing — the brick's idle pose IS the chain's.
-    close(center.l.x + jL[0]! * 0 + jL[1]! * 0, center.l.x);
+  it("centres the ellipse on the vergence ray (the offsets average to zero)", () => {
+    const s = patternSamples("ellipse", 10, 25, 1.5, 0.6);
+    const mean = s.reduce(
+      (m, { offset }) => ({ x: m.x + offset.x / s.length, y: m.y + offset.y / s.length }),
+      { x: 0, y: 0 },
+    );
+    close(mean.x, 0, 1e-6);
+    close(mean.y, 0, 1e-6);
+  });
+
+  it("puts the triangle's two samples symmetric about the vergence ray", () => {
+    const [a, b] = patternSamples("triangle", 10, -40, 1, 1);
+    close(a!.offset.x, -b!.offset.x);
+    close(a!.offset.y, -b!.offset.y);
   });
 });
 
