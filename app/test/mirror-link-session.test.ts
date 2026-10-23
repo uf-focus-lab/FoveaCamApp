@@ -32,10 +32,20 @@ type Spec = {
 };
 
 const ctl = vi.hoisted(() => ({
-  controller: null as null | { v22Capable: boolean; dv: number },
+  controller: null as null | { v22Capable: boolean; dv: number; clockCalibrated?: boolean },
+  /** `activeController()` reads — every sample's volt clamp reads it once, so
+   *  the delta counts spec builds. */
+  controllerReads: 0,
   trajectories: [] as Array<FakeTrajectory>,
   openError: null as Error | null,
   replaceError: null as Error | null,
+  /** When set, the matching call parks on it (an in-flight open/start/replace). */
+  openGate: null as Promise<void> | null,
+  startGate: null as Promise<void> | null,
+  replaceGate: null as Promise<void> | null,
+  nextId: 1,
+  /** Ordered teardown-relevant events (trajectory stop/close, position close). */
+  events: [] as string[],
   pacerTick: null as null | (() => void),
   positionUpdates: 0,
   triggerOn: [] as string[],
@@ -52,9 +62,14 @@ const ctl = vi.hoisted(() => ({
 // factory-built object typed here.
 type FakeTrajectory = {
   name: string;
+  /** The CURRENT MCU table id (a replace swaps it, like the real handle). */
+  id: number;
   spec: Spec;
   state: string;
   startedAt: bigint | null;
+  /** `start()` calls (a cancelled start never sends one). */
+  startCalls: number;
+  replaceCalls: number;
   replaced: Spec[];
   stops: number;
   closes: number;
@@ -85,32 +100,43 @@ vi.mock("@orchestrator/controller-node", () => {
   const makeTrajectory = (name: string, spec: Spec): FakeTrajectory => {
     const t: FakeTrajectory = {
       name,
+      id: ctl.nextId++,
       spec,
       state: "ready",
       startedAt: null,
+      startCalls: 0,
+      replaceCalls: 0,
       replaced: [],
       stops: 0,
       closes: 0,
       frameCbs: [],
       stateCbs: [],
       async start(at) {
+        t.startCalls++;
         t.startedAt = at ?? null;
+        // The node holds inputs (state running) BEFORE the START await.
         t.state = "running";
+        if (ctl.startGate) await ctl.startGate;
       },
       async stop() {
         t.stops++;
+        ctl.events.push("traj-stop");
         if (t.state === "running") t.state = "ready";
       },
       async close() {
         t.closes++;
+        ctl.events.push("traj-close");
         t.state = "closed";
       },
       async replace(next) {
+        t.replaceCalls++;
+        if (ctl.replaceGate) await ctl.replaceGate;
         if (ctl.replaceError) throw ctl.replaceError;
         if (t.state === "running" && next.periodUs !== t.spec.periodUs)
           throw new Error("period change while running");
         t.replaced.push(next);
         t.spec = next;
+        t.id = ctl.nextId++;
       },
       onFrame(cb) {
         t.frameCbs.push(cb);
@@ -122,7 +148,7 @@ vi.mock("@orchestrator/controller-node", () => {
       },
       push(f) {
         const full: FrameOut = {
-          trajectoryId: 1,
+          trajectoryId: t.id,
           marker: 0,
           cycle: 0,
           status: "OK",
@@ -151,9 +177,10 @@ vi.mock("@orchestrator/controller-node", () => {
         return p;
       },
       updateAt: (_t: bigint, p: unknown) => p,
-      close: async () => {},
+      close: async () => void ctl.events.push("pos-close"),
     }),
     async openTrajectory(spec: Spec, opts: { name: string }) {
+      if (ctl.openGate) await ctl.openGate;
       if (ctl.openError) throw ctl.openError;
       const t = makeTrajectory(opts.name, spec);
       ctl.trajectories.push(t);
@@ -175,7 +202,10 @@ vi.mock("@orchestrator/controller-node", () => {
 });
 
 vi.mock("@orchestrator/controller", () => ({
-  activeController: () => ctl.controller,
+  activeController: () => {
+    ctl.controllerReads++;
+    return ctl.controller;
+  },
   TrajectoryReplaceError: class TrajectoryReplaceError extends Error {
     constructor(
       message: string,
@@ -284,7 +314,7 @@ import { scanAngles, patternSamples, patternPeriodUs, sweepUs } from "@modules/m
 class FakeCam {
   frame_rate_enable = true;
   frame_rate = 30;
-  readonly frame_rate_range = { min: 1, max: 60 };
+  frame_rate_range = { min: 1, max: 60 };
   exposure = 12_000;
   readonly exposure_range = { min: 20, max: 30e6 };
   exposure_auto: "Off" | "Once" | "Continuous" = "Continuous";
@@ -295,6 +325,7 @@ class FakeCam {
     ExposureMode: "Timed",
     TriggerActivation: "RisingEdge",
     TriggerMode: "Off",
+    TriggerOverlap: "Off",
   };
   constructor(
     readonly serial: string,
@@ -334,12 +365,12 @@ const conv = {
   A2H: { L: () => new Float64Array(9), R: () => new Float64Array(9) },
 };
 
-function makeTriple(opts: { calibrated?: boolean; modes?: string[] } = {}) {
-  const lease = (serial: string) => ({
-    camera: new FakeCam(serial, opts.modes),
-    reconfigure: async (fn: () => void) => fn(),
-    release: vi.fn(),
-  });
+function makeTriple(opts: { calibrated?: boolean; modes?: string[]; maxFps?: number } = {}) {
+  const lease = (serial: string) => {
+    const camera = new FakeCam(serial, opts.modes);
+    if (opts.maxFps !== undefined) camera.frame_rate_range = { min: 1, max: opts.maxFps };
+    return { camera, reconfigure: async (fn: () => void) => fn(), release: vi.fn() };
+  };
   return {
     leases: { L: lease("SL"), C: lease("SC"), R: lease("SR") },
     conv,
@@ -363,32 +394,49 @@ function makeTriple(opts: { calibrated?: boolean; modes?: string[] } = {}) {
   };
 }
 
+type Anchor = { tStart: bigint; tEnd: bigint; flip: boolean };
+type ProbeRow = { frames: number; flipped: number; unmatched: number; matchedSkewNs?: number };
+
 function makeFlipSeam() {
-  const pools: Record<string, Array<{ tExposure: bigint; flip: boolean }>> = {};
+  const pools: Record<string, Anchor[]> = {};
   const seam = {
-    advertised: [] as string[],
-    attached: [] as Array<{ src: string; id: string; toleranceNs: bigint }>,
+    advertised: [] as Array<{ id: string; width?: number }>,
+    attached: [] as Array<{ src: string; id: string; toleranceNs: bigint; anchorFrom?: string }>,
     detached: [] as string[],
     unadvertised: [] as string[],
     pools,
-    probes: {} as Record<string, { frames: number; flipped: number; unmatched: number }>,
-    advertise: (spec: { id: string }) => {
-      seam.advertised.push(spec.id);
+    probes: {} as Record<string, ProbeRow>,
+    advertise: (spec: { id: string; width?: number }) => {
+      seam.advertised.push({ id: spec.id, width: spec.width });
       return 1;
     },
     unadvertise: (id: string) => void seam.unadvertised.push(id),
-    attach: (src: string, id: string, o: { toleranceNs: bigint }) => {
-      seam.attached.push({ src, id, toleranceNs: o.toleranceNs });
+    attach: (src: string, id: string, o: { toleranceNs: bigint; anchorFrom?: string }) => {
+      seam.attached.push({ src, id, toleranceNs: o.toleranceNs, anchorFrom: o.anchorFrom });
       pools[id] = [];
+      // A fresh brick counts from 0.
+      delete seam.probes[id];
     },
-    pushAnchor: (id: string, a: { tExposure: bigint; flip: boolean }) => void pools[id]!.push(a),
+    pushAnchor: (id: string, a: Anchor) => void pools[id]!.push(a),
     probe: (id: string) => {
       const p = seam.probes[id] ?? { frames: 0, flipped: 0, unmatched: 0 };
-      return { ...p, anchorPoolSize: pools[id]?.length ?? 0 };
+      return {
+        matchedSkewNs: 0,
+        ...p,
+        anchorPoolSize: pools[id]?.length ?? 0,
+        anchorDrops: 0,
+      };
     },
     detach: (id: string) => void seam.detached.push(id),
   };
   return seam;
+}
+
+/** A gate a fake call parks on until `open()`. */
+function gate(): { p: Promise<void>; open: () => void } {
+  let open!: () => void;
+  const p = new Promise<void>((r) => (open = r));
+  return { p, open };
 }
 
 // --- harness -------------------------------------------------------------------
@@ -400,12 +448,19 @@ async function settle(n = 12): Promise<void> {
 let perfNow = 0;
 
 async function harness(
-  opts: { calibrated?: boolean; modes?: string[]; state?: Record<string, unknown> } = {},
+  opts: {
+    calibrated?: boolean;
+    modes?: string[];
+    maxFps?: number;
+    state?: Record<string, unknown>;
+  } = {},
 ) {
-  ctl.controller = { v22Capable: true, dv: 170 };
+  ctl.controller = { v22Capable: true, dv: 170, clockCalibrated: true };
   ctl.trajectories.length = 0;
   ctl.openError = null;
   ctl.replaceError = null;
+  ctl.openGate = ctl.startGate = ctl.replaceGate = null;
+  ctl.events.length = 0;
   ctl.triggerOn.length = 0;
   ctl.triggerOff.length = 0;
   ctl.reports.length = 0;
@@ -419,7 +474,9 @@ async function harness(
     advertise: () => 1,
     connect: vi.fn((id: string) => ({
       shmName: `/fv.${id}`,
-      spec: { width: 64, height: 48, channels: 4, bytesPerFrame: 64 * 48 * 4 },
+      // The broker's record (width 80) differs from cameraPipeSpec's (64): the flip
+      // pipe must be advertised with the BROKER's.
+      spec: { id, width: 80, height: 48, channels: 4, bytesPerFrame: 80 * 48 * 4 },
     })),
     disconnect: vi.fn(() => 0),
     drop: () => {},
@@ -470,7 +527,20 @@ async function harness(
     await settle();
   };
   const traj = () => ctl.trajectories.at(-1)!;
-  return { session, client, tele, state, call, setState, tick, traj, triple, flipSeam, broker };
+  return {
+    session,
+    server,
+    client,
+    tele,
+    state,
+    call,
+    setState,
+    tick,
+    traj,
+    triple,
+    flipSeam,
+    broker,
+  };
 }
 
 beforeEach(() => {
@@ -640,7 +710,116 @@ describe("start / stop", () => {
     expect(h.tele.scan.exposure_us).toEqual({ L: 80_000, R: 80_000 });
     // Unequal triangle windows cannot share one Timed exposure.
     expect(h.tele.scan.mismatch).toBe(true);
+    expect(h.tele.scan.mismatch_reason).toBe(
+      "unequal windows: Timed exposure uses the rising window for both",
+    );
     expect(ctl.reports.some((r) => r.includes("cannot take the exposure windows"))).toBe(true);
+    // EVERY marker carries marker 0's applied exposure, so the firmware's
+    // per-marker strobe timeout matches the camera's single exposure.
+    expect(h.traj().spec.markers!.map((m) => m.pulseUs)).toEqual([80_000, 80_000]);
+    expect(h.tele.scan.windows).toEqual([
+      { t_offset_us: 10_000, pulse_us: 80_000 },
+      { t_offset_us: 120_000, pulse_us: 80_000 },
+    ]);
+    // ...and a window move re-writes the exposure first, then swaps in the
+    // equal pulses.
+    await h.setState("tri_window_rise", [0.1, 0.6]);
+    await vi.advanceTimersByTimeAsync(0);
+    await settle();
+    expect(h.triple.leases.L.camera.exposure).toBe(50_000);
+    expect(h.traj().replaced.at(-1)!.markers!.map((m) => m.pulseUs)).toEqual([50_000, 50_000]);
+  });
+
+  it("TriggerWidth keeps each marker's own pulse (no mismatch)", async () => {
+    const h = await harness({ state: { scan_mode: "triangle", tri_window_sync: false } });
+    await h.setState("tri_window_rise", [0.1, 0.9]);
+    await h.setState("tri_window_fall", [0.2, 0.5]);
+    await h.call("startScan");
+    await settle();
+    expect(h.traj().spec.markers!.map((m) => m.pulseUs)).toEqual([80_000, 30_000]);
+    expect(h.tele.scan.mismatch).toBe(false);
+    expect(h.tele.scan.mismatch_reason).toBeNull();
+  });
+
+  it("sets TriggerOverlap = ReadOut while scanning and restores it", async () => {
+    const h = await harness();
+    await h.call("startScan");
+    expect(h.triple.leases.L.camera.features.TriggerOverlap).toBe("ReadOut");
+    expect(h.triple.leases.R.camera.features.TriggerOverlap).toBe("ReadOut");
+    await h.call("stopScan");
+    await settle();
+    expect(h.triple.leases.L.camera.features.TriggerOverlap).toBe("Off");
+  });
+
+  it("mismatch: trigger rate above either fovea's maximum frame rate (scan still runs)", async () => {
+    const h = await harness({ maxFps: 8 });
+    expect(await h.call("startScan")).toBe(true); // 10 Hz > 8 fps
+    await settle();
+    expect(h.tele.scan.mismatch).toBe(true);
+    expect(h.tele.scan.mismatch_reason).toBe("trigger rate above the camera's maximum frame rate");
+    expect(ctl.reports.some((r) => r.includes("maximum frame rate"))).toBe(true);
+  });
+
+  it("mismatch: triangle exposures closer end-to-end than the sensor readout", async () => {
+    // 30 fps max → 33.3 ms readout; ends at 0.95 T and T + 0.2 T → 25 ms apart.
+    const h = await harness({ maxFps: 30, state: { scan_mode: "triangle", tri_window_sync: false } });
+    await h.setState("tri_window_rise", [0.05, 0.95]);
+    await h.setState("tri_window_fall", [0.05, 0.2]);
+    await h.call("startScan");
+    await settle();
+    expect(h.tele.scan.mismatch_reason).toBe("exposures closer than the sensor readout");
+    // Spread them and the replace clears it.
+    await h.setState("tri_window_fall", [0.05, 0.6]);
+    await vi.advanceTimersByTimeAsync(0);
+    await settle();
+    expect(h.tele.scan.mismatch).toBe(false);
+    expect(h.tele.scan.mismatch_reason).toBeNull();
+  });
+
+  it("refuses until the controller clock is calibrated, touching no camera", async () => {
+    const h = await harness();
+    ctl.controller!.clockCalibrated = false;
+    expect(await h.call("startScan")).toBe(false);
+    await settle();
+    expect(h.tele.scan_blocked).toBe("controller clock not calibrated yet");
+    expect(ctl.trajectories).toHaveLength(0);
+    expect(ctl.triggerOn).toEqual([]);
+    ctl.controller!.clockCalibrated = true;
+    expect(await h.call("startScan")).toBe(true);
+  });
+
+  it("a throwing flip retire still restores the cameras", async () => {
+    const h = await harness({ state: { scan_mode: "triangle" } });
+    await h.call("startScan");
+    h.flipSeam.detach = () => {
+      throw new Error("native detach failed");
+    };
+    await h.call("stopScan");
+    await settle();
+    expect(ctl.triggerOff).toEqual(["SL", "SR"]);
+    expect(h.triple.leases.L.camera.features.ExposureMode).toBe("Timed");
+    expect(h.tele.scan).toBeNull();
+    expect(h.state.flipPipes).toEqual({ L: null, R: null });
+    expect(ctl.reports.some((r) => r.includes("flip pipe retire incomplete"))).toBe(true);
+  });
+
+  it("a refused restore write is reported; the rest still lands", async () => {
+    const h = await harness();
+    await h.call("startScan");
+    const L = h.triple.leases.L.camera;
+    const orig = L.setFeature.bind(L);
+    L.setFeature = (n: string, v: string) => {
+      if (n === "TriggerActivation") throw new Error("locked");
+      orig(n, v);
+    };
+    await h.call("stopScan");
+    await settle();
+    expect(L.features.ExposureMode).toBe("Timed");
+    expect(L.features.TriggerOverlap).toBe("Off");
+    expect(L.exposure_auto).toBe("Continuous");
+    expect(ctl.reports.some((r) => r.includes("restore incomplete") && r.includes("L TriggerActivation"))).toBe(
+      true,
+    );
   });
 });
 
@@ -783,24 +962,48 @@ describe("triangle flip", () => {
     await h.call("startScan");
     await settle();
     const T = sweepUs(10);
+    const tol = BigInt(0.4 * T * 1000);
     expect(h.flipSeam.attached).toEqual([
-      { src: "camera/SL/convert", id: "camera/SL/convert/flip", toleranceNs: BigInt(0.4 * T * 1000) },
-      { src: "camera/SR/convert", id: "camera/SR/convert/flip", toleranceNs: BigInt(0.4 * T * 1000) },
+      {
+        src: "camera/SL/convert",
+        id: "camera/SL/convert/flip",
+        toleranceNs: tol,
+        anchorFrom: "controller/trajectory",
+      },
+      {
+        src: "camera/SR/convert",
+        id: "camera/SR/convert/flip",
+        toleranceNs: tol,
+        anchorFrom: "controller/trajectory",
+      },
+    ]);
+    // Advertised with the BROKER's record of the source pipe.
+    expect(h.flipSeam.advertised).toEqual([
+      { id: "camera/SL/convert/flip", width: 80 },
+      { id: "camera/SR/convert/flip", width: 80 },
     ]);
     expect(h.state.flipPipes).toEqual({ L: "camera/SL/convert/flip", R: "camera/SR/convert/flip" });
     // The ring reader re-bound to the flip pipes.
     expect(h.broker.connect).toHaveBeenCalledWith("camera/SL/convert/flip");
     expect(ctl.workers.at(-1)!.init.pipes).toHaveLength(2);
-    // Graph rows: kind "flip", fed by the convert pipe and the trajectory.
-    const flipRows = ctl.wirings.flatMap((w) => w.nodes).filter((n) => n.kind === "flip");
-    expect(flipRows.map((n) => n.id)).toEqual(["camera/SL/convert/flip", "camera/SR/convert/flip"]);
-    // OK pushes → anchors (falling = marker 1 = flip); failed ones → none.
+    // Graph rows are the brick's NATIVE ones (anchorFrom names the trajectory
+    // input) — the session registers none.
+    expect(ctl.wirings.flatMap((w) => w.nodes).some((n) => n.kind === "flip")).toBe(false);
+    expect(
+      ctl.wirings.some((w) =>
+        (w.edges as Array<{ to: string }>).some((e) => e.to.endsWith("/flip")),
+      ),
+    ).toBe(false);
+    await h.tick();
+    expect(h.tele.perf.trajectory.flip_tolerance_us).toBe(0.4 * T);
+    // OK pushes → anchors carrying BOTH exposure edges (falling = marker 1 =
+    // flip; the pulse is that marker's: 0.9 T); failed ones → none.
     h.traj().push({ marker: 0, status: "OK", tExposure: 5n });
     h.traj().push({ marker: 1, status: "OK", tExposure: 9n });
     h.traj().push({ marker: 1, status: "STROBE_TIMEOUT", tExposure: 11n });
     expect(h.flipSeam.pools["camera/SL/convert/flip"]).toEqual([
-      { tExposure: 5n, flip: false },
-      { tExposure: 9n, flip: true },
+      { tStart: 5n, tEnd: 5n + 90_000_000n, flip: false },
+      { tStart: 9n, tEnd: 9n + 90_000_000n, flip: true },
     ]);
     expect(h.flipSeam.pools["camera/SR/convert/flip"]).toHaveLength(2);
     await h.call("stopScan");
@@ -846,6 +1049,70 @@ describe("triangle flip", () => {
     await h.tick();
     expect(ctl.reports.filter((r) => r.includes("before their marker push"))).toHaveLength(1);
   });
+
+  it("tolerance floor 1 ms; floor above the 0.45 × spacing cap → mismatch, scan runs", async () => {
+    // 50 Hz: T = 20 ms. Rising at 0.88 T = 17.6 ms, falling at T: 2.4 ms apart
+    // → 0.96 ms, floored to 1 ms (the cap is 1.08 ms).
+    const h = await harness({
+      maxFps: 500,
+      state: { scan_mode: "triangle", tri_window_sync: false, scan_hz: 50 },
+    });
+    await h.setState("tri_window_rise", [0.88, 0.95]);
+    await h.setState("tri_window_fall", [0, 0.5]);
+    expect(await h.call("startScan")).toBe(true);
+    await settle();
+    expect(h.flipSeam.attached[0]!.toleranceNs).toBe(1_000_000n);
+    expect(h.tele.scan.mismatch).toBe(false);
+    // 0.9 T → 2 ms apart: cap 0.9 ms < the floor → too close; the tolerance is
+    // the cap (rebuilt tighter on the replace) and mismatch names it.
+    await h.setState("tri_window_rise", [0.9, 0.95]);
+    await vi.advanceTimersByTimeAsync(0);
+    await settle();
+    expect(h.flipSeam.attached.at(-1)!.toleranceNs).toBe(900_000n);
+    expect(h.tele.scan.mismatch).toBe(true);
+    expect(h.tele.scan.mismatch_reason).toBe(
+      "exposure windows too close for reliable flipping at this frequency",
+    );
+    expect(h.tele.scan).not.toBeNull();
+  });
+
+  it("accumulates flip counters across brick rebuilds within a run; skew from the probe", async () => {
+    const h = await harness({ state: { scan_mode: "triangle", tri_window_sync: false } });
+    await h.call("startScan");
+    h.flipSeam.probes["camera/SL/convert/flip"] = {
+      frames: 30,
+      flipped: 10,
+      unmatched: 2,
+      matchedSkewNs: 41_500,
+    };
+    await h.tick();
+    expect(h.tele.perf.trajectory.skew_us).toEqual({ L: 41.5, R: 0 });
+    // A probe that matched nothing new keeps the last skew (0 is no reading).
+    h.flipSeam.probes["camera/SL/convert/flip"] = {
+      frames: 32,
+      flipped: 10,
+      unmatched: 4,
+      matchedSkewNs: 0,
+    };
+    await h.tick();
+    expect(h.tele.perf.trajectory.skew_us.L).toBe(41.5);
+    // Markers closer → tighter tolerance → the bricks are rebuilt (count from 0).
+    await h.setState("tri_window_rise", [0.9, 0.95]);
+    await h.setState("tri_window_fall", [0, 0.5]);
+    await vi.advanceTimersByTimeAsync(200);
+    await settle();
+    expect(h.flipSeam.attached).toHaveLength(4);
+    h.flipSeam.probes["camera/SL/convert/flip"] = { frames: 5, flipped: 3, unmatched: 1 };
+    await h.tick();
+    expect(h.tele.perf.trajectory.flipped).toEqual({ L: 13, R: 0 });
+    expect(h.tele.perf.trajectory.unmatched).toEqual({ L: 5, R: 0 });
+    // A new run starts over.
+    await h.call("stopScan");
+    await h.call("startScan");
+    await h.tick();
+    expect(h.tele.perf.trajectory.flipped).toEqual({ L: 0, R: 0 });
+    expect(h.tele.perf.trajectory.skew_us).toEqual({ L: 0, R: 0 });
+  });
 });
 
 describe("telemetry", () => {
@@ -884,6 +1151,8 @@ describe("telemetry", () => {
       reuploads: 0,
       flipped: { L: 0, R: 0 },
       unmatched: { L: 0, R: 0 },
+      skew_us: { L: 0, R: 0 },
+      flip_tolerance_us: 0,
     });
   });
 
@@ -914,5 +1183,231 @@ describe("telemetry", () => {
     await u.call("setAxis", { x: 5, y: 5 });
     await settle();
     expect(u.session.state.scan_axis_deg).toBe(0);
+  });
+});
+
+// --- lifecycle interleavings (review round 1, spec §lifecycle) ---------------
+
+describe("lifecycle: a run ending during an await", () => {
+  it("detach mid-replace + a plain Error from the dead device → the scan aborts", async () => {
+    const h = await harness();
+    await h.call("startScan");
+    const g = gate();
+    ctl.replaceGate = g.p;
+    await h.setState("scan_amp", 0.9);
+    await vi.advanceTimersByTimeAsync(0);
+    await settle();
+    expect(h.traj().replaceCalls).toBe(1);
+    h.traj().setState("detached");
+    ctl.replaceError = new Error("Controller not connected");
+    g.open();
+    await settle(40);
+    expect(h.tele.scan).toBeNull();
+    expect(ctl.triggerOff).toEqual(["SL", "SR"]);
+    expect(h.tele.scan_blocked).toMatch(/re-upload ended the run: Controller not connected/);
+  });
+
+  it("a run that went `ready` mid-replace aborts once the swap settles (failure or success)", async () => {
+    for (const fails of [true, false]) {
+      const h = await harness();
+      await h.call("startScan");
+      const g = gate();
+      ctl.replaceGate = g.p;
+      await h.setState("scan_amp", 0.9);
+      await vi.advanceTimersByTimeAsync(0);
+      await settle();
+      h.traj().setState("ready"); // e.g. a run-level CANCELLED push mid-swap
+      if (fails) ctl.replaceError = new Error("upload REJ");
+      g.open();
+      await settle(40);
+      expect(h.tele.scan).toBeNull();
+      expect(ctl.triggerOff).toEqual(["SL", "SR"]);
+      expect(h.tele.scan_blocked).toMatch(
+        fails ? /re-upload ended the run: upload REJ/ : /the controller ended the trajectory run/,
+      );
+    }
+  });
+
+  it("a CANCELLED push during START refuses the start and restores", async () => {
+    const h = await harness();
+    const g = gate();
+    ctl.startGate = g.p;
+    const started = h.call<boolean>("startScan");
+    await settle();
+    expect(h.traj().startCalls).toBe(1);
+    h.traj().setState("ready");
+    g.open();
+    expect(await started).toBe(false);
+    await settle();
+    expect(h.tele.scan_blocked).toBe("the controller ended the trajectory run — scan stopped");
+    expect(h.tele.scan ?? null).toBeNull();
+    expect(h.traj().closes).toBe(1);
+    expect(ctl.triggerOff).toEqual(["SL", "SR"]);
+  });
+});
+
+describe("lifecycle: edits during a start are reconciled at the commit", () => {
+  it("a geometry change while starting is swapped in right after the commit", async () => {
+    const h = await harness();
+    const g = gate();
+    ctl.openGate = g.p;
+    const started = h.call<boolean>("startScan");
+    await settle();
+    await h.setState("scan_amp", 0.9);
+    g.open();
+    expect(await started).toBe(true);
+    await vi.advanceTimersByTimeAsync(0);
+    await settle();
+    expect(h.traj().replaced).toHaveLength(1);
+    const ref = patternSamples("ellipse", 10, 0, 0.9, 1);
+    const want = chainVolts({ x: 0, y: 0 }, ref[3]!.offset);
+    expect(h.traj().replaced[0]!.samples[3]!.left.x).toBeCloseTo(want.left.x, 9);
+  });
+
+  it("a scan_hz change while starting restarts into the new period", async () => {
+    const h = await harness();
+    const g = gate();
+    ctl.openGate = g.p;
+    const started = h.call<boolean>("startScan");
+    await settle();
+    await h.setState("scan_hz", 20);
+    g.open();
+    expect(await started).toBe(true);
+    await settle(40);
+    expect(ctl.trajectories).toHaveLength(2);
+    expect(h.traj().spec.periodUs).toBe(50_000);
+    expect(h.traj().state).toBe("running");
+    expect(h.tele.scan.hz).toBe(20);
+  });
+});
+
+describe("lifecycle: the replace throttle under a slow replace", () => {
+  it("keeps ONE queued replace however many steer events arrive", async () => {
+    const h = await harness();
+    await h.call("startScan");
+    const g = gate();
+    ctl.replaceGate = g.p;
+    await h.setState("scan_amp", 0.6);
+    await vi.advanceTimersByTimeAsync(0);
+    await settle();
+    expect(h.traj().replaceCalls).toBe(1); // in flight, parked
+    for (const amp of [0.7, 0.8, 0.9, 1.0]) {
+      perfNow += 150; // each past the 100 ms throttle
+      await h.setState("scan_amp", amp);
+      await vi.advanceTimersByTimeAsync(150);
+      await settle();
+    }
+    const reads = ctl.controllerReads;
+    g.open();
+    await settle(40);
+    await vi.advanceTimersByTimeAsync(500);
+    await settle();
+    // ONE more op ran: one spec build (128 samples × 2 eyes of clamp reads)
+    // and one replace, with the LATEST geometry.
+    expect(ctl.controllerReads - reads).toBe(2 * 128);
+    expect(h.traj().replaceCalls).toBe(2);
+    expect(h.tele.scan.amp_deg).toBe(1.0);
+  });
+});
+
+describe("lifecycle: no START after a stop or teardown was requested", () => {
+  it("stopScan mid-start: the START never goes out; a later start works", async () => {
+    const h = await harness();
+    const g = gate();
+    ctl.openGate = g.p;
+    const started = h.call<boolean>("startScan");
+    await settle();
+    const stopped = h.call("stopScan");
+    await settle();
+    g.open();
+    expect(await started).toBe(false);
+    await stopped;
+    await settle();
+    expect(h.traj().startCalls).toBe(0);
+    expect(h.traj().closes).toBe(1);
+    expect(ctl.triggerOff).toEqual(["SL", "SR"]);
+    expect(h.tele.scan_blocked).toBeNull();
+    ctl.openGate = null;
+    expect(await h.call("startScan")).toBe(true);
+    expect(h.traj().startCalls).toBe(1);
+  });
+
+  it("teardown mid-start: no START, cameras restored", async () => {
+    const h = await harness();
+    const g = gate();
+    ctl.openGate = g.p;
+    const started = h.call<boolean>("startScan");
+    await settle();
+    h.session.unsubscribe(h.server);
+    await settle();
+    g.open();
+    expect(await started).toBe(false);
+    await settle(40);
+    expect(h.traj().startCalls).toBe(0);
+    expect(ctl.triggerOff).toEqual(["SL", "SR"]);
+  });
+
+  it("teardown during a restart takes the stop path instead of a START", async () => {
+    const h = await harness();
+    await h.call("startScan");
+    const g = gate();
+    ctl.openGate = g.p;
+    await h.setState("scan_hz", 20); // restart: close, then open (parked)
+    h.session.unsubscribe(h.server);
+    await settle();
+    g.open();
+    await settle(40);
+    expect(ctl.trajectories).toHaveLength(2);
+    expect(h.traj().startCalls).toBe(0);
+    expect(h.traj().closes).toBe(1);
+    expect(ctl.triggerOff).toEqual(["SL", "SR"]);
+  });
+
+  it("teardown stops the scan BEFORE closing the idle position input", async () => {
+    const h = await harness();
+    await h.call("startScan");
+    h.session.unsubscribe(h.server);
+    await settle(40);
+    const close = ctl.events.indexOf("traj-close");
+    expect(close).toBeGreaterThanOrEqual(0);
+    expect(close).toBeLessThan(ctl.events.indexOf("pos-close"));
+    expect(ctl.triggerOff).toEqual(["SL", "SR"]);
+  });
+});
+
+describe("nits", () => {
+  it("clamps scan_amp and writes it back", async () => {
+    const h = await harness();
+    await h.setState("scan_amp", 5);
+    expect(h.state.scan_amp).toBe(2);
+    await h.setState("scan_amp", -1);
+    expect(h.state.scan_amp).toBe(0);
+  });
+
+  it("scores pushes by trajectoryId: the pending spec mid-swap, the old one in the grace", async () => {
+    const h = await harness();
+    await h.call("startScan");
+    const t0 = h.traj().startedAt!;
+    const oldId = h.traj().id;
+    const g = gate();
+    ctl.replaceGate = g.p;
+    await h.setState("scan_window", [0.2, 0.4]); // marker 0 moves 0 → 20 ms
+    await vi.advanceTimersByTimeAsync(0);
+    await settle();
+    // Mid-swap, a push from the NEW table (an id this run has not seen yet).
+    h.traj().push({ trajectoryId: 999, marker: 0, cycle: 1, tTrigger: t0 + 120_000_000n + 7_000n });
+    await h.tick();
+    expect(h.tele.perf.trajectory.lateness_us).toBe(7);
+    g.open();
+    await settle(30);
+    expect(h.traj().id).not.toBe(oldId);
+    // A late push of the OLD table (the retired-id grace): its own spec.
+    h.traj().push({ trajectoryId: oldId, marker: 0, cycle: 2, tTrigger: t0 + 200_000_000n + 3_000n });
+    await h.tick();
+    expect(h.tele.perf.trajectory.lateness_us).toBe(3);
+    // ...and the new table's, against the new spec.
+    h.traj().push({ marker: 0, cycle: 3, tTrigger: t0 + 320_000_000n + 4_000n });
+    await h.tick();
+    expect(h.tele.perf.trajectory.lateness_us).toBe(4);
   });
 });

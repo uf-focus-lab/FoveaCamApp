@@ -74,7 +74,8 @@ import type {
   PipeInput,
   VisionResult,
 } from "@orchestrator/vision-worker-protocol";
-import { nodeId, type StreamType } from "@lib/orchestrator/graph-contract";
+import { nodeId } from "@lib/orchestrator/graph-contract";
+import type { PipeSpec } from "@lib/orchestrator/pipe-contract";
 import { makeMat } from "@lib/mat";
 import type { RingReadout } from "@lib/ring-code";
 import type { PipeBroker } from "@orchestrator/pipe-session";
@@ -99,6 +100,7 @@ import {
   createFlipPipe,
   type FlipAnchor,
   type FlipHandle,
+  type FlipProbe,
   type FlipPipeSeam,
 } from "@orchestrator/flip-pipe";
 import {
@@ -141,17 +143,22 @@ import {
   axisDegFromPixelRay,
   axisHandleOffset,
   clampWindow,
+  flipToleranceUs,
+  minExposureEndSpacingUs,
   normalizeAxisDeg,
   patternPath,
   patternPeriodUs,
   patternSamples,
+  sameWindowValue,
   SCAN_AMP_RANGE,
   SCAN_HZ_RANGE,
   SCAN_RATIO_RANGE,
   scanAngles,
+  sweepUs,
   WINDOW_MAX,
   windowMarkers,
   windowPaths,
+  type WindowMarker,
 } from "./scan";
 import {
   applyTriggeredTiming,
@@ -180,13 +187,9 @@ const windowFrom = (v: unknown): ScanWindow =>
   Array.isArray(v) && v.length === 2
     ? clampWindow([Number(v[0]), Number(v[1])])
     : [0, WINDOW_MAX];
-const sameWindow = (a: unknown, b: unknown): boolean =>
-  Array.isArray(a) &&
-  Array.isArray(b) &&
-  a.length === 2 &&
-  b.length === 2 &&
-  a[0] === b[0] &&
-  a[1] === b[1];
+/** Window equality up to float noise (scan.ts `sameWindowValue`): a clamp's
+ *  ULP nudge is not a change worth a write-back. */
+const sameWindow = sameWindowValue;
 
 /** Points per drawn scan path — dense enough that the polyline reads as an
  *  ellipse at PosView scale, cheap enough to republish on every slider nudge. */
@@ -204,13 +207,6 @@ const SCAN_START_LEAD_NS = 20_000_000n;
  *  latest geometry wins. The node coalesces too; this keeps the wire sane. */
 const REPLACE_INTERVAL_MS = 100;
 
-/** Flip-brick match tolerance (spec §triangle-flip): this fraction of the
- *  sweep T (the brief's 0.4·T at the default windows), but never more than the
- *  same fraction of the CLOSEST marker spacing — so a frame whose own anchor
- *  is late can never match the neighbouring marker (and flip a rising frame).
- *  The nearest anchor wins inside the tolerance anyway. */
-const FLIP_TOLERANCE_FRACTION = 0.4;
-
 /** No-exposure watchdog: a run with no OK marker push for this many periods
  *  warns once (spec §exposure-windows). */
 const NO_OK_PERIODS = 2;
@@ -223,9 +219,34 @@ const FLIP_WINDOW_MIN_MS = 500;
 const UNMATCHED_WARN_FRACTION = 0.05;
 const FLIP_WINDOW_MIN_FRAMES = 8;
 
-/** The trajectory node's output type (the flip bricks' anchor edge). */
-const TRAJECTORY_STREAM: StreamType = { kind: "analysis", schema: "trajectory" };
-const RGBA_STREAM = { kind: "frame", pixelFormat: "RGBA8", dtype: "U8" } as const;
+/** Reasons `ScanTelemetry.mismatch_reason` names (spec §exposure-windows). */
+const MISMATCH = {
+  timedClamp: "Timed exposure clamped to the camera's exposure range",
+  timedUnequal: "unequal windows: Timed exposure uses the rising window for both",
+  rate: "trigger rate above the camera's maximum frame rate",
+  readout: "exposures closer than the sensor readout",
+  flip: "exposure windows too close for reliable flipping at this frequency",
+} as const;
+
+/** A start / restart cancelled before its START went out (a stop or teardown
+ *  was requested meanwhile) — undone quietly, never reported as a failure. */
+class ScanCancelled extends Error {
+  constructor() {
+    super("scan start cancelled");
+  }
+}
+
+/** Why a run that is no longer `running` ended (spec §lifecycle). */
+const runEndReason = (state: NodeTrajectoryState): string =>
+  state === "detached"
+    ? "controller disconnected — scan stopped"
+    : "the controller ended the trajectory run — scan stopped";
+
+/** The controller's MCU↔host clock calibration flag. Read defensively: the
+ *  getter (`Controller.clockCalibrated`) lands with the controller fix round;
+ *  a build without it reads as calibrated (the old behavior). */
+const clockCalibrated = (c: object): boolean =>
+  (c as { clockCalibrated?: boolean }).clockCalibrated ?? true;
 
 /** Physical saturation limits for the vergence DOF, in radians (the shared
  *  degree constants). The drawer's Verge/Shift sliders ARE these DOF, so their
@@ -407,7 +428,9 @@ export default function mirrorLinkSession(
         const px = (o: Point2d): Point2d =>
           t.conv.A2P.C({ x: c.x + o.x, y: c.y + o.y }, false);
         pathPx = path.offsets.map(px);
-        const markers = windowMarkers(mode, hz, activeWindows(mode, s.state));
+        // What the cameras expose: the Timed fallback stretches every window
+        // to marker 0's pulse, so the drawn windows say so too.
+        const markers = scanMarkers(mode, hz).markers;
         windowPx = windowPaths(mode, hz, g.axis, g.amp, g.ratio, markers, SCAN_PATH_SAMPLES).map(
           (seg) => seg.map(px),
         );
@@ -449,6 +472,11 @@ export default function mirrorLinkSession(
     /** False from idle start until the next activate: a queued start must not
      *  re-arm the cameras while teardown drains. */
     let scanAllowed = false;
+    /** `stopScan` commands whose stop op has not run yet. Non-zero means a stop
+     *  was REQUESTED: a start/restart in flight must not send its START (spec
+     *  §lifecycle). A count, not a boolean, so two quick stops cannot clear
+     *  each other's request. */
+    let stopsPending = 0;
     /** FIFO mutex over the lease timing config AND the trajectory: a fast
      *  toggle must not interleave an apply with an in-flight restore, nor a
      *  re-upload with a restart (manual-control's idiom). */
@@ -466,12 +494,17 @@ export default function mirrorLinkSession(
 
     // -- the trajectory run --------------------------------------------------
 
-    type BuiltScan = { mode: ScanMode; hz: number; spec: TrajectorySpec };
+    /** A built pattern: the spec the MCU runs, plus the markers as the WINDOWS
+     *  ask for them (`raw`) — they differ only in the Timed fallback, where
+     *  every marker carries marker 0's applied exposure. */
+    type BuiltScan = { mode: ScanMode; hz: number; spec: TrajectorySpec; raw: WindowMarker[] };
 
     let trajectory: NodeTrajectory | null = null;
     let trajectoryUnsubs: Array<() => void> = [];
-    /** The spec the MCU runs NOW (after the last successful start/replace). */
+    /** The spec the MCU runs NOW (after the last successful start/replace),
+     *  and the window markers it was built from. */
     let runSpec: TrajectorySpec | null = null;
+    let runRaw: WindowMarker[] = [];
     let runMode: ScanMode = "ellipse";
     let runHz = 0;
     /** The run's EXPLICIT host-steady start instant — lateness is exact
@@ -479,8 +512,55 @@ export default function mirrorLinkSession(
     let runStartNs = 0n;
     /** ...and the same instant on `now()`'s clock, for the watchdogs. */
     let runStartMs = 0;
-    /** A `replace` is in flight: its state traffic is not a run end. */
+    /** A `replace` is in flight: its own failure transition (`running →
+     *  ready`) is judged by `replaceNow` once the swap settles. */
     let replacing = false;
+    /** The spec of the in-flight replace — pushes from a table id this run
+     *  has not seen yet belong to it (the new table, mid-swap). */
+    let pendingSpec: TrajectorySpec | null = null;
+    /** MCU table id → the spec it runs, for THIS run: a push is scored (and
+     *  its anchor's pulse taken) against the table that produced it, also
+     *  for the old table's late pushes in the swap grace (spec §actuation). */
+    const specById = new Map<number, TrajectorySpec>();
+
+    function rememberSpec(traj: NodeTrajectory, spec: TrajectorySpec): void {
+      const id = traj.id;
+      if (id === null || id === undefined) return;
+      specById.delete(id);
+      specById.set(id, spec);
+      // Only the last few tables can still push (the replace grace is short).
+      while (specById.size > 4) specById.delete(specById.keys().next().value!);
+    }
+
+    /** The spec that produced push `f` (see {@link specById}). */
+    function specFor(f: TrajectoryFrameOutcome): TrajectorySpec | null {
+      return specById.get(f.trajectoryId) ?? (replacing && pendingSpec ? pendingSpec : runSpec);
+    }
+
+    /** The Timed fallback's ONE exposure (µs), the pulse every marker then
+     *  carries so the firmware's per-marker strobe timeout matches what the
+     *  camera exposes (spec §exposure-windows); null in TriggerWidth (or
+     *  unarmed). The longer eye's value should a clamp differ. */
+    function timedPulseUs(): number | null {
+      if (!applied) return null;
+      if (applied.L.exposure_mode !== "Timed" && applied.R.exposure_mode !== "Timed") return null;
+      const us = Math.max(applied.L.exposure_us, applied.R.exposure_us);
+      return Math.max(1, Math.round(us));
+    }
+
+    /** The trigger markers for the current windows: `raw` as the windows ask,
+     *  `markers` as the MCU runs them (equal Timed pulses). */
+    function scanMarkers(
+      mode: ScanMode,
+      hz: number,
+    ): { raw: WindowMarker[]; markers: WindowMarker[] } {
+      const raw = windowMarkers(mode, hz, activeWindows(mode, s.state));
+      const timed = timedPulseUs();
+      return {
+        raw,
+        markers: timed === null ? raw : raw.map((m) => ({ tOffsetUs: m.tOffsetUs, pulseUs: timed })),
+      };
+    }
 
     /**
      * The pattern as a `TrajectorySpec` (spec §actuation): every sample through
@@ -500,15 +580,21 @@ export default function mirrorLinkSession(
           return { tOffsetUs, left: clampVolt(v.l), right: clampVolt(v.r) };
         },
       );
-      const markers = windowMarkers(mode, hz, activeWindows(mode, s.state)).map((m) => ({
-        tOffsetUs: m.tOffsetUs,
-        pulseUs: m.pulseUs,
-        cameras: ["L", "R"] as ("L" | "R")[],
-      }));
+      const { raw, markers } = scanMarkers(mode, hz);
       return {
         mode,
         hz,
-        spec: { periodUs: patternPeriodUs(mode, hz), samples, markers, step: false },
+        raw,
+        spec: {
+          periodUs: patternPeriodUs(mode, hz),
+          samples,
+          markers: markers.map((m) => ({
+            tOffsetUs: m.tOffsetUs,
+            pulseUs: m.pulseUs,
+            cameras: ["L", "R"] as ("L" | "R")[],
+          })),
+          step: false,
+        },
       };
     }
 
@@ -521,10 +607,22 @@ export default function mirrorLinkSession(
     let latenessUs = 0;
     let reuploads = 0;
     let lastOkMs = 0;
+    /** Flip counters for THIS run: `base` holds what retired bricks counted
+     *  (a tolerance change or a restart rebuilds them), `flipCounts` is base +
+     *  the live bricks' own counters (spec §triangle-flip). */
+    const flipBase = {
+      flipped: { L: 0, R: 0 },
+      unmatched: { L: 0, R: 0 },
+    };
     const flipCounts = {
       flipped: { L: 0, R: 0 },
       unmatched: { L: 0, R: 0 },
     };
+    /** Last matched-frame skew per eye (µs) — kept across probes that matched
+     *  nothing (the brick reports 0 then, which is not a measurement). */
+    let flipSkewUs = { L: 0, R: 0 };
+    /** Each live brick's counters at the previous probe (matched-delta gate). */
+    const lastProbe: Partial<Record<Side, { frames: number; unmatched: number }>> = {};
     /** Summed flip counters over recent probes — the unmatched watchdog's window. */
     let flipWindow: { at: number; flipped: number; unmatched: number }[] = [];
     // Each failure family warns once per run.
@@ -534,14 +632,19 @@ export default function mirrorLinkSession(
     let warnedMismatch = false;
     let warnedNoFlipSeam = false;
 
-    /** A new scan: counters and once-per-run warnings start over. */
+    /** A new scan: counters and once-per-run warnings start over. Called by
+     *  `startScanNow` only (and on idle) — a restart / brick rebuild within a
+     *  run keeps counting. */
     function resetRunStats(): void {
       pushes.ok = pushes.timeout = pushes.busy = pushes.other = 0;
       latenessUs = 0;
       reuploads = 0;
       lastOkMs = 0;
+      flipBase.flipped = { L: 0, R: 0 };
+      flipBase.unmatched = { L: 0, R: 0 };
       flipCounts.flipped = { L: 0, R: 0 };
       flipCounts.unmatched = { L: 0, R: 0 };
+      flipSkewUs = { L: 0, R: 0 };
       flipWindow = [];
       warnedNoOk = warnedUnmatched = warnedReplace = warnedMismatch = false;
     }
@@ -554,28 +657,37 @@ export default function mirrorLinkSession(
         reuploads,
         flipped: { ...flipCounts.flipped },
         unmatched: { ...flipCounts.unmatched },
+        skew_us: { ...flipSkewUs },
+        flip_tolerance_us: flips.L || flips.R ? Number(flipToleranceNs) / 1000 : 0,
       };
     }
 
-    /** Every push of THE run's table (spec §exposure-windows). OK pushes are
+    /** Every push of THE run's tables (spec §exposure-windows). OK pushes are
      *  the exposure ground truth: the flip anchor goes out FIRST, synchronously
      *  — the flip brick never holds a frame back, so a frame processed before
-     *  its anchor arrived passes unflipped (spec §triangle-flip). */
+     *  its anchor arrived passes unflipped (spec §triangle-flip). The anchor
+     *  carries BOTH exposure edges — `tExposure` and `tExposure + pulse` of
+     *  that marker in the table that pushed it — so the brick matches whichever
+     *  edge the camera stamps its frames with. */
     function onTrajectoryFrame(f: TrajectoryFrameOutcome): void {
+      const spec = specFor(f);
+      const m = f.marker !== null ? spec?.markers?.[f.marker] : undefined;
       if (f.status === "OK") {
         if (f.marker !== null && (flips.L || flips.R)) {
-          const anchor: FlipAnchor = { tExposure: f.tExposure, flip: f.marker === 1 };
+          const anchor: FlipAnchor = {
+            tStart: f.tExposure,
+            tEnd: f.tExposure + BigInt(m?.pulseUs ?? 0) * 1000n,
+            flip: f.marker === 1,
+          };
           flips.L?.pushAnchor(anchor);
           flips.R?.pushAnchor(anchor);
         }
         pushes.ok++;
         lastOkMs = now();
-        const m = f.marker !== null ? runSpec?.markers?.[f.marker] : undefined;
-        if (m && runSpec)
+        if (m && spec)
           latenessUs =
             Number(
-              f.tTrigger -
-                expectedTriggerNs(runStartNs, f.cycle, runSpec.periodUs, m.tOffsetUs),
+              f.tTrigger - expectedTriggerNs(runStartNs, f.cycle, spec.periodUs, m.tOffsetUs),
             ) / 1000;
         return;
       }
@@ -585,15 +697,16 @@ export default function mirrorLinkSession(
     }
 
     /** The run ended under us (controller unbound/swapped, or the MCU ended or
-     *  cancelled it): the scan is over — restore and say why. */
+     *  cancelled it): the scan is over — restore and say why. Ignored before
+     *  the start commits (`startScanNow` re-checks the state at its commit
+     *  point) and, during a replace, the `ready` the failed swap itself causes
+     *  (`replaceNow` re-checks once the swap settles); a `detached` mid-swap
+     *  queues the abort right away (it runs after the replace op). */
     function onTrajectoryState(traj: NodeTrajectory, state: NodeTrajectoryState): void {
-      if (traj !== trajectory || !scanActive || replacing) return;
+      if (traj !== trajectory || !scanActive) return;
       if (state === "running" || state === "uploading") return;
-      const reason =
-        state === "detached"
-          ? "controller disconnected — scan stopped"
-          : "the controller ended the trajectory run — scan stopped";
-      void queueScanOp(() => abortScanNow(reason, traj));
+      if (replacing && state === "ready") return;
+      void queueScanOp(() => abortScanNow(runEndReason(state), traj));
     }
 
     /** No OK push for {@link NO_OK_PERIODS} periods → one warning per run. */
@@ -610,15 +723,25 @@ export default function mirrorLinkSession(
       );
     }
 
+    /** Fold one eye's live brick counters into the run's (base + live), and
+     *  take its matched-frame skew when it matched anything since last time. */
+    function foldProbe(side: Side, p: FlipProbe): void {
+      flipCounts.flipped[side] = flipBase.flipped[side] + p.flipped;
+      flipCounts.unmatched[side] = flipBase.unmatched[side] + p.unmatched;
+      const prev = lastProbe[side] ?? { frames: 0, unmatched: 0 };
+      const matched = p.frames - p.unmatched - (prev.frames - prev.unmatched);
+      if (matched > 0 && Number.isFinite(p.matchedSkewNs))
+        flipSkewUs[side] = p.matchedSkewNs / 1000;
+      lastProbe[side] = { frames: p.frames, unmatched: p.unmatched };
+    }
+
     /** Read the flip bricks' counters and judge the unmatched share over the
      *  last two periods (spec §triangle-flip). */
     function probeFlips(tick: number): void {
       if (!flips.L && !flips.R) return;
       for (const side of SIDES) {
         const p = flips[side]?.probe();
-        if (!p) continue;
-        flipCounts.flipped[side] = p.flipped;
-        flipCounts.unmatched[side] = p.unmatched;
+        if (p) foldProbe(side, p);
       }
       const sample = {
         at: tick,
@@ -643,19 +766,28 @@ export default function mirrorLinkSession(
       );
     }
 
-    async function runTrajectory(built: BuiltScan): Promise<void> {
+    /** Open + START one run of `built`. `cancelled` is checked right before
+     *  the START goes out: a stop or teardown requested meanwhile throws
+     *  {@link ScanCancelled} instead (the caller undoes the open). */
+    async function runTrajectory(built: BuiltScan, cancelled: () => boolean): Promise<void> {
       const traj = await controllerNode().openTrajectory(built.spec, { name: "mirror-link" });
       trajectory = traj;
       runSpec = built.spec;
+      runRaw = built.raw;
       runMode = built.mode;
       runHz = built.hz;
+      specById.clear();
+      rememberSpec(traj, built.spec);
       trajectoryUnsubs.push(
         traj.onFrame(onTrajectoryFrame),
         traj.onStateChange((state) => onTrajectoryState(traj, state)),
       );
       // The flip bricks exist BEFORE the first trigger: the first falling frame
       // must already find its brick (spec §triangle-flip).
-      syncFlips(built.mode === "triangle", flipTolerance(built.spec));
+      const tol = flipTolerance(built);
+      flipTooClose = built.mode === "triangle" && tol.tooClose;
+      syncFlips(built.mode === "triangle", tol.ns);
+      if (cancelled()) throw new ScanCancelled();
       // An EXPLICIT start instant: lateness is exact and replace carries the
       // phase from it (spec controller.md#trajectory-ownership).
       const at = hostNowNs() + SCAN_START_LEAD_NS;
@@ -673,6 +805,9 @@ export default function mirrorLinkSession(
       const traj = trajectory;
       trajectory = null;
       runSpec = null;
+      runRaw = [];
+      pendingSpec = null;
+      specById.clear();
       for (const u of trajectoryUnsubs.splice(0)) u();
       if (!traj) return;
       try {
@@ -691,25 +826,46 @@ export default function mirrorLinkSession(
 
     const flips: Partial<Record<Side, FlipHandle>> = {};
     let flipToleranceNs = 0n;
-    let flipWiring: (() => void) | null = null;
+    /** The run's windows are too close for the tolerance floor (a mismatch). */
+    let flipTooClose = false;
 
-    /** {@link FLIP_TOLERANCE_FRACTION} of min(sweep, closest circular marker
-     *  spacing), in ns. */
-    function flipTolerance(spec: TrajectorySpec): bigint {
-      const P = spec.periodUs;
-      const offsets = (spec.markers ?? []).map((m) => m.tOffsetUs).sort((a, b) => a - b);
-      let gap = offsets.length > 1 ? P / offsets.length : P; // the sweep T
-      for (let i = 0; i < offsets.length; i++) {
-        const next = i + 1 < offsets.length ? offsets[i + 1]! : offsets[0]! + P;
-        gap = Math.min(gap, next - offsets[i]!);
+    /** The run's flip tolerance (scan.ts `flipToleranceUs`: 0.4 × min(T,
+     *  closest circular marker spacing), floored at 1 ms, capped at 0.45 ×
+     *  spacing), in ns, and whether the floor had to give way to the cap. */
+    function flipTolerance(built: BuiltScan): { ns: bigint; tooClose: boolean } {
+      const r = flipToleranceUs(
+        built.spec.periodUs,
+        sweepUs(built.hz),
+        (built.spec.markers ?? []).map((m) => m.tOffsetUs),
+      );
+      return { ns: BigInt(Math.round(r.toleranceUs * 1000)), tooClose: r.tooClose };
+    }
+
+    /** The flip source's pipe spec: the broker's own record of the advertised
+     *  convert pipe (connected just long enough to read it), else the spec the
+     *  convert pipe is advertised with (`cameraPipeSpec`). */
+    function sourcePipeSpec(cam: CameraLease["camera"]): PipeSpec {
+      const id = nodeId.convert(cam.serial);
+      try {
+        const handle = broker.connect(id);
+        try {
+          if (handle?.spec) return { ...handle.spec, id };
+        } finally {
+          broker.disconnect(id);
+        }
+      } catch {
+        // not connectable from here — fall back to the advertised shape
       }
-      return BigInt(Math.round(FLIP_TOLERANCE_FRACTION * gap * 1000));
+      return cameraPipeSpec(cam);
     }
 
     /** Advertise + attach one flip brick per eye on its convert pipe (the
-     *  source pipe's own spec — a flip changes no byte), register their graph
-     *  rows, publish `state.flipPipes`, and re-bind the ring reader. All or
-     *  nothing: a failed eye retires the other and rethrows. */
+     *  source pipe's own spec — a flip changes no byte), publish
+     *  `state.flipPipes`, and re-bind the ring reader. The bricks' graph rows
+     *  are NATIVE (`Topology.report()`: kind "flip", the `frame` input from the
+     *  convert pipe and — via `anchorFrom` — the `anchor` input from the
+     *  trajectory node), so the session registers none. All or nothing: a
+     *  failed eye retires the other and rethrows. */
     function buildFlips(t: CalibratedTriple, toleranceNs: bigint): void {
       if (!flipSeam) {
         if (!warnedNoFlipSeam) {
@@ -729,9 +885,9 @@ export default function mirrorLinkSession(
           built[side] = createFlipPipe(
             flipSeam,
             nodeId.convert(cam.serial),
-            cameraPipeSpec(cam),
+            sourcePipeSpec(cam),
             nodeId.flip(cam.serial),
-            { toleranceNs },
+            { toleranceNs, anchorFrom: trajectoryNodeId() },
           );
         }
       } catch (e) {
@@ -741,50 +897,46 @@ export default function mirrorLinkSession(
       flips.L = built.L;
       flips.R = built.R;
       flipToleranceNs = toleranceNs;
-      flipWindow = []; // fresh bricks count from 0
-      flipWiring = registerGraphWiring({
-        nodes: SIDES.map((side) => ({
-          id: built[side]!.pipeId,
-          kind: "flip",
-          owner: "win/mirror-link",
-          output: RGBA_STREAM,
-          transport: "pipe" as const,
-        })),
-        edges: SIDES.flatMap((side) => [
-          {
-            from: nodeId.convert(t.leases[side].camera.serial),
-            to: built[side]!.pipeId,
-            port: "in",
-            type: RGBA_STREAM,
-          },
-          {
-            from: trajectoryNodeId(),
-            to: built[side]!.pipeId,
-            port: "anchor",
-            type: TRAJECTORY_STREAM,
-          },
-        ]),
-      });
+      for (const side of SIDES) delete lastProbe[side]; // fresh bricks count from 0
       s.setState("flipPipes", { L: built.L!.pipeId, R: built.R!.pipeId });
       rebindRingNode();
     }
 
     /** The reverse, consumers first: the views fall back to the raw pipes
      *  (`flipPipes` → null), the reader lets go of the flip pipes, then the
-     *  bricks retire and the reader re-binds the raw pipes. */
+     *  bricks retire (their final counters folded into the run's) and the
+     *  reader re-binds the raw pipes. Best-effort per step — a stop path must
+     *  always reach the camera restore after it. */
     function retireFlips(): void {
       if (!flips.L && !flips.R) return;
-      s.setState("flipPipes", { L: null, R: null });
+      const failures: string[] = [];
+      const step = (what: string, fn: () => void): void => {
+        try {
+          fn();
+        } catch (e) {
+          failures.push(`${what}: ${errorLine(e)}`);
+        }
+      };
+      step("views", () => s.setState("flipPipes", { L: null, R: null }));
       const hadRing = ringNode !== null;
-      if (hadRing) disposeRingNode();
-      flipWiring?.();
-      flipWiring = null;
+      if (hadRing) step("ring reader", disposeRingNode);
       for (const side of SIDES) {
-        flips[side]?.retire();
+        const h = flips[side];
         delete flips[side];
+        if (!h) continue;
+        step(`${side} probe`, () => {
+          const p = h.probe();
+          if (p) foldProbe(side, p);
+        });
+        flipBase.flipped[side] = flipCounts.flipped[side];
+        flipBase.unmatched[side] = flipCounts.unmatched[side];
+        delete lastProbe[side];
+        step(`${side} retire`, () => h.retire());
       }
       // Teardown (`scanAllowed` already false) disposes the reader next anyway.
-      if (hadRing && scanAllowed) buildRingNode();
+      if (hadRing && scanAllowed) step("ring reader", buildRingNode);
+      if (failures.length)
+        report("mirror-link", `flip pipe retire incomplete: ${failures.join("; ")}`, "warning");
     }
 
     /** Flip pipes exactly in triangle mode while scanning; a tolerance change
@@ -806,6 +958,21 @@ export default function mirrorLinkSession(
      *  written for (TriggerWidth needs no write per window). */
     let applied: Record<Side, TriggeredTiming> | null = null;
     let appliedPulseUs = 0;
+    /** Each fovea's maximum frame rate, read before arming — the trigger rate
+     *  and readout checks (spec §exposure-windows). Infinity = unknown. */
+    let frameRateMax: Record<Side, number> = { L: Infinity, R: Infinity };
+
+    function readFrameRateMax(t: CalibratedTriple): Record<Side, number> {
+      const one = (side: Side): number => {
+        try {
+          const max = t.leases[side].camera.frame_rate_range.max;
+          return Number.isFinite(max) && max > 0 ? max : Infinity;
+        } catch {
+          return Infinity;
+        }
+      };
+      return { L: one("L"), R: one("R") };
+    }
 
     /** Snapshot (once) → trigger mode on (once) → triggered timing, on the
      *  lease's safe reconfigure path. */
@@ -850,36 +1017,43 @@ export default function mirrorLinkSession(
     }
 
     /** Free-run again, then the pre-scan timing verbatim — best-effort per
-     *  step (the lease may be releasing). MUST run while the leases are live. */
+     *  step AND per feature (the lease may be releasing); what did not land is
+     *  reported once. MUST run while the leases are live. */
     async function disarmCameras(t: CalibratedTriple): Promise<void> {
+      const failures: string[] = [];
       for (const side of SIDES) {
         const lease = t.leases[side];
         if (triggerArmed[side]) {
           try {
             await disableHardwareTrigger(lease);
-          } catch {
-            // best-effort — the lease may already be releasing
+          } catch (e) {
+            failures.push(`${side} trigger off: ${errorLine(e)}`);
           }
           delete triggerArmed[side];
         }
         const snap = snapshots[side];
         if (snap) {
           try {
-            await lease.reconfigure(() => restoreTiming(lease.camera, snap));
-          } catch {
-            // best-effort — the lease may already be releasing
+            await lease.reconfigure(() => {
+              for (const f of restoreTiming(lease.camera, snap)) failures.push(`${side} ${f}`);
+            });
+          } catch (e) {
+            failures.push(`${side} restore: ${errorLine(e)}`);
           }
           delete snapshots[side];
         }
       }
       applied = null;
       appliedPulseUs = 0;
+      if (failures.length)
+        report("mirror-link", `camera timing restore incomplete: ${failures.join("; ")}`, "warning");
     }
 
-    /** A new marker-0 pulse: in TIMED mode the exposure itself moves; in
-     *  TriggerWidth the pulse IS the exposure — nothing to write. */
-    async function retimeIfNeeded(t: CalibratedTriple, spec: TrajectorySpec): Promise<void> {
-      const pulse = spec.markers?.[0]?.pulseUs ?? 0;
+    /** The marker-0 pulse the windows ask for moved: in TIMED mode the
+     *  exposure itself moves (and with it every marker's pulse — the caller
+     *  rebuilds the spec after); in TriggerWidth the pulse IS the exposure —
+     *  nothing to write. */
+    async function retimeIfNeeded(t: CalibratedTriple, pulse: number): Promise<void> {
       if (!applied || pulse === appliedPulseUs) return;
       if (applied.L.exposure_mode === "TriggerWidth" && applied.R.exposure_mode === "TriggerWidth") {
         appliedPulseUs = pulse;
@@ -891,19 +1065,45 @@ export default function mirrorLinkSession(
       appliedPulseUs = pulse;
     }
 
-    /** Publish the applied scan (non-null exactly while active). In Timed mode
-     *  a clamped exposure, or triangle windows of unequal length (one exposure
-     *  for both), is a `mismatch` — warned once per run. */
+    /** Why the cameras cannot take the run's windows as asked (spec
+     *  §exposure-windows), in priority order; empty when they can. */
+    function mismatchReasons(timed: boolean): string[] {
+      if (!runSpec || !applied) return [];
+      const reasons: string[] = [];
+      const markers = runSpec.markers ?? [];
+      if (timed) {
+        const want0 = runRaw[0]?.pulseUs ?? 0;
+        if (
+          exposureMismatch(applied.L.exposure_us, want0) ||
+          exposureMismatch(applied.R.exposure_us, want0)
+        )
+          reasons.push(MISMATCH.timedClamp);
+        if (runRaw.some((m) => exposureMismatch(want0, m.pulseUs))) reasons.push(MISMATCH.timedUnequal);
+      }
+      const maxFps = Math.min(frameRateMax.L, frameRateMax.R);
+      if (Number.isFinite(maxFps)) {
+        // One trigger per sweep T per camera, in both patterns.
+        if (1e6 / sweepUs(runHz) > maxFps) reasons.push(MISMATCH.rate);
+        if (
+          runMode === "triangle" &&
+          minExposureEndSpacingUs(runSpec.periodUs, markers) < 1e6 / maxFps
+        )
+          reasons.push(MISMATCH.readout);
+      }
+      if (runMode === "triangle" && flipTooClose) reasons.push(MISMATCH.flip);
+      return reasons;
+    }
+
+    /** Publish the applied scan (non-null exactly while active), with
+     *  `mismatch` / `mismatch_reason` from {@link mismatchReasons} — warned
+     *  once per run (re-armed when the mismatch clears). */
     function publishScanTelemetry(): void {
       if (!runSpec || !applied) return;
       const markers = runSpec.markers ?? [];
       const timed = applied.L.exposure_mode === "Timed" || applied.R.exposure_mode === "Timed";
-      const p0 = markers[0]?.pulseUs ?? 0;
-      const mismatch =
-        timed &&
-        (exposureMismatch(applied.L.exposure_us, p0) ||
-          exposureMismatch(applied.R.exposure_us, p0) ||
-          markers.some((m) => exposureMismatch(p0, m.pulseUs)));
+      const reasons = mismatchReasons(timed);
+      const mismatch = reasons.length > 0;
+      const reason = mismatch ? reasons.join("; ") : null;
       const scan: ScanTelemetry = {
         mode: runMode,
         hz: runHz,
@@ -914,6 +1114,7 @@ export default function mirrorLinkSession(
         exposure_us: { L: applied.L.exposure_us, R: applied.R.exposure_us },
         frame_rate: { L: applied.L.frame_rate, R: applied.R.frame_rate },
         mismatch,
+        mismatch_reason: reason,
       };
       activeScan = scan;
       s.telemetry({ scan });
@@ -923,22 +1124,49 @@ export default function mirrorLinkSession(
       }
       if (warnedMismatch) return;
       warnedMismatch = true;
+      const detail = timed
+        ? ` (Timed fallback: L ${(applied.L.exposure_us / 1000).toFixed(2)} ms, ` +
+          `R ${(applied.R.exposure_us / 1000).toFixed(2)} ms for ` +
+          `${runRaw.map((m) => (m.pulseUs / 1000).toFixed(2)).join(" / ")} ms windows)`
+        : "";
       report(
         "mirror-link",
-        `the cameras cannot take the exposure windows (Timed fallback: ` +
-          `L ${(applied.L.exposure_us / 1000).toFixed(2)} ms, R ${(applied.R.exposure_us / 1000).toFixed(2)} ms ` +
-          `for ${markers.map((m) => (m.pulseUs / 1000).toFixed(2)).join(" / ")} ms windows)`,
+        `the cameras cannot take the exposure windows as asked: ${reason}${detail}`,
         "warning",
       );
     }
 
     // -- start / stop / restart / re-upload ----------------------------------
 
+    /** Undo a start that did not commit: the table, the flip pipes, then —
+     *  ALWAYS — the cameras. */
+    async function undoStart(t: CalibratedTriple): Promise<void> {
+      try {
+        await closeTrajectory();
+        retireFlips();
+      } finally {
+        await disarmCameras(t);
+      }
+    }
+
+    /** Edits that landed while a start/restart was awaiting (spec §lifecycle):
+     *  a new mode or period restarts, anything else re-uploads. */
+    function reconcileRun(): void {
+      if (!scanActive || !runSpec) return;
+      const now = buildScan();
+      if (now.mode !== runMode || now.spec.periodUs !== runSpec.periodUs)
+        void queueScanOp(restartScanNow);
+      else if (!sameSpec(now.spec, runSpec)) scheduleReplace();
+    }
+
     /**
-     * Start (spec §lifecycle): a bound v2.2 controller, then BOTH cameras armed
-     * (snapshot → trigger mode → triggered timing), then the trajectory opened
-     * and STARTed at an explicit host instant. Any failure undoes what was done
-     * and refuses with the reason. Serialized via {@link queueScanOp}.
+     * Start (spec §lifecycle): a bound v2.2 controller with a calibrated
+     * clock, then BOTH cameras armed (snapshot → trigger mode → triggered
+     * timing), then the trajectory opened and STARTed at an explicit host
+     * instant — unless a stop / teardown was requested meanwhile. Any failure
+     * undoes what was done and refuses with the reason; a run that ended
+     * while starting is a refusal too. Edits made during the awaits are
+     * reconciled at the commit point. Serialized via {@link queueScanOp}.
      */
     async function startScanNow(): Promise<boolean> {
       if (scanActive) return true;
@@ -955,10 +1183,15 @@ export default function mirrorLinkSession(
         publishScanBlocked("controller firmware >= 2.2.0 required");
         return false;
       }
+      if (!clockCalibrated(c)) {
+        publishScanBlocked("controller clock not calibrated yet");
+        return false;
+      }
       const t = triple;
-      const built = buildScan();
-      const pulse0 = built.spec.markers?.[0]?.pulseUs ?? 0;
+      const cancelled = (): boolean => !scanAllowed || triple !== t || stopsPending > 0;
       resetRunStats();
+      frameRateMax = readFrameRateMax(t);
+      const pulse0 = buildScan().raw[0]?.pulseUs ?? 0;
       try {
         applied = await armCameras(t, pulse0);
         appliedPulseUs = pulse0;
@@ -967,24 +1200,32 @@ export default function mirrorLinkSession(
         publishScanBlocked(`exposure override failed: ${errorLine(e)}`);
         return false;
       }
-      // Idled / re-leased while awaiting — undo, stay out.
-      if (!scanAllowed || triple !== t) {
+      // Idled / re-leased / stopped while awaiting — undo, stay out.
+      if (cancelled()) {
         await disarmCameras(t);
         return false;
       }
       try {
-        await runTrajectory(built);
+        // Built AFTER arming: a Timed fallback gives every marker its pulse.
+        await runTrajectory(buildScan(), cancelled);
       } catch (e) {
-        await closeTrajectory();
-        retireFlips();
-        await disarmCameras(t);
-        publishScanBlocked(`trajectory start failed: ${errorLine(e)}`);
+        await undoStart(t);
+        if (!(e instanceof ScanCancelled))
+          publishScanBlocked(`trajectory start failed: ${errorLine(e)}`);
         return false;
       }
-      if (!scanAllowed || triple !== t) {
-        await closeTrajectory();
-        retireFlips();
-        await disarmCameras(t);
+      if (cancelled()) {
+        await undoStart(t);
+        return false;
+      }
+      // The run may have ended during the START await (a CANCELLED push, a
+      // detach) — the state listener ignores it before the commit.
+      const traj = trajectory;
+      if (!traj || traj.state !== "running") {
+        const reason = runEndReason(traj?.state ?? "detached");
+        await undoStart(t);
+        publishScanBlocked(reason);
+        report("mirror-link", reason, "warning");
         return false;
       }
       scanActive = true;
@@ -992,27 +1233,33 @@ export default function mirrorLinkSession(
       publishScanBlocked(null);
       publishScanTelemetry();
       publishPerf();
+      reconcileRun();
       return true;
     }
 
     /** Stop (spec §lifecycle): the trajectory first (the node re-takes the DAC
      *  for the idle pose), the flip pipes, then the cameras back to free-run and
-     *  their pre-scan timing. Serialized via {@link queueScanOp}. MUST run while
-     *  the leases are live — the restore rides `lease.reconfigure`. */
+     *  their pre-scan timing — the camera restore runs whatever threw before
+     *  it. Serialized via {@link queueScanOp}. MUST run while the leases are
+     *  live — the restore rides `lease.reconfigure`. */
     async function stopScanNow(): Promise<void> {
       const wasActive = scanActive;
       scanActive = false;
-      cancelReplace();
-      await closeTrajectory();
-      retireFlips();
-      pushRingEnabled();
-      resetRingTelemetry();
-      if (triple) await disarmCameras(triple);
-      if (wasActive) {
-        activeScan = null;
-        s.telemetry({ scan: null });
+      const t = triple;
+      try {
+        cancelReplace();
+        await closeTrajectory();
+        retireFlips();
+        pushRingEnabled();
+        resetRingTelemetry();
+      } finally {
+        if (t) await disarmCameras(t);
+        if (wasActive) {
+          activeScan = null;
+          s.telemetry({ scan: null });
+        }
+        publishPerf();
       }
-      publishPerf();
     }
 
     /** The run ended under us: stop for good and say why. `traj` (when given)
@@ -1027,29 +1274,43 @@ export default function mirrorLinkSession(
 
     /** A PERIOD change while active (`scan_hz`, `scan_mode`): replace cannot
      *  swap it, so stop → rebuild → start, keeping the camera config (only a
-     *  Timed exposure is re-written, and only for a new pulse). Serialized via
+     *  Timed exposure is re-written, and only for a new pulse). A stop /
+     *  teardown requested meanwhile takes the stop path instead of a START; a
+     *  run that ended during the START aborts. Serialized via
      *  {@link queueScanOp}. */
     async function restartScanNow(): Promise<void> {
       const t = triple;
       if (!scanActive || !t) return;
-      const built = buildScan();
+      const cancelled = (): boolean => !scanAllowed || triple !== t || stopsPending > 0;
+      if (cancelled()) return stopScanNow();
+      let built = buildScan();
       if (runSpec && built.mode === runMode && built.spec.periodUs === runSpec.periodUs)
         return replaceNow(); // same period after all (e.g. a no-op write)
       cancelReplace();
       await closeTrajectory();
       try {
-        await retimeIfNeeded(t, built.spec);
-        await runTrajectory(built);
+        await retimeIfNeeded(t, built.raw[0]?.pulseUs ?? 0);
+        built = buildScan(); // a Timed re-write moves every marker's pulse
+        await runTrajectory(built, cancelled);
       } catch (e) {
+        if (e instanceof ScanCancelled) return stopScanNow();
         await abortScanNow(`scan restart failed: ${errorLine(e)}`);
+        return;
+      }
+      const traj = trajectory;
+      if (traj && traj.state !== "running") {
+        await abortScanNow(runEndReason(traj.state), traj);
         return;
       }
       publishScanTelemetry();
     }
 
-    // Live geometry → phase-continuous re-upload, ≤ 10 Hz, latest wins.
+    // Live geometry → phase-continuous re-upload, ≤ 10 Hz, latest wins, and
+    // at most ONE replace op queued at a time (a replace slower than the
+    // throttle must not stack an op per steer event).
     let replaceTimer: ReturnType<typeof setTimeout> | null = null;
     let replacePending = false;
+    let replaceQueued = false;
     let lastReplaceAt = -Infinity;
 
     /** Called by every geometry change: (re)arm the throttle timer; the spec is
@@ -1057,13 +1318,21 @@ export default function mirrorLinkSession(
     function scheduleReplace(): void {
       if (!scanActive) return;
       replacePending = true;
-      if (replaceTimer) return;
+      if (replaceTimer || replaceQueued) return; // the queued op will see it
       const wait = Math.max(0, lastReplaceAt + REPLACE_INTERVAL_MS - now());
       replaceTimer = setTimeout(() => {
         replaceTimer = null;
         if (!replacePending) return;
         replacePending = false;
-        void queueScanOp(replaceNow);
+        replaceQueued = true;
+        lastReplaceAt = now(); // the throttle counts from QUEUE time
+        void queueScanOp(async () => {
+          // This op builds the spec NOW, so edits that arrived while it was
+          // queued are covered; later ones arm the timer again.
+          replaceQueued = false;
+          replacePending = false;
+          await replaceNow();
+        });
       }, wait);
     }
 
@@ -1075,55 +1344,79 @@ export default function mirrorLinkSession(
 
     /** Swap the running table for the current geometry (`NodeTrajectory.
      *  replace`, spec §actuation). A period change is the restart's job; an
-     *  identical spec is skipped. A failure that left the run going keeps the
-     *  old geometry (warned once); one that ended the run stops the scan. */
+     *  identical spec is skipped. In Timed mode a new marker-0 window re-writes
+     *  the exposure FIRST, so the swapped-in pulses are what the camera takes.
+     *  Once the swap settles (success or failure) a run that is no longer
+     *  `running` aborts the scan; a failure that left it running keeps the old
+     *  geometry (warned once). */
     async function replaceNow(): Promise<void> {
       const traj = trajectory;
       const t = triple;
       if (!scanActive || !traj || !t || !runSpec) return;
-      const built = buildScan();
+      let built = buildScan();
       if (built.mode !== runMode || built.spec.periodUs !== runSpec.periodUs) return;
+      const pulse0 = built.raw[0]?.pulseUs ?? 0;
+      if (applied && pulse0 !== appliedPulseUs) {
+        try {
+          await retimeIfNeeded(t, pulse0);
+        } catch (e) {
+          await abortScanNow(`exposure re-apply failed: ${errorLine(e)}`, traj);
+          return;
+        }
+        built = buildScan();
+      }
       if (sameSpec(built.spec, runSpec)) return;
-      lastReplaceAt = now();
       replacing = true;
+      pendingSpec = built.spec;
+      let error: unknown = null;
+      let failed = false;
       try {
         await traj.replace(built.spec);
       } catch (e) {
+        failed = true;
+        error = e;
+      } finally {
         replacing = false;
-        if (e instanceof TrajectoryReplaceError && !e.running) {
-          await abortScanNow(`live trajectory re-upload ended the run: ${errorLine(e)}`, traj);
-          return;
-        }
+        pendingSpec = null;
+      }
+      if (trajectory !== traj) return;
+      const ended =
+        traj.state !== "running" || (error instanceof TrajectoryReplaceError && !error.running);
+      if (ended) {
+        await abortScanNow(
+          failed
+            ? `live trajectory re-upload ended the run: ${errorLine(error)}`
+            : runEndReason(traj.state),
+          traj,
+        );
+        return;
+      }
+      if (failed) {
         if (!warnedReplace) {
           warnedReplace = true;
           report(
             "mirror-link",
-            `live trajectory re-upload failed: ${errorLine(e)} — the scan keeps its previous geometry`,
+            `live trajectory re-upload failed: ${errorLine(error)} — the scan keeps its previous geometry`,
             "warning",
           );
         }
         return;
       }
-      replacing = false;
-      if (trajectory !== traj) return;
       runSpec = built.spec;
+      runRaw = built.raw;
+      rememberSpec(traj, built.spec);
       reuploads++;
       // Markers moved closer than the flip bricks' tolerance allows: rebuild
       // them tighter (a wider spacing keeps the bricks — nearest wins anyway).
-      const tol = flipTolerance(built.spec);
-      if (runMode === "triangle" && tol < flipToleranceNs) {
+      const tol = flipTolerance(built);
+      flipTooClose = runMode === "triangle" && tol.tooClose;
+      if (runMode === "triangle" && tol.ns < flipToleranceNs) {
         try {
-          syncFlips(true, tol);
+          syncFlips(true, tol.ns);
         } catch (e) {
           await abortScanNow(`flip pipe rebuild failed: ${errorLine(e)}`, traj);
           return;
         }
-      }
-      try {
-        await retimeIfNeeded(t, built.spec);
-      } catch (e) {
-        await abortScanNow(`exposure re-apply failed: ${errorLine(e)}`, traj);
-        return;
       }
       publishScanTelemetry();
     }
@@ -2189,28 +2482,38 @@ export default function mirrorLinkSession(
         }
       });
 
-      // --- teardown (LIFO — reverse of the drain; spec §teardown) ----------
+      // --- teardown (LIFO — the LAST registered drains FIRST; spec §teardown)
+      // Drain order: (1) stop the scan, (2) stop the pacer + close the idle
+      // position input, (3) drop the triple — then the earlier registrations
+      // (capture, recording, vergence, pipes, leases).
       scope.defer(() => {
+        // (3) After both below: nothing reads the triple any more.
         triple = null;
         s.telemetry({ ready: false });
       });
-      // Stop the scan while the leases are still live (the camera restore
-      // rides `lease.reconfigure`), after the pacer stopped: the trajectory
-      // closes, the flip pipes retire, the cameras go back to free-run + their
-      // pre-scan timing — then the gain override (spec §gain).
+      scope.defer(() => {
+        // (2) The scan is already stopped, so the node has handed the DAC
+        // back to this input and the mirror sits at the idle pose; only now
+        // stop pushing and terminate the MCU stream (+ disable-iff-we-enabled).
+        stopActuation?.();
+        stopActuation = null;
+        void posInput?.close();
+        posInput = null;
+      });
       scope.defer(async () => {
+        // (1) FIRST: no queued start may arm or START any more, then stop the
+        // scan while the leases and the idle position input are still live —
+        // the trajectory closes (the node's `resumeInputs` re-takes the DAC
+        // for the idle input, so the mirror returns to the center), the flip
+        // pipes retire, the cameras go back to free-run + their pre-scan
+        // timing (the restore rides `lease.reconfigure`) — then the gain
+        // override (spec §gain).
         scanAllowed = false;
         await queueScanOp(async () => {
           stopVergenceNow(); // the loop's workers + pid node go first
           await stopScanNow();
           await restoreGainNow();
         });
-      });
-      scope.defer(() => {
-        stopActuation?.(); // drains FIRST — stop pushing immediately
-        stopActuation = null;
-        void posInput?.close(); // terminate the MCU stream + disable-iff-we-enabled
-        posInput = null;
       });
 
       monitor.done("controller");
@@ -2288,7 +2591,11 @@ export default function mirrorLinkSession(
         // (throttled). Out-of-range values are clamped and written back, so the
         // pane never shows a value the scan does not run (a server write fires
         // no watch — the republish below covers it).
-        scan_amp() {
+        scan_amp(v) {
+          const a = Number.isFinite(v)
+            ? Math.min(Math.max(v, SCAN_AMP_RANGE.min), SCAN_AMP_RANGE.max)
+            : SCAN_AMP_RANGE.min;
+          if (a !== v) s.setState("scan_amp", a);
           publishScanGeometry();
         },
         scan_ratio(v) {
@@ -2336,7 +2643,9 @@ export default function mirrorLinkSession(
           publishScanGeometry();
         },
         // A PERIOD change (frequency, or the pattern family — the triangle runs
-        // 2T): replace cannot swap it, so the op chain restarts the run.
+        // 2T): replace cannot swap it, so the op chain restarts the run. A
+        // change made while a start is awaiting is reconciled at its commit
+        // point (`reconcileRun`).
         scan_hz() {
           if (scanActive) void queueScanOp(restartScanNow);
           publishScanGeometry();
@@ -2408,7 +2717,14 @@ export default function mirrorLinkSession(
           return ok;
         },
         async stopScan() {
-          await queueScanOp(stopScanNow);
+          // The request is visible to a start/restart ALREADY in flight (it
+          // must not send its START); it clears when this stop op runs, so a
+          // start commanded after it proceeds normally.
+          stopsPending++;
+          await queueScanOp(async () => {
+            stopsPending--;
+            await stopScanNow();
+          });
           publishScanBlocked(null);
         },
         // Capture — forwarded to the shared helper (its guards live inside).
