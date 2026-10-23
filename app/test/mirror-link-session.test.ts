@@ -240,6 +240,8 @@ vi.mock("@orchestrator/controller", () => ({
     constructor(
       message: string,
       readonly running: boolean,
+      readonly cause?: unknown,
+      readonly replacement: { id: number; maybeLive: boolean } | null = null,
     ) {
       super(message);
     }
@@ -1159,6 +1161,136 @@ describe("live geometry → replace", () => {
   });
 });
 
+describe("failed replace: the routed new id is scored against ITS spec", () => {
+  /** A `TrajectoryReplaceError(running: true)` that left table `id` routed. */
+  async function replaceErrorWith(id: number, maybeLive: boolean) {
+    const { TrajectoryReplaceError } = await import("@orchestrator/controller");
+    return new (TrajectoryReplaceError as unknown as new (
+      m: string,
+      r: boolean,
+      c?: unknown,
+      rep?: { id: number; maybeLive: boolean } | null,
+    ) => Error)("atomic START timed out", true, undefined, { id, maybeLive });
+  }
+
+  it("graced (never live): pushes from the new id score against the new spec for its grace", async () => {
+    const h = await harness();
+    await h.call("startScan");
+    const start = h.traj().startedAt!;
+    ctl.replaceError = await replaceErrorWith(7, false);
+    await h.setState("scan_window", [0.3, 0.95]); // marker 0 moves 0 → 30 ms
+    await vi.advanceTimersByTimeAsync(0);
+    await settle();
+    expect(h.traj().replaceCalls).toBe(1);
+    // A push from id 7 exactly on the NEW table's phase: 0 µs late, not the
+    // old marker's 30 ms.
+    h.traj().push({
+      trajectoryId: 7,
+      status: "OK",
+      marker: 0,
+      cycle: 2,
+      tTrigger: start + 200_000_000n + 30_000_000n,
+    });
+    await h.tick();
+    expect(h.tele.perf.trajectory.lateness_us).toBe(0);
+    // The running table (id 0) still scores against ITS spec (marker at 0).
+    h.traj().push({
+      status: "OK",
+      marker: 0,
+      cycle: 3,
+      tTrigger: start + 300_000_000n + 5_000n,
+    });
+    await h.tick();
+    expect(h.tele.perf.trajectory.lateness_us).toBe(5);
+    // Past the grace the id may be reallocated: back to the running spec.
+    ctl.hostNs += 1_000_000_000n;
+    h.traj().push({
+      trajectoryId: 7,
+      status: "OK",
+      marker: 0,
+      cycle: 12,
+      tTrigger: start + 1_200_000_000n + 30_000_000n,
+    });
+    await h.tick();
+    expect(h.tele.perf.trajectory.lateness_us).toBe(30_000);
+  });
+
+  it("possibly live: the entry never expires on its own; the next landed swap retires it", async () => {
+    const h = await harness();
+    await h.call("startScan");
+    const start = h.traj().startedAt!;
+    ctl.replaceError = await replaceErrorWith(7, true);
+    await h.setState("scan_window", [0.3, 0.95]);
+    await vi.advanceTimersByTimeAsync(0);
+    await settle();
+    ctl.hostNs += 5_000_000_000n; // far past any grace
+    h.traj().push({
+      trajectoryId: 7,
+      status: "OK",
+      marker: 0,
+      cycle: 52,
+      tTrigger: start + 5_200_000_000n + 30_000_000n,
+    });
+    await h.tick();
+    expect(h.tele.perf.trajectory.lateness_us).toBe(0);
+    // A swap that lands (the controller STOPped the sibling first) retires
+    // the entry: past ITS grace the id scores as the live table again.
+    ctl.replaceError = null;
+    perfNow += 200;
+    await h.setState("scan_window", [0.4, 0.95]); // marker 0 at 40 ms
+    await vi.advanceTimersByTimeAsync(200);
+    await settle();
+    expect(h.traj().replaceCalls).toBe(2);
+    ctl.hostNs += 1_000_000_000n;
+    h.traj().push({
+      trajectoryId: 7,
+      status: "OK",
+      marker: 0,
+      cycle: 62,
+      tTrigger: start + 6_200_000_000n + 40_000_000n,
+    });
+    await h.tick();
+    expect(h.tele.perf.trajectory.lateness_us).toBe(0);
+  });
+
+  it("Timed, possibly live: the shorter exposure of a pre-swap shrink is NOT written back", async () => {
+    const h = await harness({
+      state: { scan_mode: "triangle", tri_window_sync: false },
+    });
+    h.triple.leases.R.camera.modes.splice(1); // R: Timed only
+    await h.setState("tri_window_rise", [0.1, 0.9]);
+    await h.setState("tri_window_fall", [0.1, 0.9]);
+    await h.call("startScan");
+    await settle();
+    expect(h.triple.leases.L.camera.exposure).toBe(80_000);
+    // A shrinking window re-times the camera FIRST (50 ms), then swaps…
+    ctl.replaceError = await replaceErrorWith(7, true);
+    await h.setState("tri_window_rise", [0.1, 0.6]);
+    await vi.advanceTimersByTimeAsync(0);
+    await settle();
+    expect(h.traj().replaceCalls).toBe(1);
+    // …and the swap's outcome is unknown: the 50 ms exposure stays (safe under
+    // either table), the 80 ms one is NOT restored.
+    expect(h.triple.leases.L.camera.exposure).toBe(50_000);
+  });
+
+  it("Timed, never live: the pre-swap shrink IS written back", async () => {
+    const h = await harness({
+      state: { scan_mode: "triangle", tri_window_sync: false },
+    });
+    h.triple.leases.R.camera.modes.splice(1); // R: Timed only
+    await h.setState("tri_window_rise", [0.1, 0.9]);
+    await h.setState("tri_window_fall", [0.1, 0.9]);
+    await h.call("startScan");
+    await settle();
+    ctl.replaceError = await replaceErrorWith(7, false);
+    await h.setState("tri_window_rise", [0.1, 0.6]);
+    await vi.advanceTimersByTimeAsync(0);
+    await settle();
+    expect(h.triple.leases.L.camera.exposure).toBe(80_000);
+  });
+});
+
 describe("scan.amp_deg", () => {
   it("is the RUNNING amplitude: a failed replace leaves it at the old one", async () => {
     const h = await harness({ state: { scan_amp: 0.5 } });
@@ -1697,8 +1829,14 @@ describe("telemetry", () => {
   it("stalled: no OK push for two periods after good ones → true at the throttle, an OK push clears it", async () => {
     const h = await harness();
     await h.call("startScan");
-    const ok = (cycle: number) =>
-      h.traj().push({ status: "OK", marker: 0, cycle });
+    const start = h.traj().startedAt!;
+    const ok = (cycle: number, lateUs = 0) =>
+      h.traj().push({
+        status: "OK",
+        marker: 0,
+        cycle,
+        tTrigger: start + BigInt(cycle) * 100_000_000n + BigInt(lateUs) * 1000n,
+      });
     perfNow += 100;
     ok(1);
     perfNow += 100;
@@ -1721,10 +1859,12 @@ describe("telemetry", () => {
     expect(
       ctl.reports.filter((r) => r.includes("no fovea exposure")),
     ).toHaveLength(1);
-    // An OK push clears it at once (no throttle tick needed)...
-    ok(9);
+    // An OK push clears it at once (no throttle tick needed), and the
+    // republish carries THAT push's lateness, not the previous one's.
+    ok(9, 13);
     await settle();
     expect(h.tele.perf.trajectory.stalled).toBe(false);
+    expect(h.tele.perf.trajectory.lateness_us).toBe(13);
     // ...and a stop publishes it false.
     perfNow += 1000;
     await h.tick(0);

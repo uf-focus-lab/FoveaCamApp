@@ -693,7 +693,14 @@ ids ALTERNATE across swaps. The session therefore scores every push — lateness
 flip anchor's pulse — by `f.trajectoryId` against the spec THAT table ran: when a swap
 lands the old id's entry is stamped `until = hostNow + trajectoryGraceUs(old spec)` and
 used only until then; an expired entry is ignored, so mid-swap a reallocated id — like a
-not-yet-seen one — resolves to the in-flight spec.
+not-yet-seen one — resolves to the in-flight spec. A FAILED swap that left its new table
+id routed (`TrajectoryReplaceError.replacement`, controller.md's decision table) is scored
+the same way, against the spec that table carries: for the grace when it can never be live
+(`maybeLive: false`), open-ended while it may be (`maybeLive: true`) until the next landed
+swap — the controller STOPs such a sibling first — or the run's end retires it. In the
+Timed fallback a pre-swap exposure shrink is written back only when the new table can
+never be live: while it may be, the shorter exposure is safe under either table and the
+longer one could overrun its pulse.
 
 **`perf.trajectory`** (`TrajectoryTelemetry`, published with `perf` at the
 `VOLT_TELEMETRY_INTERVAL_MS` throttle; counters reset per scan): `running` (scan active and

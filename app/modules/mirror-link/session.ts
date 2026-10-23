@@ -638,6 +638,42 @@ export default function mirrorLinkSession(
       specById.set(id, { spec, untilNs: null });
     }
 
+    /** Ids a FAILED swap left routed as possibly-live siblings (the
+     *  controller's ambiguous row): their entries never expire on their own —
+     *  the next landed swap or the run's end retires them (the controller
+     *  STOPs them there). */
+    const siblingIds = new Set<number>();
+
+    /** A failed swap left its NEW table id routed (`TrajectoryReplaceError.
+     *  replacement`): score its pushes against the spec IT carries — for the
+     *  controller's grace when it can never be live, open-ended while it may
+     *  be (spec §actuation: every push scored against the table that ran). */
+    function rememberFailedReplacement(
+      rep: { id: number; maybeLive: boolean } | null,
+      spec: TrajectorySpec,
+    ): void {
+      if (!rep) return;
+      if (rep.maybeLive) {
+        siblingIds.add(rep.id);
+        specById.set(rep.id, { spec, untilNs: null });
+      } else {
+        specById.set(rep.id, {
+          spec,
+          untilNs: hostNowNs() + BigInt(trajectoryGraceUs(spec)) * 1000n,
+        });
+      }
+    }
+
+    /** A swap landed (the controller STOPped every sibling first): their
+     *  entries stay valid for their grace only. */
+    function retireSiblingSpecs(): void {
+      for (const id of siblingIds) {
+        const e = specById.get(id);
+        if (e) retireSpec(id, e.spec);
+      }
+      siblingIds.clear();
+    }
+
     /** A swap landed: the OLD table's entry stays valid for its grace only. */
     function retireSpec(
       id: number | null | undefined,
@@ -1002,6 +1038,7 @@ export default function mirrorLinkSession(
       runOverrun = false;
       pendingSpec = null;
       specById.clear();
+      siblingIds.clear();
       for (const u of trajectoryUnsubs.splice(0)) u();
       if (!traj) return;
       try {
@@ -1726,9 +1763,14 @@ export default function mirrorLinkSession(
             "warning",
           );
         }
+        const rep =
+          error instanceof TrajectoryReplaceError ? error.replacement : null;
+        rememberFailedReplacement(rep, built.spec);
         // The camera took the shorter exposure of a swap that never landed:
-        // back to the running table's (its MCU pulses still carry it).
-        if (retimedBefore)
+        // back to the running table's (its MCU pulses still carry it). NOT
+        // while the new table MAY be live: the shorter exposure is safe under
+        // either table, the longer one would overrun its pulse.
+        if (retimedBefore && !rep?.maybeLive)
           try {
             await retimeIfNeeded(t, prevPulseUs);
           } catch (e) {
@@ -1746,6 +1788,7 @@ export default function mirrorLinkSession(
       runAmp = built.amp;
       runOverrun = built.overrun;
       if (traj.id !== oldId) retireSpec(oldId, oldSpec);
+      retireSiblingSpecs();
       rememberSpec(traj.id, built.spec);
       reuploads++;
       // A growing Timed exposure: the MCU pulses are longer now — only now may
