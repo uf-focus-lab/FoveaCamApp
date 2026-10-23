@@ -406,6 +406,8 @@ Teensy DMAMEM, 80 KB, first-fit), `MAX_MARKERS = 8` per table.
   running table first; deleting a free id is a
   no-op ACK. `System::Enable(false)` halts the run (`CANCELLED` push) and cancels
   an in-flight marker capture (`CANCELLED`); uploaded tables survive.
+- A phase-continuous swap is `STOP(a)` + `START(b, original t_start)`, written back to
+  back, with table `b` uploaded and committed beforehand (`TrajectoryHandle.replace`).
 
 REJ reasons: `Trajectory id out of range (max 4 tables)`, `Trajectory is running
 (STOP it first)`, `Trajectory needs at least one sample`, `Trajectory too long (max
@@ -423,7 +425,7 @@ checks (`Bad BEGIN length`, `Bad DATA length …`, …) and `Unknown trajectory
 operation`.
 
 Host: `Controller.uploadTrajectory({ samples, periodUs, markers, step })` →
-`{ id, start(atHostNs?, cycles?), stop(), dispose(), onFrame(cb) }`
+`{ id, start(atHostNs?, cycles?), stop(), dispose(), onFrame(cb), replace(spec) }`
 (`app/orchestrator/controller.ts`), gated on `>= 2.2.0`. Core delivers the pushes
 through `Device.onPush(Protocol.Command.TrajectoryFrame, cb)` — the generic
 non-LOG SYN dispatch in `core/src/Controller.cpp`. Sessions use it through
