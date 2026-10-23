@@ -1107,6 +1107,72 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
         expect(wireOps().at(-1)).toEqual({ op: "DELETE", id: 0 });
       });
 
+      it("after an ambiguous outcome, dispose() graces and DELETEs the sibling", async () => {
+        const handle = await running(FW_221);
+        const got: number[] = [];
+        handle.onFrame((f) => got.push(f.trajectoryId));
+        mockOps.reject.push(
+          { op: "START", id: 1, message: TIMEOUT },
+          { op: "START", id: 0, message: "A trajectory is already running (STOP it first)" },
+        );
+        await handle.replace(reshaped(4)).catch(() => {});
+        mockCalls.length = 0;
+        await handle.dispose();
+        expect(wireOps()).toEqual([
+          { op: "DELETE", id: 1 },
+          { op: "DELETE", id: 0 },
+        ]);
+        // Both ids are in grace: their stragglers reach nobody and neither
+        // is allocated to the next table.
+        push(1);
+        push(0);
+        expect(got).toEqual([]);
+        const next = await ctrl!.uploadTrajectory(spec(4));
+        expect(next.id).toBe(2);
+        const gotNext: number[] = [];
+        next.onFrame((f) => gotNext.push(f.trajectoryId));
+        push(1);
+        expect(gotNext).toEqual([]);
+        elapse(trajectoryGraceUs(reshaped(4)) + 1);
+        expect((await ctrl!.uploadTrajectory(spec(2))).id).toBe(0);
+        expect((await ctrl!.uploadTrajectory(spec(2))).id).toBe(1);
+      });
+
+      it("after an ambiguous outcome, a run that ENDED replaces as a plain re-upload and retires the sibling", async () => {
+        const handle = await running(FW_221);
+        const got: number[] = [];
+        handle.onFrame((f) => got.push(f.trajectoryId));
+        mockOps.reject.push(
+          { op: "START", id: 1, message: TIMEOUT },
+          { op: "START", id: 0, message: "A trajectory is already running (STOP it first)" },
+        );
+        await handle.replace(reshaped(4)).catch(() => {});
+        push(0, { marker: null, status: "ENDED", cycle: 10 });
+        got.length = 0;
+        mockCalls.length = 0;
+        await handle.replace(reshaped(4, 40_000)); // not running: any period
+        expect(trajectoryOps()).toEqual(["BEGIN", "DATA", "MARK", "COMMIT", "DELETE", "DELETE"]);
+        expect(wireOps().find((a) => a.op === "BEGIN")).toMatchObject({ id: 2 });
+        expect(wireOps().slice(-2)).toEqual([
+          { op: "DELETE", id: 0 },
+          { op: "DELETE", id: 1 },
+        ]);
+        expect(handle.id).toBe(2);
+        // The sibling is graced, then unrouted — not a sibling any more.
+        push(1);
+        expect(got).toEqual([1]);
+        elapse(trajectoryGraceUs(reshaped(4)) + 1);
+        push(1);
+        expect(got).toEqual([1]);
+        mockCalls.length = 0;
+        await handle.start(T_START_NS);
+        await handle.stop();
+        expect(wireOps()).toEqual([
+          { op: "START", id: 2, t_start: 2_000_000n, cycles: 0 },
+          { op: "STOP", id: 2 },
+        ]);
+      });
+
       it("a re-START failing otherwise ends the run (running: false): STOP(old), DELETE(new)", async () => {
         const handle = await running(FW_221);
         mockOps.reject.push(

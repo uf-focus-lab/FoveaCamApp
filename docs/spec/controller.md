@@ -232,8 +232,13 @@ stopping the scan. MirrorLink calls it on every steer drag or slider move, at mo
   a swap is in flight collapse into one pending batch. The latest spec wins and is sent
   once the in-flight swap lands; intermediate specs are never uploaded, and every
   caller in the batch settles with that one swap. `stop()` waits for the in-flight swap
-  and the pending batch. `close()` rejects the pending batch, waits for the in-flight
-  swap, then STOPs and DELETEs.
+  and the batch pending ON ENTRY, then STOPs. A `replace()` issued after `stop()` was
+  called, until it settles, is refused ("stopping"), like the session's pending-stop
+  guard (`docs/spec/mirror-link.md`, Cancellation), so a steady stream of replaces
+  cannot starve the STOP; once `stop()` resolved, a replace is a plain re-upload from
+  `ready`. `close()` refuses every later `replace()` from the moment it is called
+  ("closing"), rejects the pending batch, waits for the in-flight swap, then STOPs and
+  DELETEs.
 
 **FIN routing.**
 
