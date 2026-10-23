@@ -88,8 +88,10 @@ onStateChange(cb), reupload(), replace(spec) }`.
     the run-level `ENDED` push, or on `CANCELLED` (system disabled).
   - `start()` refuses while running, uploading, detached or closed.
 - **Input holding.** While the trajectory is `running`, every position-input push
-  (`update` / `updateAt`) is held locally. Nothing is sent (the firmware would REJ it)
-  and nothing is recorded. The input returns its last predicted value.
+  (`update` / `updateAt`) is held locally. Nothing is sent (the firmware would REJ it:
+  a running trajectory refuses stream UPDATEs, keyframes, `Actuate` and the legacy
+  `Trigger` — `serial-protocol.md#trajectory`) and nothing is recorded. The input
+  returns its last predicted value.
   - When the run ends, each input re-takes the DAC with its latest pose: the held one,
     or its pre-run target. The node sends it as a FORCED UPDATE that bypasses the
     gate's dedupe, because the firmware HOLDs the trajectory's last position until the

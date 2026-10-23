@@ -28,6 +28,8 @@ that a second request cannot arrive until the first's delay elapses). Callers
 wanting overlap use `CMD_STREAM`.
 
 Pending actions are cancelled (REJected) on `System::Disable`.
+Both are REJected while a trajectory runs ([trajectory](#trajectory)): it owns
+the DAC and the trigger lines.
 
 ## pipelining and in-flight limits {#pipelining}
 
@@ -403,11 +405,15 @@ Teensy DMAMEM, 80 KB, first-fit), `MAX_MARKERS = 8` per table.
   position. After either, the mirror stays put (`Owner::HOLD`, surviving the
   1 Hz MEMS refresh) until the next stream write — UPDATE, an applied keyframe,
   a CREATE that takes the DAC, or a CMD_FRAME activation — takes the DAC back.
-- While a trajectory runs (armed or playing) it owns the DAC: `CMD_STREAM UPDATE`
-  and `CMD_SCHEDULE` are REJected (`A trajectory owns the DAC (STOP it first)`;
-  silent for seq 0). A host `CMD_FRAME` is still accepted: it cannot re-point the
-  DAC, so it exposes at the trajectory's current position (and reports it), and
-  any marker crossing while it is in flight pushes `BUSY`. `DELETE` stops a
+- While a trajectory runs (armed or playing) it owns the DAC: `CMD_STREAM UPDATE`,
+  `CMD_SCHEDULE` and `Command::Actuate` are REJected (`A trajectory owns the DAC
+  (STOP it first)`; silent for seq 0), and it owns the trigger lines: the legacy
+  `Command::Trigger` REJs `A trajectory owns the trigger lines (STOP it first)`.
+  Both work again once the run is over (`HOLD` after STOP/ENDED is not running —
+  an Actuate there writes the DAC as usual). A host `CMD_FRAME` is still
+  accepted: it cannot re-point the DAC, so it exposes at the trajectory's
+  current position (and reports it), and any marker crossing while it is in
+  flight pushes `BUSY`. `DELETE` stops a
   running table first; deleting a free id is a
   no-op ACK. `System::Enable(false)` halts the run (`CANCELLED` push) and cancels
   an in-flight marker capture (`CANCELLED`); uploaded tables survive.
@@ -433,8 +439,10 @@ Teensy DMAMEM, 80 KB, first-fit), `MAX_MARKERS = 8` per table.
   gets it (older firmware) falls back to `STOP(a)` + `START(b, original t_start)`
   back to back, which joins in progress (markers due between the two are lost).
   Host: `TrajectoryHandle.replace` (`app/orchestrator/controller.ts`). Guarded by
-  `test/fw-sim-check.cpp` stages C5 (swap mid-capture, `b`'s marker later) and C6
-  (`b`'s marker earlier than the swap phase; `b` with more markers than `a`).
+  `test/fw-sim-check.cpp` stages C5 (swap mid-capture, `b`'s marker later), C6
+  (`b`'s marker earlier than the swap phase; `b` with more markers than `a`) and
+  C6c (a swap while armed pre-positions at `b`'s phase 0; a swap whose `cycles`
+  is already spent ends with a phase-0 hold + `ENDED`).
 
 REJ reasons: `Trajectory id out of range (max 4 tables)`, `Trajectory is running
 (STOP it first)`, `Trajectory needs at least one sample`, `Trajectory too long (max
