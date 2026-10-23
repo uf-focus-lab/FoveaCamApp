@@ -700,7 +700,8 @@ id routed (`TrajectoryReplaceError.replacement`, controller.md's decision table)
 the same way, against the spec that table carries: for the grace when it can never be live
 (`maybeLive: false`), open-ended while it may be (`maybeLive: true`) until the next landed
 swap — an atomic START replaces whichever table plays, the STOP/START pair STOPs each
-sibling — or the run's end retires it. While such a sibling exists the MCU may be running
+sibling — a failed pair swap that STOPped it (`TrajectoryReplaceError.retiredSiblings`:
+the entry moves to the grace), or the run's end retires it. While such a sibling exists the MCU may be running
 the abandoned geometry, so `scan.mismatch` names "replacement swap unconfirmed — the mirror
 may run the previous edit" and an edit back to the running geometry still swaps (the
 identical-spec shortcut is suspended) so the next landed swap settles it. In the Timed

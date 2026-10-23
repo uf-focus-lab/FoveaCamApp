@@ -1259,9 +1259,10 @@ class NodeTrajectoryImpl implements NodeTrajectory {
   private endRun(): void {
     if (this._state !== "running") return;
     // A possibly-live replacement is done with once the run ends: the node's
-    // scoring entry gets its grace now (the controller STOPs + graces the
-    // table on stop(), the next swap, a failed swap's "run is over" branch,
-    // or dispose — a sibling whose STOP failed stays reserved there).
+    // scoring entry gets its grace now. (The controller retires — graces +
+    // DELETEs — such a sibling at the next landed swap, a failed pair swap
+    // whose sibling STOP landed, stop(), the "run is over" branch, or
+    // dispose; a sibling whose STOP failed stays reserved there.)
     for (const [id, r] of this.retired)
       if (r.untilNs === null)
         this.graceRetired(id, r.spec, trajectoryGraceUs(r.spec));
@@ -1425,6 +1426,7 @@ class NodeTrajectoryImpl implements NodeTrajectory {
       const e = error as {
         running?: boolean;
         replacement?: { id: number; maybeLive: boolean } | null;
+        retiredSiblings?: readonly number[];
       } | null;
       // The replacement table id stays routed here after the failure (it may
       // have played for a moment, or may be live): its pushes belong to `spec`.
@@ -1433,6 +1435,14 @@ class NodeTrajectoryImpl implements NodeTrajectory {
           this.retired.set(e.replacement.id, { spec, untilNs: null });
         else this.graceRetired(e.replacement.id, spec, trajectoryGraceUs(spec));
       }
+      // A failed pair swap STOPped earlier possibly-live siblings: their
+      // open-ended entries move to the grace.
+      if (this.handle === h)
+        for (const sid of e?.retiredSiblings ?? []) {
+          const r = this.retired.get(sid);
+          if (r && r.untilNs === null)
+            this.graceRetired(sid, r.spec, trajectoryGraceUs(r.spec));
+        }
       // The swap failed and the old table could not be re-STARTed: the run
       // is over — inputs re-take the DAC.
       if (e?.running === false && this.handle === h) this.endRun();

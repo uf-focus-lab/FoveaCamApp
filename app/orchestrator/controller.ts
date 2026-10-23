@@ -391,14 +391,21 @@ export interface TrajectoryHandle {
  *  (phase-continuously) still runs. `replacement` is set when the new table
  *  id stays routed to the handle's listeners after the failure: in its grace
  *  (`maybeLive: false` — it may have played for a moment), or reserved as a
- *  possibly-LIVE sibling (`maybeLive: true`, the ambiguous outcome) until the
- *  handle's next stop / swap / dispose retires it. */
+ *  possibly-LIVE sibling (`maybeLive: true`, the ambiguous outcome) until it
+ *  is retired (graced + DELETEd): at the next landed swap (the atomic START
+ *  replaces whichever table plays; the pair STOPs it first), a failed pair
+ *  swap whose sibling STOP landed (`retiredSiblings` names those), `stop()`,
+ *  the "run is over" branch, or `dispose()`. */
 export class TrajectoryReplaceError extends Error {
   constructor(
     message: string,
     readonly running: boolean,
     readonly cause?: unknown,
     readonly replacement: { id: number; maybeLive: boolean } | null = null,
+    /** Possibly-live siblings from EARLIER failures that this failed pair
+     *  swap retired (their STOP landed, so they are graced + DELETEd): a
+     *  consumer scoring their pushes by spec moves them to the grace. */
+    readonly retiredSiblings: readonly number[] = [],
   ) {
     super(message);
     this.name = "TrajectoryReplaceError";
@@ -1551,10 +1558,12 @@ export class Controller {
         for (const gone of swapTo(newId, next, true, onSwap)) await drop(gone);
         return;
       }
-      // Siblings that took their STOP are done with.
-      await dropSiblings(
-        sibIds.filter((_, i) => sibStops[i]?.status === "fulfilled"),
+      // Siblings that took their STOP are done with (reported on the error:
+      // the node's and the session's open-ended entries move to the grace).
+      const retiredSibs = sibIds.filter(
+        (_, i) => sibStops[i]?.status === "fulfilled",
       );
+      await dropSiblings(retiredSibs);
       // START(new) failed: retire it (in grace when it failed without a REJ —
       // it may have started); if STOP(old) went through, re-START the old
       // table at the same t_start (phase-continuous again) so the scan keeps
@@ -1582,6 +1591,7 @@ export class Controller {
         running,
         started.reason,
         startUnknown ? { id: newId, maybeLive: false } : null,
+        retiredSibs,
       );
     };
 

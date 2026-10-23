@@ -1315,6 +1315,33 @@ describe("NodeTrajectory.replace", () => {
       await t.close();
     });
 
+    it("a failed pair swap's retiredSiblings move an open-ended entry to the grace", async () => {
+      const { t, h } = await runningOn();
+      h.replace.mockRejectedValueOnce(
+        Object.assign(new Error("ambiguous: table 0 (or 7) is live"), {
+          running: true,
+          replacement: { id: 7, maybeLive: true },
+        }),
+      );
+      await expect(t.replace(RESHAPED)).rejects.toThrow(/ambiguous/);
+      advance(1_000_000_000n);
+      expect(lateness(h, 7, 0, 4_000, 61)).toBe(61); // RESHAPED, open-ended
+      h.replace.mockRejectedValueOnce(
+        Object.assign(new Error("pair START REJ"), {
+          running: true,
+          replacement: null,
+          retiredSiblings: [7],
+        }),
+      );
+      await expect(t.replace(THIRD)).rejects.toThrow(/pair START REJ/);
+      // Still RESHAPED's inside the grace…
+      expect(lateness(h, 7, 0, 4_000, 62)).toBe(62);
+      // …and the live table's past it (RESHAPED's grace: 55 ms).
+      advance(60_000_000n);
+      expect(lateness(h, 7, 0, 2_000, 63)).toBe(63); // SPEC's marker 0
+      await t.close();
+    });
+
     it("a detach forgets the retired ids: a new device's reuse of one is scored as the live table", async () => {
       const { t, h } = await runningOn();
       h.replace.mockRejectedValueOnce(

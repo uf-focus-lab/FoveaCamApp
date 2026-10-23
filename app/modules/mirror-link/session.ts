@@ -642,10 +642,12 @@ export default function mirrorLinkSession(
 
     /** Ids a FAILED swap left routed as possibly-live siblings (the
      *  controller's ambiguous row): their entries never expire on their own —
-     *  the next landed swap or the run's end retires them (an atomic START
-     *  replaces whichever table plays; the STOP/START pair and stop() STOP
-     *  each sibling). While any exists, `mismatch` names the unconfirmed swap
-     *  and an edit back to the running geometry still swaps. */
+     *  the next landed swap, a failed pair swap that STOPped them
+     *  (`TrajectoryReplaceError.retiredSiblings`) or the run's end retires
+     *  them (an atomic START replaces whichever table plays; the STOP/START
+     *  pair and stop() STOP each sibling). While any exists, `mismatch` names
+     *  the unconfirmed swap and an edit back to the running geometry still
+     *  swaps. */
     const siblingIds = new Set<number>();
 
     /** A failed swap left its NEW table id routed (`TrajectoryReplaceError.
@@ -1781,6 +1783,12 @@ export default function mirrorLinkSession(
         const rep =
           error instanceof TrajectoryReplaceError ? error.replacement : null;
         rememberFailedReplacement(rep, built.spec);
+        // A failed PAIR swap STOPped earlier siblings: graced, not live.
+        if (error instanceof TrajectoryReplaceError)
+          for (const sid of error.retiredSiblings ?? []) {
+            const e = specById.get(sid);
+            if (e && siblingIds.delete(sid)) retireSpec(sid, e.spec);
+          }
         // The camera took the shorter exposure of a swap that never landed:
         // back to the running table's (its MCU pulses still carry it). NOT
         // while the new table MAY be live: the shorter exposure is safe under

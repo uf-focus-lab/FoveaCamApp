@@ -242,6 +242,7 @@ vi.mock("@orchestrator/controller", () => ({
       readonly running: boolean,
       readonly cause?: unknown,
       readonly replacement: { id: number; maybeLive: boolean } | null = null,
+      readonly retiredSiblings: readonly number[] = [],
     ) {
       super(message);
     }
@@ -1272,6 +1273,56 @@ describe("failed replace: the routed new id is scored against ITS spec", () => {
     // …and the swap's outcome is unknown: the 50 ms exposure stays (safe under
     // either table), the 80 ms one is NOT restored.
     expect(h.triple.leases.L.camera.exposure).toBe(50_000);
+  });
+
+  it("a failed pair swap that STOPped the sibling (retiredSiblings) clears the unconfirmed state", async () => {
+    const h = await harness();
+    await h.call("startScan");
+    const start = h.traj().startedAt!;
+    ctl.replaceError = await replaceErrorWith(7, true);
+    await h.setState("scan_window", [0.3, 0.95]);
+    await vi.advanceTimersByTimeAsync(0);
+    await settle();
+    expect(h.tele.scan.mismatch_reason).toBe(
+      "replacement swap unconfirmed — the mirror may run the previous edit",
+    );
+    // The next swap falls to the pair, STOPs sibling 7, and its START fails:
+    // the sibling is retired (graced) — no longer unconfirmed.
+    const { TrajectoryReplaceError } = await import("@orchestrator/controller");
+    ctl.replaceError = new (TrajectoryReplaceError as unknown as new (
+      m: string,
+      r: boolean,
+      c?: unknown,
+      rep?: { id: number; maybeLive: boolean } | null,
+      sibs?: readonly number[],
+    ) => Error)("pair START REJ", true, undefined, null, [7]);
+    perfNow += 200;
+    await h.setState("scan_window", [0.4, 0.95]);
+    await vi.advanceTimersByTimeAsync(200);
+    await settle();
+    expect(h.traj().replaceCalls).toBe(2);
+    expect(h.tele.scan.mismatch).toBe(false);
+    // Inside the grace a push from 7 still scores against ITS spec (30 ms)…
+    h.traj().push({
+      trajectoryId: 7,
+      status: "OK",
+      marker: 0,
+      cycle: 3,
+      tTrigger: start + 300_000_000n + 30_000_000n,
+    });
+    await h.tick();
+    expect(h.tele.perf.trajectory.lateness_us).toBe(0);
+    // …past it, as the running table (marker at 0).
+    ctl.hostNs += 1_000_000_000n;
+    h.traj().push({
+      trajectoryId: 7,
+      status: "OK",
+      marker: 0,
+      cycle: 13,
+      tTrigger: start + 1_300_000_000n + 30_000_000n,
+    });
+    await h.tick();
+    expect(h.tele.perf.trajectory.lateness_us).toBe(30_000);
   });
 
   it("possibly live: mismatch names the unconfirmed swap; an edit back to the running geometry still swaps and settles it", async () => {

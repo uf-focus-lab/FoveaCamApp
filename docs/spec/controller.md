@@ -169,8 +169,11 @@ stopping the scan. MirrorLink calls it on every steer drag or slider move, at mo
     | no REJ (transport) | fails otherwise | the run is over: best-effort `STOP(old)` and `STOP(each sibling)` (graced + DELETEd where the STOP landed), `DELETE(new)` (a DELETE halts a playing table), new id graced | `running: false` |
 
     A sibling is retired by the handle's next running swap. The atomic START works
-    whichever of the two tables plays; the pair also STOPs each sibling. A plain
-    re-upload retires it too. `stop()` STOPs the current table and every sibling;
+    whichever of the two tables plays; the pair also STOPs each sibling — and when
+    that pair's `START(new)` then fails, every sibling whose STOP landed is still
+    retired (graced + DELETEd) and named on the error (`retiredSiblings`), so a
+    consumer scoring its pushes by spec moves it to the grace. A plain re-upload
+    retires it too. `stop()` STOPs the current table and every sibling;
     each sibling whose STOP is ACKed is graced and DELETEd. `dispose()` graces and
     DELETEs them.
   - `DELETE(old)` follows either way, best-effort. The handle's `id` getter then reads
