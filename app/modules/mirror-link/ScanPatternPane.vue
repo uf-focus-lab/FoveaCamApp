@@ -18,28 +18,23 @@ import SingleSelect, {
 } from "@src/inputs/single-select.vue";
 import type { StateOf } from "@lib/orchestrator/protocol";
 import { mirrorLink, type ScanMode, type ScanWindow } from "./contract";
-import { SCAN_AMP_RANGE, SCAN_HZ_RANGE } from "./scan";
+import { SCAN_AMP_RANGE, SCAN_HZ_RANGE, WINDOW_MAX, WINDOW_MIN } from "./scan";
 
 /** The session's live `state` proxy (`useSession(...).state`): writes go
  *  straight to the session, as with every other drawer control. */
 const props = defineProps<{ state: StateOf<typeof mirrorLink> }>();
 const state = props.state;
 
-/** The exposure-window cap (spec §scan-patterns `WINDOW_MAX`): the trigger line
- *  must be released and the capture engine idle before the next marker. */
-const WINDOW_MAX = 0.95;
-/** One keyboard step; also the narrowest window (a marker needs a pulse). */
-const WINDOW_STEP = 0.005;
+/** One keyboard step = the narrowest window the session accepts
+ *  (`WINDOW_MIN`, spec §scan-patterns); the cap is `WINDOW_MAX` from the same
+ *  place, so the pane can never produce a window the session rewrites. */
+const WINDOW_STEP = WINDOW_MIN;
 const DEFAULT_WINDOW: ScanWindow = [0, WINDOW_MAX];
 const DEFAULT_TRI_WINDOW: ScanWindow = [0.05, WINDOW_MAX];
 
 const MODE_OPTIONS: readonly SingleSelectOption<ScanMode>[] = [
   { value: "ellipse", label: "Ellipse" },
   { value: "triangle", label: "Triangle" },
-];
-const SYNC_OPTIONS: readonly SingleSelectOption<"off" | "on">[] = [
-  { value: "off", label: "Off" },
-  { value: "on", label: "On" },
 ];
 
 const ellipse = computed(() => state.scan_mode === "ellipse");
@@ -70,11 +65,6 @@ const fallWindow = computed<ScanWindow>({
   set: (v) => {
     if (!state.tri_window_sync) state.tri_window_fall = v;
   },
-});
-// SingleSelect over a string proxy: the drawer's boolean idiom (Ring Reader).
-const sync = computed<"off" | "on">({
-  get: () => (state.tri_window_sync ? "on" : "off"),
-  set: (v) => (state.tri_window_sync = v === "on"),
 });
 
 const MODE_TITLE =
@@ -190,15 +180,16 @@ const SYNC_TITLE =
         <span>Falling Window</span>
         <span>{{ windowMs(fallWindow) }}</span>
       </DualRangeSlider>
-      <div class="toggle-row" :title="SYNC_TITLE">
+      <!-- A real checkbox (owner's ask), checked by default: the drawer's
+           other on/off controls are selectors, this one is a plain tick. -->
+      <label class="check-row" :title="SYNC_TITLE">
         <span>Sync Windows</span>
-        <SingleSelect
-          v-model="sync"
-          :options="SYNC_OPTIONS"
-          class="segmented"
+        <input
+          type="checkbox"
+          v-model="state.tri_window_sync"
           aria-label="Sync the falling window to the rising window"
         />
-      </div>
+      </label>
     </template>
   </div>
 </template>
@@ -230,6 +221,25 @@ const SYNC_TITLE =
     text-transform: uppercase;
     font-size: 0.8em;
     letter-spacing: 0.02em;
+  }
+}
+
+// Label + checkbox on one row; the box takes the accent like every other
+// emphasis in the drawer (a fill, never a border).
+.check-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1ch;
+  font-size: 0.9em;
+  cursor: pointer;
+
+  input[type="checkbox"] {
+    width: 1.1em;
+    height: 1.1em;
+    margin: 0;
+    accent-color: var(--accent);
+    cursor: pointer;
   }
 }
 
