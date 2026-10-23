@@ -474,37 +474,53 @@ declare module "core/Aravis" {
 
   /** Options for `attachFlipPipe`. */
   export interface FlipPipeOptions {
-    /** Match window in ns (>= 0, inclusive, two-sided): a frame is matched to
-     *  the anchor NEAREST its `deviceTimestamp` among those with
-     *  `|deviceTimestamp − tExposure| <= toleranceNs`. */
+    /** Match window in ns (a bigint >= 0 — a Number throws; inclusive,
+     *  two-sided): a frame is matched to the anchor EDGE (`tStart` or `tEnd`)
+     *  NEAREST its `deviceTimestamp` among those with
+     *  `|deviceTimestamp − edge| <= toleranceNs`. */
     toleranceNs: bigint;
-    /** Bounded anchor pool (drop-oldest); default 16, >= 1. */
+    /** Bounded anchor pool (drop-oldest); an integer, default 16, clamped to
+     *  [1, 1024] (a non-integer throws). */
     anchorCap?: number;
+    /** Graph node id the anchors come from (the controller's trajectory
+     *  node): `Topology.report()` then lists it as the row's second input,
+     *  port `anchor`. Omitted → no anchor edge. */
+    anchorFrom?: string;
   }
 
-  /** One trajectory-marker anchor pushed via `pushFlipAnchor`. `tExposure` is
-   *  the marker push's OWNER-APPLIED trusted host-steady ns — the same domain
-   *  as a frame's `deviceTimestamp`. `flip`: a frame matched to this anchor is
-   *  vertically flipped. */
+  /** One trajectory-marker anchor pushed via `pushFlipAnchor`: the exposure's
+   *  start (`tStart`, the marker push's `tExposure`) and end (`tEnd`, start +
+   *  pulse), both OWNER-APPLIED trusted host-steady ns (bigints — a Number
+   *  throws) in the same domain as a frame's `deviceTimestamp`; `tEnd >=
+   *  tStart`. `flip`: a frame matched to this anchor is vertically flipped. */
   export interface FlipAnchor {
-    tExposure: bigint;
+    tStart: bigint;
+    tEnd: bigint;
     flip: boolean;
   }
 
   /** `flipProbe` snapshot: the shared meter shape (input `frame`, output
-   *  `flip`) + the brick's counters. */
+   *  `flip`) + the brick's counters. Every field is a Number (the
+   *  `flipProbeAll` rows are JSON-exported with the perf snapshot). */
   export interface FlipProbeSnapshot extends ProbeSnapshot {
     /** Frames processed (flipped + passed through). */
     frames: number;
     /** Frames matched to a `flip: true` anchor (rows reversed). */
     flipped: number;
-    /** Frames with NO anchor inside the tolerance — passed through unflipped. */
+    /** Frames with NO anchor edge inside the tolerance — passed through
+     *  unflipped (also a frame processed before its anchor arrived). */
     unmatched: number;
     /** Live anchor pool size (pruned per frame; bounded by `anchorCap`). */
     anchorPoolSize: number;
-    /** Anchors evicted by the `anchorCap` bound (drop-oldest) before use. */
+    /** Anchors evicted by the `anchorCap` bound (drop-oldest) before use —
+     *  climbs harmlessly while the brick is parked (no frames prune it). */
     anchorDrops: number;
-    toleranceNs: bigint;
+    /** The configured match window, ns (a Number; exact below 2^53). */
+    toleranceNs: number;
+    /** Mean signed (frame stamp − matched edge), ns, over the frames matched
+     *  since the last `flipProbe` (which resets the window; `flipProbeAll`
+     *  only peeks). 0 when nothing matched. */
+    matchedSkewNs: number;
   }
 
   /**
@@ -516,10 +532,13 @@ declare module "core/Aravis" {
    * reversed). Same pixel format, dims and stride as the source; timestamps,
    * crop origin and convertMs forwarded UNCHANGED (trusted-time). Advertise
    * `pipeId` with the SOURCE pipe's spec first (unknown pipe throws). Matching
-   * is PairStream's root rule (`|deviceTimestamp − tExposure| <= toleranceNs`,
-   * no side delta) narrowed to the nearest anchor (ties → the older); no match
-   * → pass through and count `unmatched`. Throws on a missing/negative
-   * `toleranceNs`, a bad `anchorCap` or an unknown source.
+   * is PairStream's root rule (`|deviceTimestamp − edge| <= toleranceNs`, no
+   * side delta) over both edges of every pooled anchor, narrowed to the
+   * nearest edge (ties → the older anchor, then `tStart`); no match → pass
+   * through and count `unmatched`. Re-attaching a live id replaces the brick
+   * (the old producer leaves the ring first). Throws on a missing, non-bigint
+   * or negative `toleranceNs`, a non-integer `anchorCap`, a non-string
+   * `anchorFrom` or an unknown source.
    */
   export function attachFlipPipe(
     sourcePipeId: string,
@@ -529,14 +548,17 @@ declare module "core/Aravis" {
 
   /** Push one marker anchor into the flip brick's bounded pool (drop-oldest).
    *  FIN-rate, cheap. Returns false for an unknown pipe id; throws on a
-   *  missing `tExposure` (bigint) or `flip` (boolean). */
+   *  missing/non-bigint `tStart`/`tEnd`, `tEnd < tStart`, or a missing
+   *  `flip` (boolean). */
   export function pushFlipAnchor(pipeId: string, anchor: FlipAnchor): boolean;
 
-  /** The flip brick's counters + meter, or null for an unknown pipe id. */
+  /** The flip brick's counters + meter, or null for an unknown pipe id.
+   *  Resets the `matchedSkewNs` window. */
   export function flipProbe(pipeId: string): FlipProbeSnapshot | null;
 
   /** Every live flip brick's `flipProbe` row → `{ [pipeId]: FlipProbeSnapshot }`
-   *  (keys AND meter names are the node ids; folds like `scaleProbeAll`). */
+   *  (keys AND meter names are the node ids; folds like `scaleProbeAll`).
+   *  Peeks at `matchedSkewNs` without resetting it. */
   export function flipProbeAll(): Record<string, FlipProbeSnapshot>;
 
   /** Detach + join the flip producer. Idempotent (false if unknown). */

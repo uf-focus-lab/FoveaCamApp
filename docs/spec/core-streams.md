@@ -173,32 +173,79 @@ frames matched to an anchor marked `flip`.
   `OwnedFrame` tap, demand propagation (it runs iff its pipe has consumers; while running
   it keeps the upstream chain awake), a max-bound gated `PipeOfferSubscriber`, the reused
   output buffer released on park. Advertise the flip pipe with the SOURCE pipe's own spec
-  (same format, dims, footprint) BEFORE attaching — an unknown pipe throws.
+  (same format, dims, footprint) BEFORE attaching — an unknown pipe throws. Re-attaching a
+  live id replaces the brick: the old gated subscriber is reset (off the ring) before the
+  new gate is registered, so two producers never write one sink; the old brick is joined
+  after that, outside the registry lock.
+- **Options.** `attachFlipPipe(sourcePipeId, pipeId, { toleranceNs, anchorCap?,
+  anchorFrom? })`: `toleranceNs` MUST be a bigint ≥ 0 (a Number throws — the generic
+  int64 conversion would truncate it to int32); `anchorCap` an integer (default 16,
+  clamped to [1, 1024]; a non-integer throws); `anchorFrom` the graph node id the anchors
+  come from (the controller's trajectory node).
 - **Product.** Matched-`flip` frame: `cv::flip(src, dst, 0)` (rows reversed) into the
-  reused buffer. Any other frame: passed through by header (the tap's `OwnedFrame`
-  already owns a deep copy made for this brick, so no second copy). Pixel format, dims and
-  stride are the source's; `deviceTimestamp`/`systemTimestamp`, the crop origin and the
-  upstream `convertMs` are forwarded unchanged — the trusted-time invariant, and the v4
-  slot header reads as the source pipe's would.
-- **Anchors.** `pushFlipAnchor(pipeId, { tExposure, flip })` at FIN rate (OK marker
-  pushes: `flip: marker === 1`), `tExposure` in the owner-applied trusted host-ns domain,
-  the same domain as a frame's `deviceTimestamp`. They go into a mutex-guarded bounded
-  pool (`anchorCap`, default 16, drop-oldest; evictions counted as `anchorDrops`).
-- **Matching rule.** PairStream's root rule (`matchesFrame`, no side delta), narrowed to
-  the nearest anchor: an anchor is a candidate iff
-  `|int64(frame.deviceTimestamp) − tExposure| <= toleranceNs` (two-sided, inclusive); the
-  smallest difference wins, ties going to the older anchor. The frame flips iff a winner
-  exists and is marked `flip`; with no candidate it passes through unflipped and counts
-  `unmatched`. Frames arrive in timestamp order, so after each frame the pool sheds every
-  anchor older than the winner (it can never be nearest to a later frame) or, with no
-  winner, every anchor below `ts − toleranceNs`. The session passes
-  `toleranceNs = 0.4 · T` (the sweep time).
+  reused buffer. Any other frame: passed through by header — the output `cv::Mat` shares
+  the input's reference-counted buffer (a deep copy made for this brick's tap alone,
+  never written again), so the pixels live as long as any holder keeps the header and no
+  second copy is made. Pixel format, dims and stride are the source's;
+  `deviceTimestamp`/`systemTimestamp`, the crop origin and the upstream `convertMs` are
+  forwarded unchanged — the trusted-time invariant, and the v4 slot header reads as the
+  source pipe's would.
+- **Anchors.** `pushFlipAnchor(pipeId, { tStart, tEnd, flip })` at FIN rate, one per OK
+  marker push: `tStart` = the push's `tExposure` (the strobe-rise latch), `tEnd` =
+  `tStart` + the marker's pulse, `flip: marker === 1`. Both are bigints (a Number throws)
+  in the owner-applied trusted host-ns domain, the same domain as a frame's
+  `deviceTimestamp`; `tEnd < tStart` throws. They go into a mutex-guarded bounded pool
+  (`anchorCap`, drop-oldest; evictions counted as `anchorDrops`).
+- **Matching rule (two edges).** Which instant the camera stamps a frame with — exposure
+  start or end — is not documented for the Blackfly S here, so the brick does not assume
+  it. PairStream's root rule (`matchesFrame`, no side delta) runs over BOTH edges of every
+  pooled anchor, narrowed to the nearest: an edge is a candidate iff
+  `|int64(frame.deviceTimestamp) − edge| <= toleranceNs` (two-sided, inclusive; the
+  difference is computed in unsigned arithmetic, so no input can overflow it); the
+  smallest difference wins, ties going to the older anchor (and, within one anchor, to
+  `tStart`). The frame flips iff a winner exists and its anchor is marked `flip`; with no
+  candidate it passes through unflipped and counts `unmatched`. Frames arrive in
+  timestamp order, so after each frame the pool sheds every anchor whose BOTH edges are
+  older than the winner's matched edge (no later frame can be nearer to them than to that
+  edge) or, with no winner, every anchor with `tEnd < ts − toleranceNs`.
+- **Late anchors.** Matching happens once, when the brick processes the frame. A frame
+  processed before its anchor was pushed (the FIN push lost the race with the frame)
+  passes through UNFLIPPED and counts `unmatched`; the anchor arriving afterwards is
+  pruned by a later frame. The session pushes the anchor synchronously on the FIN, which
+  precedes the frame's arrival in practice; a rising `unmatched` share is the symptom
+  when it does not.
+- **Tolerance (as the session computes it).** `toleranceNs = 0.4 · min(T, closest marker
+  spacing)`, where `T` is the sweep time (half the triangle's 2T period) and the marker
+  spacing is taken circularly over the period (`session.ts` `flipTolerance`), floored at
+  1 ms for clock alignment (`docs/spec/mirror-link-scan-patterns.md`, review round 1);
+  when that floor exceeds 0.45 × the closest marker spacing the windows are too close to
+  flip reliably at that frequency and the scan reports `mismatch`. Bounding by the
+  marker spacing keeps a frame whose own anchor is late from matching the neighbouring
+  marker.
 - **Counters.** `flipProbe(pipeId)` returns the thread meter (input `frame`, output
-  `flip`) plus `frames`, `flipped`, `unmatched`, `anchorPoolSize`, `anchorDrops` and
-  `toleranceNs`, or `null` for an unknown pipe; `flipProbeAll()` returns the same rows
-  keyed by pipe id for the perf/workload fold. `Topology.report()` shows a kind `"flip"`
-  row with one `frame` input edge from the source pipe.
+  `flip`) plus `frames`, `flipped`, `unmatched`, `anchorPoolSize`, `anchorDrops`,
+  `toleranceNs` and `matchedSkewNs`, or `null` for an unknown pipe; `flipProbeAll()`
+  returns the same rows keyed by pipe id for the perf/workload fold. EVERY field is a
+  plain Number (`toleranceNs` included — it is far below 2^53): the `flipProbeAll` rows
+  land in the perf snapshot's workloads, which the orchestrator client JSON-stringifies,
+  and a BigInt would throw there. `matchedSkewNs` is the mean signed (frame stamp −
+  matched edge) over the frames matched since the last `flipProbe` — `flipProbe` resets
+  the window, `flipProbeAll` only peeks, so the 1 Hz perf fold never steals the session's
+  window; 0 when nothing matched. It tells the bench which edge the camera stamps
+  (≈ 0 against `tStart` or `tEnd`, the other edge one pulse away) and feeds
+  `perf.trajectory.skew_us`. `anchorDrops` climbs harmlessly while the brick is parked
+  (no consumer → no frames → nothing prunes) or while frames never match (e.g. the
+  owner's clock is not yet calibrated): the pool simply keeps the newest `anchorCap`.
+- **Topology.** `Topology.report()` shows a kind `"flip"` row with a `frame` input edge
+  from the source pipe and, when `anchorFrom` was given, an `anchor` input edge from that
+  node (type `{ kind: "analysis", schema: "trajectory" }`). The native row replaces a
+  session-registered row of the same id (`graph-topology.ts` `mergeReportLayers`), so the
+  session need not register its own node row for the flip pipes.
 - **Teardown.** `detachFlipPipe` unregisters the consumer gate FIRST, then drops the
   binding outside the registry lock (unsubscribe, then the brick's `closeChain()` +
   `shutdown()` join), idempotent (`false` when unknown). JS retires a flip node detach
   then unadvertise (`FlipHandle.retire`). Guarded by `core/test/54-flip-stream.ts`.
+- **Build.** `core/CMakeLists.txt` collects sources with `file(GLOB …)`, so an EXISTING
+  CMake build directory does not see `FlipStream.cpp` until it is reconfigured (re-run
+  `cmake` on it, or delete the cache); without that the addon fails to link or load
+  with the flip exports unresolved.

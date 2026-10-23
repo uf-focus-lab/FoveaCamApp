@@ -30,6 +30,12 @@
 //      CMD_TRAJECTORY upload/commit/start -> periodic DAC playback + marker
 //      SYN pushes with sane timestamps; STOP holds position, DAC returns to
 //      the streams.
+//   C5 (v2.2.1): CMD_TRAJECTORY atomic swap — START b at a's t_start while a
+//      runs (same period) switches tables in place: mismatched period /
+//      t_start / a itself REJ with a still running; a's in-flight capture
+//      pushes (a's id) after the swap ACK; marker cycles stay contiguous on
+//      the original clock; the DAC ramp keeps advancing (no HOLD, no phase
+//      jump) and b's table plays afterwards.
 //   D. Pipelining (runs between 6 and 7): N requests in
 //      flight answered in seq order at ~one round trip; seq=0 UPDATEs
 //      interleaved silently (latest wins); requests behind a pending
@@ -557,7 +563,7 @@ int main() {
       CHECK(v.major == Protocol::Version::Major &&
                 v.minor == Protocol::Version::Minor &&
                 v.patch == Protocol::Version::Patch,
-            "firmware reports the shared Protocol::Version (2.1.0)");
+            "firmware reports the shared Protocol::Version");
       std::printf("fw-sim-check: 1 version %u.%u.%u OK\n", v.major, v.minor,
                   v.patch);
     }
@@ -1065,6 +1071,286 @@ int main() {
       std::printf("fw-sim-check: C4 HOLD/STOP (held %u) + DAC hand-back + "
                   "DELETE OK\n",
                   unsigned(held));
+    }
+    // C5 — v2.2.1 ATOMIC SWAP: START {b, t_start = a's, cycles} while table a
+    //      runs switches the playing table in place. Proves: a mismatched
+    //      period / t_start (and a re-START of a itself) REJs with a still
+    //      running; the swap lands while a's marker capture is IN FLIGHT and
+    //      that capture's OK push still arrives after the ACK with a's id;
+    //      markers keep firing on the ORIGINAL phase clock with no missed or
+    //      doubled cycle — b's marker 0 sits LATER in the cycle than a's, so
+    //      the swap lands between a's (already fired) and b's marker-0 phase
+    //      and only the by-index crossing state keeps it from firing twice in
+    //      that cycle; the DAC ramp stays in band and keeps advancing through
+    //      the swap (no HOLD, no phase reset), and b's table is what plays
+    //      afterwards.
+    {
+      constexpr uint8_t TA = 1, TB = 2, TC = 3;
+      constexpr uint32_t P = 60'000;      // period (us)
+      constexpr uint32_t AT_A = 10'000;   // a's (and c's) marker-0 phase
+      constexpr uint32_t AT_B = 25'000;   // b's marker-0 phase (later)
+      // The strobe falls just after the pulse ends, as ExposureActive does in
+      // TriggerWidth mode (and as C3's 2000/2500 are shaped); pulse + the
+      // 5 ms strobe margin covers it.
+      constexpr uint32_t PULSE = 28'000;  // marker pulse
+      constexpr uint32_t FALL = 30'000;   // injected strobe fall after trigger
+      constexpr uint32_t CYCLES_B = 6;    // b's budget (counted from t_start)
+      // L ch0 is a pure 0.1 count/us ramp 13000 -> 18900 over [0, 59 ms],
+      // wrapping back in the last 1 ms; ch1 tells the tables apart.
+      constexpr uint16_t BAND_LO = 13000, BAND_HI = 18900;
+      constexpr uint16_t CH1_A = 5100, CH1_B = 5200, CH1_C = 5300;
+      auto table = [&](uint64_t phase) { // ch0 on the rising part
+        return double(BAND_LO) + double(phase % P) / 10.0;
+      };
+      auto upload = [&](uint8_t id, uint32_t period, uint16_t ch1,
+                        uint32_t at) {
+        const uint32_t offs[4] = {0, 20'000, 40'000, 59'000};
+        std::vector<Cmd::TrajectorySample> smp(4);
+        for (int i = 0; i < 4; i++) {
+          smp[i].t_offset = offs[i] * period / P; // C: same shape, scaled
+          smp[i].left = pos(uint16_t(BAND_LO + offs[i] / 10), ch1, 6100, 7100);
+          smp[i].right = pos(8000, 9000, 10000, 11000);
+        }
+        Cmd::TrajectoryBegin b{};
+        b.op = Cmd::Trajectory::BEGIN;
+        b.id = id;
+        b.sample_count = 4;
+        b.period = period;
+        expectOk(trajectoryOp(wire, &b, sizeof(b)), "C5 BEGIN");
+        Cmd::TrajectoryData d{};
+        d.op = Cmd::Trajectory::DATA;
+        d.id = id;
+        d.first_index = 0;
+        d.count = 4;
+        expectOk(trajectoryOp(wire, &d, sizeof(d), smp.data(),
+                              4 * sizeof(Cmd::TrajectorySample)),
+                 "C5 DATA");
+        Cmd::TrajectoryMark m{};
+        m.op = Cmd::Trajectory::MARK;
+        m.id = id;
+        m.marker = 0;
+        m.t_offset = at;
+        m.cameras = Cmd::CAM_L | Cmd::CAM_R;
+        m.pulse = PULSE;
+        expectOk(trajectoryOp(wire, &m, sizeof(m)), "C5 MARK");
+        const auto c = trajectoryRef(Cmd::Trajectory::COMMIT, id);
+        expectOk(trajectoryOp(wire, &c, sizeof(c)), "C5 COMMIT");
+      };
+      auto startOp = [&](uint8_t id, uint64_t t, uint32_t cycles) {
+        Cmd::TrajectoryStart st{};
+        st.op = Cmd::Trajectory::START;
+        st.id = id;
+        st.t_start = t;
+        st.cycles = cycles;
+        return st;
+      };
+      // One marker push on the ORIGINAL phase clock: never early, on phase,
+      // and the exposure-averaged position is the ramp over the window.
+      uint64_t worstLate = 0;
+      auto checkMarker = [&](const Cmd::TrajectoryFrame &f, uint8_t id,
+                             uint32_t cycle, uint64_t tStart,
+                             const char *what, uint16_t ch1Lo,
+                             uint16_t ch1Hi) {
+        if (f.status != Cmd::TrajectoryFrame::OK || f.id != id ||
+            f.marker != 0 || f.cycle != cycle)
+          std::fprintf(stderr,
+                       "C5 %s: got status %u id %u marker %u cycle %u, want "
+                       "OK id %u marker 0 cycle %u\n",
+                       what, unsigned(f.status), unsigned(f.id),
+                       unsigned(f.marker), unsigned(f.cycle), unsigned(id),
+                       unsigned(cycle));
+        CHECK(f.status == Cmd::TrajectoryFrame::OK, "C5 marker capture OK");
+        CHECK(f.id == id && f.marker == 0 && f.cycle == cycle,
+              "C5 marker push identity: no missed or doubled cycle");
+        const uint64_t due =
+            tStart + uint64_t(cycle) * P + (id == TB ? AT_B : AT_A);
+        CHECK(f.result.t_trigger >= due, "C5 marker never fires early");
+        CHECK(f.result.t_trigger - due < 5'000,
+              "C5 marker fires at its phase (original clock)");
+        worstLate = std::max<uint64_t>(worstLate, f.result.t_trigger - due);
+        const double lo = table(f.result.t_trigger - tStart) - 10.0;
+        const double got = f.result.left.ch[0];
+        CHECK(got >= lo && got <= BAND_HI,
+              "C5 marker position = the ramp at the original phase");
+        CHECK(f.result.left.ch[1] >= ch1Lo && f.result.left.ch[1] <= ch1Hi,
+              "C5 marker latched the table(s) driving its exposure");
+      };
+
+      upload(TA, P, CH1_A, AT_A);
+      upload(TB, P, CH1_B, AT_B);
+      upload(TC, P / 2, CH1_C, AT_A); // different period
+      sim.ctl("strobe L 500 " + std::to_string(FALL));
+      sim.ctl("strobe R 700 " + std::to_string(FALL));
+
+      const size_t runMark = sim.lines.size();
+      const uint64_t T = mcuNow(wire) + 50'000;
+      auto st = startOp(TA, T, 0); // a: forever
+      expectOk(trajectoryOp(wire, &st, sizeof(st)), "C5 START a");
+      checkMarker(recvTrajectoryFrame(wire, 2000), TA, 0, T, "a cycle 0", CH1_A,
+                  CH1_A);
+
+      // a's cycle-0 capture is done (push in hand); the next trigger is
+      // ~30 ms away. Every START below must REJ and leave a running.
+      const std::string running = "A trajectory is already running";
+      st = startOp(TC, T, CYCLES_B);
+      CHECK(expectRejected(trajectoryOp(wire, &st, sizeof(st)),
+                           "C5 START c (period mismatch)")
+                    .find(running) == 0,
+            "C5 period mismatch keeps the 'already running' REJ");
+      st = startOp(TB, T + 1, CYCLES_B);
+      CHECK(expectRejected(trajectoryOp(wire, &st, sizeof(st)),
+                           "C5 START b (t_start + 1 us)")
+                    .find(running) == 0,
+            "C5 t_start mismatch (1 us) REJs");
+      st = startOp(TB, 0, CYCLES_B);
+      CHECK(expectRejected(trajectoryOp(wire, &st, sizeof(st)),
+                           "C5 START b (t_start 0 = now)")
+                    .find(running) == 0,
+            "C5 t_start 0 never swaps");
+      st = startOp(TA, T, CYCLES_B);
+      CHECK(expectRejected(trajectoryOp(wire, &st, sizeof(st)),
+                           "C5 START a (itself)")
+                    .find(running) == 0,
+            "C5 re-START of the running table REJs");
+
+      // Wait until a's cycle-1 marker has fired and its capture is in flight
+      // (strobe falls FALL after the trigger), then swap — BEFORE b's
+      // marker-0 phase of that same cycle.
+      uint64_t now = mcuNow(wire);
+      while (now < T + P + AT_A + 5'000) {
+        sleepMs(1);
+        now = mcuNow(wire);
+      }
+      CHECK(now < T + P + AT_B - 3'000,
+            "C5 fixture: the swap is sent while a's capture is in flight, "
+            "before b's marker phase");
+      // Every line read so far was emitted before the swap.
+      const size_t swapMark = sim.lines.size();
+
+      st = startOp(TB, T, CYCLES_B);
+      const uint16_t swapSeq = wire.next();
+      wire.send(setPacket(Protocol::Property::CMD_TRAJECTORY, swapSeq, &st,
+                          sizeof(st)));
+      // Raw receive: the ACK must come first, then a's in-flight push.
+      bool acked = false;
+      Cmd::TrajectoryFrame inflight{};
+      bool gotInflight = false;
+      while (!gotInflight) {
+        auto pkt = wire.recv(2000, true);
+        const auto h = pkt.validate();
+        if (Protocol::method(h) == Protocol::Method::SYN &&
+            Protocol::property(h) == Protocol::Property::LOG)
+          continue;
+        if (Protocol::method(h) == Protocol::Method::SYN) {
+          CHECK(Protocol::property(h) == Protocol::Property::CMD_TRAJECTORY,
+                "C5 unsolicited trajectory push");
+          CHECK(acked, "C5 a's in-flight push arrives AFTER the swap ACK");
+          inflight = payloadAs<Cmd::TrajectoryFrame>(pkt);
+          gotInflight = true;
+          continue;
+        }
+        CHECK(pkt.header().sequence == swapSeq, "C5 swap response sequence");
+        if (Protocol::method(h) != Protocol::Method::ACK)
+          throw std::runtime_error("CHECK failed: C5 swap START ACKed (got " +
+                                   payloadStr(pkt) + ")");
+        acked = true;
+      }
+      // Its exposure STRADDLES the swap: the rise latched a's position, the
+      // fall b's (same ramp; ch1 averages a's and b's).
+      checkMarker(inflight, TA, 1, T, "a's in-flight cycle 1",
+                  (CH1_A + CH1_B) / 2, (CH1_A + CH1_B) / 2);
+      CHECK(inflight.result.t_trigger < now,
+            "C5 the in-flight capture was triggered before the swap");
+      const auto before =
+          inBand(dacValues(sim, 'L', runMark, swapMark), BAND_LO, BAND_HI);
+      CHECK(!before.empty(), "C5 a drove the DAC before the swap");
+      const uint16_t lastBefore = before.back();
+
+      // b's markers continue the SAME cycle count on the same clock; b's
+      // marker 0 does NOT fire again in cycle 1 (a's marker 0 had).
+      for (uint32_t k = 2; k < CYCLES_B; k++) {
+        checkMarker(recvTrajectoryFrame(wire, 2000), TB, k, T, "b", CH1_B,
+                    CH1_B);
+        if (k == 2) { // between pushes: a period mismatch still REJs on b
+          st = startOp(TC, T, CYCLES_B);
+          CHECK(expectRejected(trajectoryOp(wire, &st, sizeof(st)),
+                               "C5 START c over b")
+                        .find(running) == 0,
+                "C5 period mismatch REJs while b runs");
+        }
+      }
+      const auto end = recvTrajectoryFrame(wire, 2000);
+      CHECK(end.status == Cmd::TrajectoryFrame::ENDED && end.id == TB &&
+                end.marker == Cmd::TrajectoryFrame::NO_MARKER &&
+                end.cycle == CYCLES_B,
+            "C5 b's budget (from the original t_start) ends the run");
+      CHECK(end.result.t_trigger == T + uint64_t(CYCLES_B) * P,
+            "C5 ENDED at t_start + cycles x period (original clock)");
+
+      // DAC: in band, advancing through the swap, b's table afterwards.
+      drain(sim);
+      const auto all = inBand(dacValues(sim, 'L', runMark), BAND_LO, BAND_HI);
+      const auto after = inBand(dacValues(sim, 'L', swapMark), BAND_LO, BAND_HI);
+      CHECK(!after.empty() && after.front() >= lastBefore,
+            "C5 the ramp keeps advancing across the swap (no phase reset)");
+      // Every decreasing run is a full wrap (high -> near-bottom): a phase
+      // reset at the swap (phase < 22 ms, ch0 < 15200) would start one low.
+      // One wrap per cycle boundary + the final hold at phase 0 (exempt from
+      // the "high" bound: a loop stall right before the end can clamp it
+      // early). The "high" bound leaves a sim stall of ~15 ms before a wrap
+      // harmless.
+      std::vector<std::pair<uint16_t, uint16_t>> steps; // (top, bottom)
+      for (size_t i = 1; i < all.size(); i++) {
+        if (all[i] >= all[i - 1])
+          continue;
+        const uint16_t top = all[i - 1];
+        while (i + 1 < all.size() && all[i + 1] < all[i])
+          i++;
+        steps.emplace_back(top, all[i]);
+      }
+      const unsigned wraps = unsigned(steps.size());
+      for (size_t i = 0; i < steps.size(); i++) {
+        const bool ok = steps[i].second <= 14'500 &&
+                        (i + 1 == steps.size() || steps[i].first >= 16'500);
+        if (!ok)
+          std::fprintf(stderr, "C5 backstep %u -> %u (#%zu of %zu)\n",
+                       unsigned(steps[i].first), unsigned(steps[i].second), i,
+                       steps.size());
+        CHECK(ok, "C5 the DAC only steps back at a cycle wrap");
+      }
+      CHECK(wraps == CYCLES_B, "C5 one wrap per cycle (no extra phase jump)");
+      const auto ch1 = dacValues(sim, 'L', swapMark);
+      const auto firstB = std::find(ch1.begin(), ch1.end(), CH1_B);
+      CHECK(firstB != ch1.end(), "C5 b's table plays after the swap");
+      CHECK(std::find(firstB, ch1.end(), CH1_A) == ch1.end(),
+            "C5 a never plays again after b took over");
+      CHECK(!hasValue(dacValues(sim, 'L', runMark), CH1_C),
+            "C5 the REJected table c never played");
+
+      // Cleanup: tables gone, strobes + stream state as C4 left them.
+      for (uint8_t id : {TA, TB, TC}) {
+        const auto del = trajectoryRef(Cmd::Trajectory::DELETE, id);
+        expectOk(trajectoryOp(wire, &del, sizeof(del)), "C5 DELETE");
+      }
+      sim.ctl("strobe L 500 2500");
+      sim.ctl("strobe R 700 2500");
+      const size_t backMark = sim.lines.size();
+      const uint16_t s = wire.next();
+      streamOp(wire, Cmd::MirrorStream::UPDATE, 1,
+               pos(4321, 22000, 32000, 42000), R0, s);
+      expectAck(wire, Protocol::Property::CMD_STREAM, s, "C5 stream hand-back");
+      bool back = false;
+      for (int i = 0; i < 100 && !back; i++) {
+        drain(sim);
+        back = hasValue(dacValues(sim, 'L', backMark), 4321);
+      }
+      CHECK(back, "C5 the streams drive the DAC again");
+      std::printf("fw-sim-check: C5 atomic swap a->b mid-capture (a's "
+                  "in-flight push after the ACK), cycles 0-%u contiguous on "
+                  "the original clock (worst +%llu us), %u wraps, 5 mismatched "
+                  "STARTs REJected OK\n",
+                  CYCLES_B - 1, static_cast<unsigned long long>(worstLate),
+                  wraps);
     }
     // ==== STAGE D — serial pipelining =========================================
     // The firmware side of "no ACK serialisation": loop() drains every

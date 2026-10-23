@@ -45,7 +45,11 @@ const char *mark(uint8_t id, uint8_t marker, Microseconds offset,
                  uint8_t cameras, Microseconds pulse);
 const char *commit(uint8_t id);
 // tStart == 0 -> now. cycles == 0 -> forever. Requires the system enabled
-// (checked by the caller, like every CMD_* handler).
+// (checked by the caller, like every CMD_* handler). While table `a` plays
+// (v2.2.1): START of a committed `id != a` with the same period and
+// `tStart` == a's recorded t_start (exact µs) is an ATOMIC SWAP — `id` takes
+// over in place with the same phase clock and marker crossing state, and
+// `cycles` replaces the budget; any other START while running REJs.
 const char *start(uint8_t id, Timestamp tStart, uint32_t cycles);
 const char *stop(uint8_t id);
 // Stops the table first if it is the running one. Deleting a free id is a

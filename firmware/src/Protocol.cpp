@@ -108,7 +108,7 @@ static void cancelPendingTrigger(const char *reason) {
   if (!trigger.pending)
     return;
   trigger.clear();
-  // The pulse was asserted on every camera's Line2 by the handler; a cancel
+  // The pulse was asserted on every camera's Line3 by the handler; a cancel
   // (System::Disable) must release them too or a trigger line stays HIGH
   // until the next legacy Trigger FINs.
   for (auto &cam : Board::camera)
@@ -308,9 +308,10 @@ HANDLE_SET(Command::Trigger) {
     reject(seq, "A trigger request is already pending");
     return;
   }
-  // Legacy all-camera pulse: asserts every camera's `trigger` (Line2 on the
-  // V0.1 board — C, L and R are all cabled). Never touches `strobe` (Line3 =
-  // VAUX) or the opto pair; those Pins are inputs and cannot be written.
+  // Legacy all-camera pulse: asserts every camera's `trigger` (Line3 on the
+  // V0.1 board — C, L and R are all cabled). Never touches `strobe` (Line2,
+  // the camera's open-drain ExposureActive output) or the opto pair; those
+  // Pins are inputs and cannot be written.
   for (auto &cam : Board::camera)
     cam.trigger.write(HIGH);
   trigger.start(seq, payload, Global::time.now() + payload.duration);
@@ -511,7 +512,7 @@ void Protocol::tick() {
   now = Global::time.now();
   if (trigger.ready(now)) {
     trigger.clear();
-    for (auto &cam : Board::camera) // release every Line2 trigger (C, L, R)
+    for (auto &cam : Board::camera) // release every Line3 trigger (C, L, R)
       cam.trigger.write(LOW);
     trigger.result.timestamp = now;
     auto packet = ::Packet::Command::Trigger::Create::FIN(trigger.seq);

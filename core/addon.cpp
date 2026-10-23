@@ -238,8 +238,9 @@ static Object init(Env env, Object exports) {
     Aravis.Set("scaleProbeAll",
                Function::New<Arv::scaleProbeAll>(env, "scaleProbeAll"));
     // mirror-link triangle flip: a pass-through copy of a convert pipe whose
-    // frames are cv::flip(…, 0)'d (rows reversed) iff matched (nearest within
-    // toleranceNs, PairStream root rule) to a marker anchor marked `flip`.
+    // frames are cv::flip(…, 0)'d (rows reversed) iff matched (nearest anchor
+    // EDGE — tStart or tEnd — within toleranceNs, PairStream root rule) to a
+    // marker anchor marked `flip`. Probe rows are all Numbers (JSON-safe).
     // docs/spec/core-streams.md#flip-stream
     Aravis.Set("attachFlipPipe",
                Function::New<Arv::attachFlipPipe>(env, "attachFlipPipe"));
