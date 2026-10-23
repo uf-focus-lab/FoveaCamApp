@@ -70,8 +70,12 @@ function makeTrajectoryHandle(id = 0) {
     get id() {
       return current;
     },
-    replace: vi.fn(async (_spec: TrajectorySpec) => {
+    /** What the next successful replace() reports as its swap kind. */
+    swapKind: "atomic" as "atomic" | "stop-start",
+    lastSwap: null as "atomic" | "stop-start" | null,
+    replace: vi.fn(async function (this: { swapKind: "atomic" | "stop-start"; lastSwap: unknown }, _spec: TrajectorySpec) {
       current += 1;
+      this.lastSwap = this.swapKind;
     }),
     start: vi.fn(async (_at?: bigint, _cycles?: number) => {}),
     stop: vi.fn(async () => {}),
@@ -1009,5 +1013,34 @@ describe("NodeTrajectory.replace", () => {
     expect(t.state).toBe("running");
     await t.close();
     await input.close();
+  });
+
+  it("reports the last swap kind and scores a retired table's straggler against ITS spec", async () => {
+    node = new ControllerNode();
+    const c = makeController();
+    node.bindController(c as never);
+    const t = await node.openTrajectory(SPEC, { name: "ml" });
+    expect(node.trajectorySnapshot()!.lastSwap).toBeNull();
+    const startNs = 2_000_000_000n;
+    await t.start(startNs);
+    const h = c.trajectories[0]!;
+    await t.replace(RESHAPED); // 0 -> 1, atomic
+    expect(node.trajectorySnapshot()).toMatchObject({ id: 1, lastSwap: "atomic" });
+
+    // An in-flight capture of the OLD table (id 0, marker 1 at 7 000 µs in
+    // SPEC — RESHAPED has no marker 1) lands after the swap, inside the
+    // grace: scored against SPEC.
+    const late = expectedTriggerNs(startNs, 3, 10_000, 7_000) + 20_000n;
+    h.push({ trajectoryId: 0, marker: 1, cycle: 3, tTrigger: late });
+    expect(node.trajectorySnapshot()!.lastLatenessUs).toBe(20);
+    // The new table's pushes score against RESHAPED (marker 0 at 4 000 µs).
+    h.push({ marker: 0, cycle: 4, tTrigger: expectedTriggerNs(startNs, 4, 10_000, 4_000) + 5_000n });
+    expect(node.trajectorySnapshot()!.lastLatenessUs).toBe(5);
+
+    h.swapKind = "stop-start";
+    await t.replace(SPEC);
+    expect(node.trajectorySnapshot()!.lastSwap).toBe("stop-start");
+    await t.stop();
+    await t.close();
   });
 });

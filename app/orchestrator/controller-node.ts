@@ -25,7 +25,9 @@ import type {
   TrajectoryFrameOutcome,
   TrajectoryHandle,
   TrajectorySpec,
+  TrajectorySwapKind,
 } from "./controller.js";
+import { trajectoryGraceUs } from "./trajectory-grace.js";
 import type { StreamType } from "@lib/orchestrator/graph-contract.js";
 import type { TrajectoryStat } from "@lib/orchestrator/contracts.js";
 import { nodeId } from "@lib/orchestrator/graph-contract.js";
@@ -154,7 +156,10 @@ export interface NodeTrajectory {
    *  stay held, pushes keep flowing on this handle. From `ready` it is a plain
    *  re-upload. Throws when detached/closed/uploading, or on a period change
    *  while running (stop first). The new spec is what `reupload()` sends;
-   *  `reuploads` in the stats row counts successful swaps. Calls made while
+   *  `reuploads` in the stats row counts successful swaps and `lastSwap`
+   *  says whether the last running one was atomic (firmware 2.2.1) or the
+   *  STOP/START pair. Pushes from the retired table during its grace still
+   *  arrive here (scored against the retired spec). Calls made while
    *  a swap is in flight COALESCE (latest spec wins, sent once the in-flight
    *  swap lands; every coalesced caller settles with it). `stop()` waits for
    *  in-flight + pending swaps; `close()` rejects the pending one and waits
@@ -1029,6 +1034,10 @@ class NodeTrajectoryImpl implements NodeTrajectory {
   private readonly statusCounts: Record<string, number> = {};
   private heldPushes = 0;
   private reuploads = 0;
+  private lastSwap: TrajectorySwapKind | null = null;
+  /** The table the last swap retired, while its grace runs: its straggler
+   *  pushes (a capture in flight at the swap) are scored against ITS spec. */
+  private retired: { id: number; spec: TrajectorySpec; untilNs: bigint } | null = null;
   // replace(): ONE swap in flight; further calls COALESCE into a single
   // pending batch whose spec is the latest one (every coalesced caller
   // resolves/rejects with that batch). `replacingSpec` is the in-flight
@@ -1274,6 +1283,8 @@ class NodeTrajectoryImpl implements NodeTrajectory {
   private async runReplace(spec: TrajectorySpec): Promise<void> {
     this.assertReplaceable(spec); // re-checked: a coalesced batch runs later
     const h = this.handle!;
+    const oldId = h.id;
+    const oldSpec = this.spec;
     this.replacingSpec = spec;
     try {
       await h.replace(spec);
@@ -1290,6 +1301,13 @@ class NodeTrajectoryImpl implements NodeTrajectory {
     // what reupload() sends and what lateness is scored against.
     this.spec = spec;
     this.reuploads++;
+    this.lastSwap = h.lastSwap ?? this.lastSwap;
+    if (h.id !== oldId)
+      this.retired = {
+        id: oldId,
+        spec: oldSpec,
+        untilNs: hostNowNs() + BigInt(trajectoryGraceUs(oldSpec)) * 1000n,
+      };
   }
 
   /** Wait until no replace is in flight or pending (errors are the callers'). */
@@ -1342,9 +1360,17 @@ class NodeTrajectoryImpl implements NodeTrajectory {
       if (f.cycle + 1 > this.cyclesSeen) this.cyclesSeen = f.cycle + 1;
     }
     if (f.status === "OK" && f.marker !== null) {
-      // Mid-swap, pushes from the NEW table belong to the in-flight spec.
+      // A straggler from the table the last swap retired (in its grace)
+      // belongs to that table's spec; mid-swap, pushes from the NEW table
+      // belong to the in-flight spec.
+      const current = f.trajectoryId === this.handle?.id;
+      const retired = this.retired;
       const spec =
-        this.replacingSpec && f.trajectoryId !== this.handle?.id ? this.replacingSpec : this.spec;
+        !current && retired && f.trajectoryId === retired.id && hostNowNs() <= retired.untilNs
+          ? retired.spec
+          : !current && this.replacingSpec
+            ? this.replacingSpec
+            : this.spec;
       const marker = spec.markers?.[f.marker];
       if (marker && this.startHostNs !== null)
         this.lastLatenessUs =
@@ -1389,6 +1415,7 @@ class NodeTrajectoryImpl implements NodeTrajectory {
       latenessExact: this.startExact,
       heldPushes: this.heldPushes,
       reuploads: this.reuploads,
+      lastSwap: this.lastSwap,
     };
   }
 }
