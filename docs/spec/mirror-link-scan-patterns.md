@@ -284,3 +284,52 @@ noted) and found the following, fixed in round 2:
   Host docs say "never doubled; a marker moved before the swap phase first
   fires next cycle" rather than "no missed marker". The BUSY-after-a-missed-
   strobe behaviour when the post-window gap is under 5 ms is documented.
+
+## Review round 3 (2026-10-23) — findings and decisions
+
+Four reviews on 98479ad re-verified every round-2 fix (all hold; one manual
+table had drifted and is realigned at b2cbc14). Fixed in round 3:
+
+- **Flip tolerance hysteresis.** The live rebuild rule "rebuild only when the
+  new tolerance is smaller" left a tightened tolerance in force forever (a
+  window dragged close and back kept a 450 µs tolerance below the 1 ms floor
+  with `mismatch` cleared) and rebuilt the bricks on every throttled replace
+  while a window grew. Decision: the bricks are rebuilt when the tolerance in
+  force is UNSAFE or STALE — tighter when it exceeds the new cap (0.45 × edge
+  gap, the no-mis-flip guarantee), wider when it is below the floor while the
+  floor fits under the new cap, or below half the new tolerance. In between
+  the bricks keep their value (`flip_tolerance_us` shows it). `tooClose`
+  follows the rule, not the brick.
+- **Teardown is exception-safe per step:** a throwing vergence stop or scan
+  stop never skips the camera restore or the gain restore (try/finally per
+  step, each failure reported); the ring-enable / ring-telemetry steps inside
+  the scan stop are best-effort.
+- **`scan.amp_deg` is the RUNNING amplitude** (held with the run's spec), not
+  the edited one — a failed replace leaves it at the value the MCU plays.
+- **Node `close()`/`stop()` vs late replaces:** a `replace()` issued after
+  `close()` was requested is refused; `stop()` waits only for the in-flight
+  swap and the batch pending on entry, never for replaces issued after it.
+- **Simulator harness:** C3/C5/C6 position lower bound from the marker's DUE
+  phase (`table(due) − 10`), not from `t_trigger` (read later, under a live
+  clock); C6a re-checks the MCU time after the swap ACK and prints the first
+  push's fields on failure; new C6c covers a swap during the ARMED window
+  (keeps pre-positioning at b's phase 0) and a swap whose `cycles` is already
+  spent (ENDED on the next tick, phase-0 hold).
+- **Firmware:** `Streams::tick` never writes under TRAJECTORY ownership before
+  the run's first `drive()` (a `touch()` landing between START and the first
+  tick no longer re-drives a stale position); `firstDrive` lives with the rest
+  of the DAC state in the anonymous namespace. `Command::Actuate` and the
+  legacy `Command::Trigger` are REJected while a trajectory runs ("trajectory
+  owns the DAC" / "trajectory owns the trigger lines"), like UPDATE/SCHEDULE.
+- **Tests added for stated guarantees:** tighten-then-widen tolerance;
+  teardown with a throwing step; dispose with an ambiguous sibling; a plain
+  re-upload retiring a sibling; `createFlipPipe` un-advertising on attach
+  failure; `buildFlips` all-or-nothing (second eye fails → first retired);
+  close-then-replace refused; stop not starved by later replaces.
+- **Docs/comments:** `#replace` in this brief points at `controller.md`
+  (atomic first, pair as fallback); "no missed marker" wording in
+  `controller.ts` / `contracts.ts`; `flip-pipe.ts` tolerance basis; the spec's
+  readout row says "below the readout time (`SensorReadoutTime`, else
+  `1 / frame_rate_range.max`)"; UI: sliders bind `disabled || undefined`
+  (Vue wrote `disabled="false"` on a `<div>`, dimming every slider); the axis
+  slider clamps a handle-dragged angle on read.
