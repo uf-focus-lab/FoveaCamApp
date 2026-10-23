@@ -333,3 +333,45 @@ table had drifted and is realigned at b2cbc14). Fixed in round 3:
   `1 / frame_rate_range.max`)"; UI: sliders bind `disabled || undefined`
   (Vue wrote `disabled="false"` on a `<div>`, dimming every slider); the axis
   slider clamps a handle-dragged angle on read.
+
+## Review round 4 (2026-10-23) — findings and decisions
+
+Four reviews on 4b7f241 re-verified every round-3 fix (all hold) and found no
+blockers. Fixed in round 4:
+
+- **Identical-spec edits re-judge the windows:** in the Timed fallback a
+  falling-END edit builds the same MCU spec; `replaceNow`'s early return now
+  still refreshes the requested windows the mismatch checks read (the
+  unequal-windows reason appears and clears without a replace).
+- **Teardown reports a throwing scan stop** (not only the op chain's log).
+- **Node `detach()` forgets the retired ids** (the next device may hand one
+  out again).
+- **Status line amber on a STALLED run:** `perf.trajectory.stalled` is true
+  while no OK push has arrived for `NO_OK_PERIODS` (2) periods of an active
+  run (the no-OK watchdog's condition, re-evaluated at the telemetry
+  throttle; false again on the next OK push); the status line turns amber on
+  it, not only when no push ever succeeded. The manual's "when the cameras
+  stop answering the trigger" is then true.
+- **Axis domain is the slider's:** `setAxis` folds an angle in
+  (−180, −179.5) to −179.5, so the state never holds a value the slider
+  cannot show (the readout never prints −180.0°, ArrowLeft never turns the
+  axis the wrong way); the pane's read clamp stays as a guard.
+- **Disabled RangeSlider never lights up on a click:** no tabindex while
+  disabled (as the dual slider), focus/active rules guarded by
+  `:not([disabled])`.
+- **Firmware:** `Streams::claim()` seeds the trajectory drive position with
+  the DAC's last written value (a START immediately followed by STOP/DELETE
+  in one loop iteration no longer HOLDs a stale position); an Actuate under
+  HOLD moves the hold position (it no longer snaps back at the next 1 Hz
+  refresh — C4 checks past the refresh); a trajectory START is REJected
+  while a legacy Trigger is pending ("A trigger is pending (legacy Trigger)
+  — wait for its FIN"), the host classifies the text as a plain REJ; the
+  harness exercises the `firstDrive` guard with START + MEMS reset in one
+  burst; `Version.h` and `docs/architecture/serial-protocol.md` list the
+  2.2.1 Actuate/Trigger/START refusals.
+- **Docs:** manual's overrun remedy is "lower Scan Frequency" (a shorter
+  window never clears it); the spec's swap fallback wording ("REJ 'already
+  running'", not any REJ); `rig.md` triangle Timed note (unequal windows
+  only); `core-streams.md` notes the hysteresis band (the brick's tolerance
+  may differ from the formula after a live window change; round 3);
+  contract comments (`shift` ±2°, `frame_rate` is a readback).
