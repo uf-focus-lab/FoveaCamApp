@@ -34,8 +34,8 @@
 //      a run plays, START REJ while a legacy Trigger is pending; an Actuate
 //      in HOLD moves the hold position (past the 1 Hz refresh); STOP holds
 //      position; a START + MEMS reset burst still starts at phase 0; START +
-//      STOP in one loop iteration holds the DAC's actual position; DAC
-//      returns to the streams.
+//      STOP in one loop iteration holds the DAC's actual position, and right
+//      after a MEMS reset holds V_BIAS; DAC returns to the streams.
 //   C5 (v2.2.1): CMD_TRAJECTORY atomic swap — START b at a's t_start while a
 //      runs (same period) switches tables in place: mismatched period /
 //      t_start / a itself REJ with a still running; a's in-flight capture
@@ -600,18 +600,50 @@ static void expectAckOf(Wire &wire, Protocol::Property p, uint16_t seq,
 // runs ONCE more after `recover` restores its entry state. The first failure
 // is logged ("retrying once"), so a load flake stays visible; a deterministic
 // firmware fault fails both attempts.
+//
+// A FIXTURE miss is different: the HOST was too slow to act inside a timing
+// window the scenario needs (send a swap between two marker phases, sample
+// before t_start), so the scenario never ran as designed and nothing about
+// the firmware was observed. A miss found before acting re-syncs in place to
+// the next cycle's window (fixtureWindow); one found only afterwards throws
+// FixtureMiss and the stage re-runs. Either way at most FIXTURE_REARMS times
+// per window/stage, each logged ("re-arming") and counted; firmware-fault
+// checks stay strict and keep the single retry.
+struct FixtureMiss : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+constexpr unsigned FIXTURE_REARMS = 5;
+static unsigned stageRetries = 0, fixtureRearms = 0; // reported at the end
+
+static void noteRearm(const std::string &what, unsigned miss) {
+  if (miss >= FIXTURE_REARMS)
+    throw std::runtime_error("CHECK failed: " + what + " (host missed the "
+                             "window " + std::to_string(miss + 1) + " times)");
+  fixtureRearms++;
+  std::printf("fw-sim-check: fixture miss %u/%u (%s); re-arming\n", miss + 1,
+              FIXTURE_REARMS, what.c_str());
+  std::fflush(stdout);
+}
+
 template <typename Body, typename Recover>
 static void retryOnce(const char *stage, Body body, Recover recover) {
-  try {
-    body();
-    return;
-  } catch (const std::runtime_error &e) {
-    std::printf("fw-sim-check: %s attempt 1 failed (%s); retrying once\n",
-                stage, e.what());
-    std::fflush(stdout);
+  bool retried = false;
+  for (unsigned misses = 0;; recover()) {
+    try {
+      body();
+      return;
+    } catch (const FixtureMiss &e) {
+      noteRearm(std::string(stage) + ": " + e.what(), misses++);
+    } catch (const std::runtime_error &e) {
+      if (retried)
+        throw;
+      retried = true;
+      stageRetries++;
+      std::printf("fw-sim-check: %s attempt failed (%s); retrying once\n",
+                  stage, e.what());
+      std::fflush(stdout);
+    }
   }
-  recover();
-  body();
 }
 
 // Swallows every frame until the wire has been quiet for `quietMs`.
@@ -871,25 +903,29 @@ int main() {
       CHECK(before.fin.t_exposure < tApply, "pre-apply frame exposed early");
       CHECK(before.fin.left.ch[0] == 12000, "pre-apply frame: old target");
 
-      // Poll the MCU clock: the keyframe's DAC word is absent at every
-      // reading well before t_apply and present at the first one well after.
-      // Absence is the SOUND direction: a word emitted before reading t is
-      // already in the stdout pipe when t's ACK arrives, so `lastAbsent`
-      // bounds the apply instant from below (presence only bounds it by the
-      // drain time, hence the 20 ms margins).
+      // Poll the MCU clock, draining after each reading t. Absence is
+      // checked against t: a word emitted before t is already in the stdout
+      // pipe when t's ACK arrives, so `lastAbsent` bounds the apply instant
+      // from below. Presence is checked against the NEXT reading t': that
+      // drain ran before the GET for t' was sent, so a word it saw was
+      // emitted before t' — present with t' < t_apply is an early apply
+      // whatever the host's latency (no margin: a correct apply has
+      // t' > t_apply).
       int64_t lastAbsent = 0;
+      bool sawPresent = false; // the previous reading's drain had the word
       while (true) {
         const uint64_t t = mcuNow(wire);
+        CHECK(!(sawPresent && t < tApply),
+              "keyframe not applied early (MCU clock)");
         drain(sim);
         const bool present = hasValue(dacValues(sim, 'L', mark), 15151);
         if (!present)
           lastAbsent = int64_t(t) - int64_t(tApply);
-        if (t + 20'000 < tApply)
-          CHECK(!present, "keyframe not applied early (MCU clock)");
         if (t > tApply + 20'000) {
           CHECK(present, "keyframe applied by t_apply + 20 ms (MCU clock)");
           break;
         }
+        sawPresent = present;
         sleepMs(2);
       }
       const auto after = runFrame(wire, 1, 2000, 0);
@@ -918,6 +954,10 @@ int main() {
         sleepMs(2);
       const auto mid = runFrame(wire, 1, 2000, 0);
       CHECK(mid.finished, "mid-ramp frame completes");
+      // Its exposure (trigger + 500..2500 us) must lie on the ramp; a host
+      // descheduled past t_B sent it too late to probe the ramp at all.
+      if (mid.fin.t_trigger + 2500 >= tB)
+        throw FixtureMiss("mid-ramp frame triggered past t_B (host stall)");
       // Exposure average ~ the ramp at trigger + 1500 us (injected strobe
       // rise +500, fall +2500).
       const double frac =
@@ -1372,6 +1412,86 @@ int main() {
       CHECK(!hasValue(v, 30000) && !hasValue(v, 0) &&
                 inBand(v, 1000, 3400).empty(),
             "START+STOP in one iteration holds the DAC's actual position");
+      // Hand the DAC back to stream 1 (same target).
+      mark = sim.lines.size();
+      s = wire.next();
+      streamOp(wire, Cmd::MirrorStream::UPDATE, 1,
+               pos(4321, 22000, 32000, 42000), R0, s);
+      expectAck(wire, Protocol::Property::CMD_STREAM, s, "UPDATE after HOLD");
+      back = false;
+      for (int i = 0; i < 100 && !back; i++) {
+        drain(sim);
+        back = hasValue(dacValues(sim, 'L', mark), 4321);
+      }
+      CHECK(back, "stream UPDATE drives the DAC again after the HOLD");
+      (void)mcuNow(wire); // that write's remaining words: out by this ACK
+      drain(sim);
+
+      // A MEMS recovery (SYS_RESET MEMS) re-inits every channel to V_BIAS, so
+      // a START (future t_start) + STOP in the SAME loop iteration right
+      // after it holds V_BIAS: claim() seeds Global::bias_voltage because
+      // Streams::noteReinit() forgot the last write. The 1 Hz refresh then
+      // re-commits the bias on all four channels of both mirrors — not the
+      // stream's pre-reset position (L ch0 4321, R = R0: the last DAC write)
+      // and not zeros. The reset's own bias word is a CH::ALL broadcast,
+      // which carriesValue() skips, so every per-channel word in the window
+      // is a refresh write.
+      constexpr uint16_t BIAS = 30000; // stage 2's staged CFG_BIAS
+      mark = sim.lines.size();
+      {
+        Cmd::TrajectoryStart fut = st;
+        fut.t_start = mcuNow(wire) + 500'000;
+        fut.cycles = 1;
+        std::vector<uint8_t> burst;
+        System::Reset rst{};
+        rst.type = System::Reset::MEMS;
+        const uint16_t sReset = wire.next();
+        appendFrame(wire,
+                    setPacket(Protocol::Property::SYS_RESET, sReset, &rst,
+                              sizeof(rst)),
+                    burst);
+        const uint16_t sStart = wire.next();
+        appendFrame(wire,
+                    setPacket(Protocol::Property::CMD_TRAJECTORY, sStart, &fut,
+                              sizeof(fut)),
+                    burst);
+        const uint16_t sStop = wire.next();
+        appendFrame(wire,
+                    setPacket(Protocol::Property::CMD_TRAJECTORY, sStop, &stop,
+                              sizeof(stop)),
+                    burst);
+        sendBurst(wire, burst);
+        expectAckOf(wire, Protocol::Property::SYS_RESET, sReset,
+                    "MEMS reset (burst with START + STOP)");
+        expectAckOf(wire, Protocol::Property::CMD_TRAJECTORY, sStart,
+                    "START after the MEMS reset");
+        expectAckOf(wire, Protocol::Property::CMD_TRAJECTORY, sStop,
+                    "STOP in the reset burst");
+      }
+      sleepMs(1200);
+      drain(sim);
+      {
+        bool wrote[2][4] = {}; // [L, R][channel] got a per-channel word
+        for (size_t i = mark; i < sim.lines.size(); i++) {
+          DacWord w;
+          if (!parseDac(sim.lines[i], w) || !carriesValue(w))
+            continue;
+          if (w.value != BIAS)
+            std::fprintf(stderr,
+                         "C4 reset hold: %s ch%u written %u, want %u\n",
+                         w.left ? "L" : "R", unsigned(w.addr),
+                         unsigned(w.value), unsigned(BIAS));
+          CHECK(w.value == BIAS,
+                "a START+STOP right after a MEMS reset holds V_BIAS (not the "
+                "pre-reset position, not zeros)");
+          wrote[0][w.addr] |= w.left;
+          wrote[1][w.addr] |= w.right;
+        }
+        for (const auto &side : wrote)
+          for (bool ch : side)
+            CHECK(ch, "the refresh re-commits V_BIAS on every channel of "
+                      "both mirrors");
+      }
       // Hand the DAC back to stream 1 (same target) for the later stages.
       s = wire.next();
       streamOp(wire, Cmd::MirrorStream::UPDATE, 1,
@@ -1384,8 +1504,8 @@ int main() {
                            "START deleted")
                     .find("Unknown trajectory") != std::string::npos,
             "deleted table is gone");
-      std::printf("fw-sim-check: C4 HOLD/STOP (held %u) + DAC hand-back + "
-                  "DELETE OK\n",
+      std::printf("fw-sim-check: C4 HOLD/STOP (held %u) + reset hold at V_BIAS "
+                  "+ DAC hand-back + DELETE OK\n",
                   unsigned(held));
     }
     // C5/C6 — v2.2.1 ATOMIC SWAP, shared fixture. Every table has the same
@@ -1470,6 +1590,26 @@ int main() {
           now = mcuNow(wire);
         }
         return now;
+      };
+      // Waits for phase `from` of `cycle` of a forever run started at T and
+      // returns the MCU time, read inside [from, before) of `cycle`. A reading
+      // at/after `before` means the host was descheduled past the window
+      // before acting (nothing was sent): re-sync to the first later cycle
+      // whose window is still ahead (`cycle` is advanced; the run plays on
+      // unchanged, and waitMcu's GETs swallow the skipped cycles' marker
+      // pushes).
+      auto fixtureWindow = [&](uint64_t T, uint32_t &cycle, uint32_t from,
+                               uint32_t before, const std::string &what) {
+        for (unsigned miss = 0;; miss++) {
+          const uint64_t base = T + uint64_t(cycle) * P;
+          const uint64_t now = waitMcu(base + from);
+          if (now < base + before)
+            return now;
+          noteRearm(what + " — read at cycle " + std::to_string(cycle) +
+                        " phase " + std::to_string(now - base) + " us",
+                    miss);
+          cycle = uint32_t((now - T - from) / P) + 1;
+        }
       };
       // One marker push on the ORIGINAL phase clock: identity, never early,
       // on phase, and the exposure-averaged position is the ramp over the
@@ -1674,6 +1814,7 @@ int main() {
         constexpr uint32_t PULSE = 32'000; // marker pulse
         constexpr uint32_t FALL = 26'000;  // injected strobe fall
         constexpr uint32_t CYCLES_B = 6;   // b's budget (from t_start)
+        uint32_t sc = 1; // the swap cycle (later if the host misses cycle 1)
         auto c5Marker = [&](const Cmd::TrajectoryFrame &f, uint8_t id,
                             uint32_t cycle, uint64_t tStart, const char *what,
                             uint16_t ch1Lo, uint16_t ch1Hi) {
@@ -1717,17 +1858,19 @@ int main() {
                       .find(running) == 0,
               "C5 re-START of the running table REJs");
 
-        // Wait until a's cycle-1 marker has fired and its capture is in
+        // Wait until a's cycle-sc marker has fired and its capture is in
         // flight (strobe falls FALL after the trigger), then swap — BEFORE
         // b's marker-0 phase of that same cycle.
-        const uint64_t now = waitMcu(T + P + AT_A + 5'000);
-        CHECK(now < T + P + AT_B - 3'000,
-              "C5 fixture: the swap is sent while a's capture is in flight, "
-              "before b's marker phase");
+        const uint64_t now =
+            fixtureWindow(T, sc, AT_A + 5'000, AT_B - 3'000,
+                          "C5: the swap is sent while a's capture is in "
+                          "flight, before b's marker phase");
+        // b keeps CYCLES_B - 2 cycles after the swap cycle.
+        const uint32_t cyclesB = CYCLES_B + (sc - 1);
         // Every line read so far was emitted before the swap.
         const size_t swapMark = sim.lines.size();
 
-        st = startOp(TB, T, CYCLES_B);
+        st = startOp(TB, T, cyclesB);
         const uint16_t swapSeq = wire.next();
         wire.send(setPacket(Protocol::Property::CMD_TRAJECTORY, swapSeq, &st,
                             sizeof(st)));
@@ -1758,17 +1901,17 @@ int main() {
         }
         // Its exposure STRADDLES the swap: the rise latched a's position, the
         // fall b's (same ramp; ch1 averages a's and b's).
-        c5Marker(inflight, TA, 1, T, "a's in-flight cycle 1",
+        c5Marker(inflight, TA, sc, T, "a's in-flight swap cycle",
                  (CH1_A + CH1_B) / 2, (CH1_A + CH1_B) / 2);
         CHECK(inflight.result.t_trigger < now,
               "C5 the in-flight capture was triggered before the swap");
 
         // b's markers continue the SAME cycle count on the same clock; b's
-        // marker 0 does NOT fire again in cycle 1 (a's marker 0 had).
-        for (uint32_t k = 2; k < CYCLES_B; k++) {
+        // marker 0 does NOT fire again in the swap cycle (a's marker 0 had).
+        for (uint32_t k = sc + 1; k < cyclesB; k++) {
           c5Marker(recvTrajectoryFrame(wire, 2000), TB, k, T, "b", CH1_B,
                    CH1_B);
-          if (k == 2) { // between pushes: a period mismatch still REJs on b
+          if (k == sc + 1) { // between pushes: a period mismatch still REJs
             st = startOp(TC, T, CYCLES_B);
             CHECK(expectRejected(trajectoryOp(wire, &st, sizeof(st)),
                                  "C5 START c over b")
@@ -1776,8 +1919,8 @@ int main() {
                   "C5 period mismatch REJs while b runs");
           }
         }
-        expectEnded(TB, CYCLES_B, T, "C5");
-        const unsigned wraps = checkRamp(runMark, swapMark, CYCLES_B, "C5");
+        expectEnded(TB, cyclesB, T, "C5");
+        const unsigned wraps = checkRamp(runMark, swapMark, cyclesB, "C5");
         CHECK(!hasValue(dacValues(sim, 'L', runMark), CH1_C),
               "C5 the REJected table c never played");
         cleanup("C5");
@@ -1785,7 +1928,7 @@ int main() {
                     "in-flight push after the ACK), cycles 0-%u contiguous on "
                     "the original clock (worst +%llu us), %u wraps, 5 "
                     "mismatched STARTs REJected OK\n",
-                    CYCLES_B - 1, static_cast<unsigned long long>(worstLate),
+                    cyclesB - 1, static_cast<unsigned long long>(worstLate),
                     wraps);
       }, recover);
 
@@ -1817,23 +1960,26 @@ int main() {
         expectOk(trajectoryOp(wire, &st, sizeof(st)), "C6a START a");
         checkMarker(recvTrajectoryFrame(wire, 2000), TA, 0, 0, T, A_AT,
                     "C6a a cycle 0", CH1_A, CH1_A);
-        const uint64_t now = waitMcu(T + P + B_AT + 3'000);
-        CHECK(now < T + P + A_AT - 3'000,
-              "C6a fixture: the swap is sent in cycle 1 after b's marker "
-              "phase and before a's");
+        uint32_t sc = 1; // the swap cycle
+        fixtureWindow(T, sc, B_AT + 3'000, A_AT - 3'000,
+                      "C6a: the swap is sent after b's marker phase and "
+                      "before a's");
+        const uint32_t cycles = CYCLES6 + (sc - 1); // b's budget
+        const uint64_t cycleT = T + uint64_t(sc) * P;
         const size_t swapMark = sim.lines.size();
-        swapIdle(startOp(TB, T, CYCLES6), "C6a");
+        swapIdle(startOp(TB, T, cycles), "C6a");
         // MCU time after the ACK bounds when the swap was handled: still
-        // before a's cycle-1 marker phase, or a's marker may have fired first
-        // (its push follows the ACK) — a host stall, not a firmware fault.
+        // before a's swap-cycle marker phase, or a's marker may have fired
+        // first (its push follows the ACK) — a host stall, not a firmware
+        // fault.
         const uint64_t acked = mcuNow(wire);
-        if (acked >= T + P + A_AT)
-          throw std::runtime_error(
-              "C6a FIXTURE: the swap ACK came at cycle-1 phase " +
-              std::to_string(acked - T - P) + " us, past a's marker (" +
-              std::to_string(A_AT) + " us) — host stall");
+        if (acked >= cycleT + A_AT)
+          throw FixtureMiss("the swap ACK came at swap-cycle phase " +
+                            std::to_string(acked - cycleT) +
+                            " us, past a's marker (" + std::to_string(A_AT) +
+                            " us) — host stall");
         const auto first = recvTrajectoryFrame(wire, 2000);
-        if (!(first.cycle == 2 && first.result.t_trigger >= T + 2 * P))
+        if (!(first.cycle == sc + 1 && first.result.t_trigger >= cycleT + P))
           std::fprintf(stderr,
                        "C6a first push after the swap: id %u marker %u cycle "
                        "%u status %u t_trigger T%+lld us\n",
@@ -1841,15 +1987,16 @@ int main() {
                        unsigned(first.cycle), unsigned(first.status),
                        static_cast<long long>(first.result.t_trigger) -
                            static_cast<long long>(T));
-        CHECK(first.cycle == 2 && first.result.t_trigger >= T + 2 * P,
+        CHECK(first.cycle == sc + 1 && first.result.t_trigger >= cycleT + P,
               "C6a b's earlier marker first fires NEXT cycle (not late in "
               "the swap cycle)");
-        checkMarker(first, TB, 0, 2, T, B_AT, "C6a b cycle 2", CH1_B, CH1_B);
-        for (uint32_t k = 3; k < CYCLES6; k++)
+        checkMarker(first, TB, 0, sc + 1, T, B_AT, "C6a b after the swap",
+                    CH1_B, CH1_B);
+        for (uint32_t k = sc + 2; k < cycles; k++)
           checkMarker(recvTrajectoryFrame(wire, 2000), TB, 0, k, T, B_AT,
                       "C6a b", CH1_B, CH1_B);
-        expectEnded(TB, CYCLES6, T, "C6a");
-        checkRamp(runMark, swapMark, CYCLES6, "C6a");
+        expectEnded(TB, cycles, T, "C6a");
+        checkRamp(runMark, swapMark, cycles, "C6a");
         cleanup("C6a");
       }, recover);
       // C6b — b with MORE markers than a. a = {m0 @10 ms}, b = {m0 @10 ms,
@@ -1871,22 +2018,23 @@ int main() {
         for (uint32_t k = 0; k < 2; k++)
           checkMarker(recvTrajectoryFrame(wire, 2000), TA, 0, k, T, M0,
                       "C6b a", CH1_A, CH1_A);
-        const uint64_t now = waitMcu(T + P + M0 + FALL6 + 2'000);
-        CHECK(now < T + P + 28'000,
-              "C6b fixture: the swap is sent in cycle 1 after a's marker "
-              "finished and before b's extra marker phase");
+        uint32_t sc = 1; // the swap cycle
+        fixtureWindow(T, sc, M0 + FALL6 + 2'000, 28'000,
+                      "C6b: the swap is sent after a's marker finished and "
+                      "before b's extra marker phase");
+        const uint32_t cycles = CYCLES6 + (sc - 1); // b's budget
         const size_t swapMark = sim.lines.size();
-        swapIdle(startOp(TB, T, CYCLES6), "C6b");
-        checkMarker(recvTrajectoryFrame(wire, 2000), TB, 1, 1, T, M1,
+        swapIdle(startOp(TB, T, cycles), "C6b");
+        checkMarker(recvTrajectoryFrame(wire, 2000), TB, 1, sc, T, M1,
                     "C6b b's extra marker 1 in the swap cycle", CH1_B, CH1_B);
-        for (uint32_t k = 2; k < CYCLES6; k++) {
+        for (uint32_t k = sc + 1; k < cycles; k++) {
           checkMarker(recvTrajectoryFrame(wire, 2000), TB, 0, k, T, M0,
                       "C6b b marker 0", CH1_B, CH1_B);
           checkMarker(recvTrajectoryFrame(wire, 2000), TB, 1, k, T, M1,
                       "C6b b marker 1", CH1_B, CH1_B);
         }
-        expectEnded(TB, CYCLES6, T, "C6b");
-        checkRamp(runMark, swapMark, CYCLES6, "C6b");
+        expectEnded(TB, cycles, T, "C6b");
+        checkRamp(runMark, swapMark, cycles, "C6b");
         cleanup("C6b");
       }, recover);
       // C6c — the two remaining documented swap guarantees
@@ -1936,9 +2084,9 @@ int main() {
         drain(sim);
         const size_t preMark = sim.lines.size();
         if (armedNow >= T - 15'000)
-          throw std::runtime_error("C6c FIXTURE: armed window sampled at T" +
-                                   std::to_string(int64_t(armedNow - T)) +
-                                   " us — host stall");
+          throw FixtureMiss("armed window sampled at T" +
+                            std::to_string(int64_t(armedNow - T)) +
+                            " us — host stall");
         const auto armed = afterB(swapMark, preMark, "C6c armed");
         CHECK(!armed.empty(), "C6c armed: b's phase 0 is driven");
         for (auto x : armed)
@@ -1957,14 +2105,11 @@ int main() {
         T = mcuNow(wire) + 50'000;
         st = startOp(TA, T, 0); // a: forever
         expectOk(trajectoryOp(wire, &st, sizeof(st)), "C6c spent START a");
-        const uint64_t now = waitMcu(T + 2 * P + 15'000);
-        if (now >= T + 2 * P + LATE_AT - 10'000)
-          throw std::runtime_error(
-              "C6c FIXTURE: the swap was to be sent in cycle 2 before b's "
-              "marker phase, MCU at cycle-2 phase " +
-              std::to_string(int64_t(now - T) - int64_t(2 * P)) + " us");
+        uint32_t sc = 2; // the swap cycle = b's (spent) budget
+        fixtureWindow(T, sc, 15'000, LATE_AT - 10'000,
+                      "C6c spent: the swap is sent before b's marker phase");
         swapMark = sim.lines.size();
-        swapIdle(startOp(TB, T, 2), "C6c spent");
+        swapIdle(startOp(TB, T, sc), "C6c spent");
         const auto end = recvTrajectoryFrame(wire, 2000);
         if (end.status != Cmd::TrajectoryFrame::ENDED)
           std::fprintf(stderr,
@@ -1973,9 +2118,9 @@ int main() {
                        unsigned(end.marker), unsigned(end.cycle));
         CHECK(end.status == Cmd::TrajectoryFrame::ENDED && end.id == TB &&
                   end.marker == Cmd::TrajectoryFrame::NO_MARKER &&
-                  end.cycle == 2,
+                  end.cycle == sc,
               "C6c spent: the next push is b's ENDED (no marker fired)");
-        CHECK(end.result.t_trigger == T + 2 * P,
+        CHECK(end.result.t_trigger == T + uint64_t(sc) * P,
               "C6c spent: ENDED at t_start + cycles x period (original "
               "clock)");
         CHECK(hasValue(dacValues(sim, 'L', runMark, swapMark), CH1_A),
@@ -2328,6 +2473,8 @@ int main() {
     int status = 0;
     CHECK(::waitpid(sim.pid, &status, 0) == sim.pid, "waitpid");
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0, "sim exits 0");
+    std::printf("fw-sim-check: %u stage retries, %u fixture re-arms\n",
+                stageRetries, fixtureRearms);
     std::printf("fw-sim-check: ALL OK\n");
     rc = 0;
     ::close(wire.fd);
