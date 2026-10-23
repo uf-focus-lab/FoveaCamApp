@@ -94,8 +94,16 @@ import {
   outputOf,
   type PidNodeHandle,
 } from "@orchestrator/pid-node";
-import { createSlicePipe, type SliceHandle, type SlicePipeSeam } from "@orchestrator/slice-pipe";
-import { createScalePipe, type ScaleHandle, type ScalePipeSeam } from "@orchestrator/scale-pipe";
+import {
+  createSlicePipe,
+  type SliceHandle,
+  type SlicePipeSeam,
+} from "@orchestrator/slice-pipe";
+import {
+  createScalePipe,
+  type ScaleHandle,
+  type ScalePipeSeam,
+} from "@orchestrator/scale-pipe";
 import {
   createFlipPipe,
   type FlipAnchor,
@@ -230,7 +238,8 @@ const FLIP_WINDOW_MIN_FRAMES = 8;
 /** Reasons `ScanTelemetry.mismatch_reason` names (spec §exposure-windows). */
 const MISMATCH = {
   timedClamp: "Timed exposure clamped to the camera's exposure range",
-  timedUnequal: "unequal windows: Timed exposure gives both the rising window's length",
+  timedUnequal:
+    "unequal windows: Timed exposure gives both the rising window's length",
   timedOverrun: "Timed exposure would run into the next trigger",
   rate: "trigger rate above the camera's maximum frame rate",
   readout: "exposures closer than the sensor readout",
@@ -307,7 +316,10 @@ export default function mirrorLinkSession(
       limits: [0, distanceToVerge(VERGE_MIN_DISTANCE_MM, s.state.baseline)],
       ...MEAS_D,
     });
-    const v_shift = new PID({ limits: [-VSHIFT_LIMIT, VSHIFT_LIMIT], ...MEAS_D });
+    const v_shift = new PID({
+      limits: [-VSHIFT_LIMIT, VSHIFT_LIMIT],
+      ...MEAS_D,
+    });
     const vergenceControllers: VergenceControllers = { pan, verge, v_shift };
     let vergenceEngaged = false;
 
@@ -368,11 +380,16 @@ export default function mirrorLinkSession(
     /** The pattern's shape parameters, sanitized (spec §scan-patterns). */
     function patternParams(): { axis: number; amp: number; ratio: number } {
       const amp = Number.isFinite(s.state.scan_amp) ? s.state.scan_amp : 0;
-      const ratio = Number.isFinite(s.state.scan_ratio) ? s.state.scan_ratio : 1;
+      const ratio = Number.isFinite(s.state.scan_ratio)
+        ? s.state.scan_ratio
+        : 1;
       return {
         axis: normalizeAxisDeg(s.state.scan_axis_deg),
         amp: Math.min(Math.max(amp, SCAN_AMP_RANGE.min), SCAN_AMP_RANGE.max),
-        ratio: Math.min(Math.max(ratio, SCAN_RATIO_RANGE.min), SCAN_RATIO_RANGE.max),
+        ratio: Math.min(
+          Math.max(ratio, SCAN_RATIO_RANGE.min),
+          SCAN_RATIO_RANGE.max,
+        ),
       };
     }
 
@@ -437,7 +454,9 @@ export default function mirrorLinkSession(
         windowPx = appliedWindowPx(px);
         centerPx = px({ x: 0, y: 0 });
         // At max(amp, ε): the handle encodes the axis even at amplitude 0.
-        handlePx = px(axisHandleOffset(g.axis, Math.max(g.amp, AXIS_HANDLE_MIN_DEG)));
+        handlePx = px(
+          axisHandleOffset(g.axis, Math.max(g.amp, AXIS_HANDLE_MIN_DEG)),
+        );
       }
       // ONE patch: the path, its closing rule and its center travel together,
       // so the renderer never pairs a new path with an old rule.
@@ -460,9 +479,15 @@ export default function mirrorLinkSession(
       const hz = clampHz(s.state.scan_hz);
       const g = patternParams();
       const markers = scanMarkers(mode, hz).markers;
-      return windowPaths(mode, hz, g.axis, g.amp, g.ratio, markers, SCAN_PATH_SAMPLES).map((seg) =>
-        seg.map(px),
-      );
+      return windowPaths(
+        mode,
+        hz,
+        g.axis,
+        g.amp,
+        g.ratio,
+        markers,
+        SCAN_PATH_SAMPLES,
+      ).map((seg) => seg.map(px));
     }
 
     /** The applied Timed exposure moved (arm, retime, disarm) without a
@@ -472,7 +497,9 @@ export default function mirrorLinkSession(
       if (!t?.undistort) return;
       const c = scanCenterAngle();
       s.telemetry({
-        scan_window_px: appliedWindowPx((o) => t.conv.A2P.C({ x: c.x + o.x, y: c.y + o.y }, false)),
+        scan_window_px: appliedWindowPx((o) =>
+          t.conv.A2P.C({ x: c.x + o.x, y: c.y + o.y }, false),
+        ),
       });
     }
 
@@ -483,7 +510,11 @@ export default function mirrorLinkSession(
         : { x: 0, y: 0 };
       // Every target write feeds the capture-epoch ring (spec §control-law) —
       // the join pairs each matched frame with the target as of ITS capture.
-      recordTarget(targetRing, { t: Number(hostNowNs()), target }, TARGET_RING_CAP);
+      recordTarget(
+        targetRing,
+        { t: Number(hostNowNs()), target },
+        TARGET_RING_CAP,
+      );
       // A steer RE-REFERENCES the loop: the new ray is the new intent, so the
       // accumulated common-mode correction is dropped (the drag re-affirm
       // semantics) and the match strip follows the new center.
@@ -548,11 +579,22 @@ export default function mirrorLinkSession(
     let runMode: ScanMode = "ellipse";
     let runHz = 0;
     /** The run's EXPLICIT host-steady start instant — lateness is exact
-     *  against it, and `replace` carries it (the phase continues). Host ns:
-     *  the controller exposes no MCU↔host offset getter, so a 30 s re-ping
-     *  that moves the offset steps `lateness_us` by the offset change
-     *  (documented, spec §actuation); the MCU's own phase is unaffected. */
+     *  against it, and `replace` carries it (the phase continues). Host ns
+     *  under the controller's MCU→host offset AT THE START; when a 30 s
+     *  re-ping moves the offset, `rebaseRunStart` shifts it by the same
+     *  difference (the MCU instant is what the START carried, so the view
+     *  follows the new offset instead of stepping `lateness_us`). */
     let runStartNs = 0n;
+    /** The controller offset `runStartNs` is expressed under. */
+    let runStartOffsetNs = 0n;
+    /** Re-express `runStartNs` under the controller's CURRENT offset — every
+     *  push timestamp rides that offset, so the two must agree. */
+    function rebaseRunStart(): void {
+      const offset = activeController()?.clockOffsetNs;
+      if (typeof offset !== "bigint" || offset === runStartOffsetNs) return;
+      runStartNs += offset - runStartOffsetNs;
+      runStartOffsetNs = offset;
+    }
     /** ...and the same instant on `now()`'s clock, for the watchdogs. */
     let runStartMs = 0;
     /** A `replace` is in flight: its own failure transition (`running →
@@ -569,13 +611,19 @@ export default function mirrorLinkSession(
      *  ALLOCATED AGAIN (ids alternate), so an expired entry is ignored and a
      *  push from the reallocated id resolves to the in-flight spec. The live
      *  table's entry has `untilNs = null`. */
-    const specById = new Map<number, { spec: TrajectorySpec; untilNs: bigint | null }>();
+    const specById = new Map<
+      number,
+      { spec: TrajectorySpec; untilNs: bigint | null }
+    >();
 
     const specLive = (e: { untilNs: bigint | null }, at: bigint): boolean =>
       e.untilNs === null || at <= e.untilNs;
 
     /** `id` now runs `spec` (a start, or the new table of a swap). */
-    function rememberSpec(id: number | null | undefined, spec: TrajectorySpec): void {
+    function rememberSpec(
+      id: number | null | undefined,
+      spec: TrajectorySpec,
+    ): void {
       if (id === null || id === undefined) return;
       const at = hostNowNs();
       for (const [k, e] of specById) if (!specLive(e, at)) specById.delete(k);
@@ -583,7 +631,10 @@ export default function mirrorLinkSession(
     }
 
     /** A swap landed: the OLD table's entry stays valid for its grace only. */
-    function retireSpec(id: number | null | undefined, spec: TrajectorySpec): void {
+    function retireSpec(
+      id: number | null | undefined,
+      spec: TrajectorySpec,
+    ): void {
       if (id === null || id === undefined) return;
       const e = specById.get(id);
       if (e) e.untilNs = hostNowNs() + BigInt(trajectoryGraceUs(spec)) * 1000n;
@@ -602,7 +653,11 @@ export default function mirrorLinkSession(
      *  unarmed). The longer eye's value should a clamp differ. */
     function timedPulseUs(): number | null {
       if (!applied) return null;
-      if (applied.L.exposure_mode !== "Timed" && applied.R.exposure_mode !== "Timed") return null;
+      if (
+        applied.L.exposure_mode !== "Timed" &&
+        applied.R.exposure_mode !== "Timed"
+      )
+        return null;
       const us = Math.max(applied.L.exposure_us, applied.R.exposure_us);
       return Math.max(1, Math.round(us));
     }
@@ -642,7 +697,9 @@ export default function mirrorLinkSession(
         },
       );
       const { raw, markers, overrun } =
-        timedPulse === undefined ? scanMarkers(mode, hz) : scanMarkers(mode, hz, timedPulse);
+        timedPulse === undefined
+          ? scanMarkers(mode, hz)
+          : scanMarkers(mode, hz, timedPulse);
       return {
         mode,
         hz,
@@ -686,7 +743,9 @@ export default function mirrorLinkSession(
      *  nothing (the brick reports 0 then, which is not a measurement). */
     let flipSkewUs = { L: 0, R: 0 };
     /** Each live brick's counters at the previous probe (matched-delta gate). */
-    const lastProbe: Partial<Record<Side, { frames: number; unmatched: number }>> = {};
+    const lastProbe: Partial<
+      Record<Side, { frames: number; unmatched: number }>
+    > = {};
     /** Summed flip counters over recent probes — the unmatched watchdog's window. */
     let flipWindow: { at: number; flipped: number; unmatched: number }[] = [];
     // Each failure family warns once per run.
@@ -723,7 +782,8 @@ export default function mirrorLinkSession(
         flipped: { ...flipCounts.flipped },
         unmatched: { ...flipCounts.unmatched },
         skew_us: { ...flipSkewUs },
-        flip_tolerance_us: flips.L || flips.R ? Number(flipToleranceNs) / 1000 : 0,
+        flip_tolerance_us:
+          flips.L || flips.R ? Number(flipToleranceNs) / 1000 : 0,
         last_swap: lastSwap,
       };
     }
@@ -750,11 +810,19 @@ export default function mirrorLinkSession(
         }
         pushes.ok++;
         lastOkMs = now();
-        if (m && spec)
+        if (m && spec) {
+          rebaseRunStart();
           latenessUs =
             Number(
-              f.tTrigger - expectedTriggerNs(runStartNs, f.cycle, spec.periodUs, m.tOffsetUs),
+              f.tTrigger -
+                expectedTriggerNs(
+                  runStartNs,
+                  f.cycle,
+                  spec.periodUs,
+                  m.tOffsetUs,
+                ),
             ) / 1000;
+        }
         return;
       }
       if (f.status === "STROBE_TIMEOUT") pushes.timeout++;
@@ -768,7 +836,10 @@ export default function mirrorLinkSession(
      *  point) and, during a replace, the `ready` the failed swap itself causes
      *  (`replaceNow` re-checks once the swap settles); a `detached` mid-swap
      *  queues the abort right away (it runs after the replace op). */
-    function onTrajectoryState(traj: NodeTrajectory, state: NodeTrajectoryState): void {
+    function onTrajectoryState(
+      traj: NodeTrajectory,
+      state: NodeTrajectoryState,
+    ): void {
       if (traj !== trajectory || !scanActive) return;
       if (state === "running" || state === "uploading") return;
       if (replacing && state === "ready") return;
@@ -830,14 +901,22 @@ export default function mirrorLinkSession(
         unmatched: flipCounts.unmatched.L + flipCounts.unmatched.R,
       };
       flipWindow.push(sample);
-      const span = Math.max(FLIP_WINDOW_MIN_MS, (2 * (runSpec?.periodUs ?? 0)) / 1000);
+      const span = Math.max(
+        FLIP_WINDOW_MIN_MS,
+        (2 * (runSpec?.periodUs ?? 0)) / 1000,
+      );
       // Keep the NEWEST sample at least `span` old as the window base.
-      while (flipWindow.length > 2 && tick - flipWindow[1]!.at >= span) flipWindow.shift();
+      while (flipWindow.length > 2 && tick - flipWindow[1]!.at >= span)
+        flipWindow.shift();
       const base = flipWindow[0]!;
       if (warnedUnmatched || tick - base.at < span) return;
       const dU = sample.unmatched - base.unmatched;
       const dF = sample.flipped - base.flipped;
-      if (dU + dF < FLIP_WINDOW_MIN_FRAMES || dU <= UNMATCHED_WARN_FRACTION * (dU + dF)) return;
+      if (
+        dU + dF < FLIP_WINDOW_MIN_FRAMES ||
+        dU <= UNMATCHED_WARN_FRACTION * (dU + dF)
+      )
+        return;
       warnedUnmatched = true;
       report(
         "mirror-link",
@@ -850,8 +929,13 @@ export default function mirrorLinkSession(
     /** Open + START one run of `built`. `cancelled` is checked right before
      *  the START goes out: a stop or teardown requested meanwhile throws
      *  {@link ScanCancelled} instead (the caller undoes the open). */
-    async function runTrajectory(built: BuiltScan, cancelled: () => boolean): Promise<void> {
-      const traj = await controllerNode().openTrajectory(built.spec, { name: "mirror-link" });
+    async function runTrajectory(
+      built: BuiltScan,
+      cancelled: () => boolean,
+    ): Promise<void> {
+      const traj = await controllerNode().openTrajectory(built.spec, {
+        name: "mirror-link",
+      });
       trajectory = traj;
       runSpec = built.spec;
       runRaw = built.raw;
@@ -874,6 +958,7 @@ export default function mirrorLinkSession(
       // phase from it (spec controller.md#trajectory-ownership).
       const at = hostNowNs() + SCAN_START_LEAD_NS;
       runStartNs = at;
+      runStartOffsetNs = activeController()?.clockOffsetNs ?? 0n;
       runStartMs = now() + Number(SCAN_START_LEAD_NS) / 1e6;
       lastOkMs = 0;
       warnedNoOk = false;
@@ -917,14 +1002,20 @@ export default function mirrorLinkSession(
      *  at 1 ms, capped at 0.45 × that gap), in ns, and whether the floor had
      *  to give way to the cap. The edges are the markers AS THE MCU RUNS
      *  THEM — the anchors carry exactly those. */
-    function flipTolerance(built: BuiltScan): { ns: bigint; tooClose: boolean } {
+    function flipTolerance(built: BuiltScan): {
+      ns: bigint;
+      tooClose: boolean;
+    } {
       const r = flipToleranceUs(
         built.spec.periodUs,
         sweepUs(built.hz),
         flipEdges(built.spec.markers ?? []),
       );
 
-      return { ns: BigInt(Math.round(r.toleranceUs * 1000)), tooClose: r.tooClose };
+      return {
+        ns: BigInt(Math.round(r.toleranceUs * 1000)),
+        tooClose: r.tooClose,
+      };
     }
 
     /** The flip source's pipe spec: the broker's own record of the advertised
@@ -1022,7 +1113,11 @@ export default function mirrorLinkSession(
       // Teardown (`scanAllowed` already false) disposes the reader next anyway.
       if (hadRing && scanAllowed) step("ring reader", buildRingNode);
       if (failures.length)
-        report("mirror-link", `flip pipe retire incomplete: ${failures.join("; ")}`, "warning");
+        report(
+          "mirror-link",
+          `flip pipe retire incomplete: ${failures.join("; ")}`,
+          "warning",
+        );
     }
 
     /** Flip pipes exactly in triangle mode while scanning; a tolerance change
@@ -1030,7 +1125,8 @@ export default function mirrorLinkSession(
     function syncFlips(want: boolean, toleranceNs: bigint): void {
       const have = !!(flips.L || flips.R);
       if (have && (!want || toleranceNs !== flipToleranceNs)) retireFlips();
-      if (want && !flips.L && !flips.R && triple) buildFlips(triple, toleranceNs);
+      if (want && !flips.L && !flips.R && triple)
+        buildFlips(triple, toleranceNs);
     }
 
     // -- camera programming (spec §exposure-windows) -------------------------
@@ -1048,7 +1144,10 @@ export default function mirrorLinkSession(
      *  timing — read in the same reconfigure, right after it is applied (the
      *  pre-scan exposure caps the rate otherwise); the trigger rate and
      *  readout checks (spec §exposure-windows). */
-    const limits: Record<Side, TimingLimits> = { L: UNKNOWN_LIMITS, R: UNKNOWN_LIMITS };
+    const limits: Record<Side, TimingLimits> = {
+      L: UNKNOWN_LIMITS,
+      R: UNKNOWN_LIMITS,
+    };
 
     /** Snapshot (once) → trigger mode on (once) → triggered timing, on the
      *  lease's safe reconfigure path. */
@@ -1072,7 +1171,10 @@ export default function mirrorLinkSession(
       }
       const box: { v?: TriggeredTiming } = {};
       await lease.reconfigure(() => {
-        box.v = applyTriggeredTiming(lease.camera, { pulseUs, preferTriggerWidth });
+        box.v = applyTriggeredTiming(lease.camera, {
+          pulseUs,
+          preferTriggerWidth,
+        });
         limits[side] = readTimingLimits(lease.camera);
       });
       return box.v!;
@@ -1085,7 +1187,8 @@ export default function mirrorLinkSession(
       pulseUs: number,
     ): Promise<Record<Side, TriggeredTiming>> {
       const a = {} as Record<Side, TriggeredTiming>;
-      for (const side of SIDES) a[side] = await armEye(side, t.leases[side], pulseUs, true);
+      for (const side of SIDES)
+        a[side] = await armEye(side, t.leases[side], pulseUs, true);
       if (a.L.exposure_mode !== a.R.exposure_mode)
         for (const side of SIDES)
           if (a[side].exposure_mode === "TriggerWidth")
@@ -1112,7 +1215,8 @@ export default function mirrorLinkSession(
         if (snap) {
           try {
             await lease.reconfigure(() => {
-              for (const f of restoreTiming(lease.camera, snap)) failures.push(`${side} ${f}`);
+              for (const f of restoreTiming(lease.camera, snap))
+                failures.push(`${side} ${f}`);
             });
           } catch (e) {
             failures.push(`${side} restore: ${errorLine(e)}`);
@@ -1125,21 +1229,32 @@ export default function mirrorLinkSession(
       limits.L = limits.R = UNKNOWN_LIMITS;
       publishAppliedWindows();
       if (failures.length)
-        report("mirror-link", `camera timing restore incomplete: ${failures.join("; ")}`, "warning");
+        report(
+          "mirror-link",
+          `camera timing restore incomplete: ${failures.join("; ")}`,
+          "warning",
+        );
     }
 
     /** The marker-0 pulse the windows ask for moved: in TIMED mode the
      *  exposure itself moves (and with it every marker's pulse — the caller
      *  rebuilds the spec after); in TriggerWidth the pulse IS the exposure —
      *  nothing to write. */
-    async function retimeIfNeeded(t: CalibratedTriple, pulse: number): Promise<void> {
+    async function retimeIfNeeded(
+      t: CalibratedTriple,
+      pulse: number,
+    ): Promise<void> {
       if (!applied || pulse === appliedPulseUs) return;
-      if (applied.L.exposure_mode === "TriggerWidth" && applied.R.exposure_mode === "TriggerWidth") {
+      if (
+        applied.L.exposure_mode === "TriggerWidth" &&
+        applied.R.exposure_mode === "TriggerWidth"
+      ) {
         appliedPulseUs = pulse;
         return;
       }
       const a = {} as Record<Side, TriggeredTiming>;
-      for (const side of SIDES) a[side] = await armEye(side, t.leases[side], pulse, false);
+      for (const side of SIDES)
+        a[side] = await armEye(side, t.leases[side], pulse, false);
       applied = a;
       appliedPulseUs = pulse;
       publishAppliedWindows();
@@ -1174,14 +1289,19 @@ export default function mirrorLinkSession(
           exposureMismatch(applied.R.exposure_us, want0)
         )
           reasons.push(MISMATCH.timedClamp);
-        if (runRaw.some((m) => exposureMismatch(want0, m.pulseUs))) reasons.push(MISMATCH.timedUnequal);
+        if (runRaw.some((m) => exposureMismatch(want0, m.pulseUs)))
+          reasons.push(MISMATCH.timedUnequal);
         if (runOverrun) reasons.push(MISMATCH.timedOverrun);
       }
       // One trigger per sweep T per camera, in both patterns.
       const maxFps = Math.min(limits.L.frame_rate_max, limits.R.frame_rate_max);
-      if (Number.isFinite(maxFps) && 1e6 / sweepUs(runHz) > maxFps) reasons.push(MISMATCH.rate);
+      if (Number.isFinite(maxFps) && 1e6 / sweepUs(runHz) > maxFps)
+        reasons.push(MISMATCH.rate);
       // The readout: SensorReadoutTime where readable, else 1 / max fps.
-      const readout = Math.max(readoutSpacingUs(limits.L), readoutSpacingUs(limits.R));
+      const readout = Math.max(
+        readoutSpacingUs(limits.L),
+        readoutSpacingUs(limits.R),
+      );
       if (
         runMode === "triangle" &&
         readout > 0 &&
@@ -1199,7 +1319,9 @@ export default function mirrorLinkSession(
     function publishScanTelemetry(): void {
       if (!runSpec || !applied) return;
       const markers = runSpec.markers ?? [];
-      const timed = applied.L.exposure_mode === "Timed" || applied.R.exposure_mode === "Timed";
+      const timed =
+        applied.L.exposure_mode === "Timed" ||
+        applied.R.exposure_mode === "Timed";
       const reasons = mismatchReasons(timed);
       const mismatch = reasons.length > 0;
       const reason = mismatch ? reasons.join("; ") : null;
@@ -1208,7 +1330,10 @@ export default function mirrorLinkSession(
         hz: runHz,
         amp_deg: patternParams().amp,
         period_us: runSpec.periodUs,
-        windows: markers.map((m) => ({ t_offset_us: m.tOffsetUs, pulse_us: m.pulseUs })),
+        windows: markers.map((m) => ({
+          t_offset_us: m.tOffsetUs,
+          pulse_us: m.pulseUs,
+        })),
         exposure_mode: timed ? "Timed" : "TriggerWidth",
         exposure_us: { L: applied.L.exposure_us, R: applied.R.exposure_us },
         frame_rate: { L: applied.L.frame_rate, R: applied.R.frame_rate },
@@ -1292,7 +1417,8 @@ export default function mirrorLinkSession(
         return false;
       }
       const t = triple;
-      const cancelled = (): boolean => !scanAllowed || triple !== t || stopsPending > 0;
+      const cancelled = (): boolean =>
+        !scanAllowed || triple !== t || stopsPending > 0;
       // A stop / teardown requested while this start was queued: the cameras
       // are never armed for it.
       if (cancelled()) return false;
@@ -1373,7 +1499,10 @@ export default function mirrorLinkSession(
 
     /** The run ended under us: stop for good and say why. `traj` (when given)
      *  must still be THE run — a stale notice for a replaced table is moot. */
-    async function abortScanNow(reason: string, traj?: NodeTrajectory): Promise<void> {
+    async function abortScanNow(
+      reason: string,
+      traj?: NodeTrajectory,
+    ): Promise<void> {
       if (!scanActive) return;
       if (traj && traj !== trajectory) return;
       await stopScanNow();
@@ -1390,7 +1519,8 @@ export default function mirrorLinkSession(
     async function restartScanNow(): Promise<void> {
       const t = triple;
       if (!scanActive || !t) return;
-      const cancelled = (): boolean => !scanAllowed || triple !== t || stopsPending > 0;
+      const cancelled = (): boolean =>
+        !scanAllowed || triple !== t || stopsPending > 0;
       if (cancelled()) return stopScanNow();
       // The run may have ended (a detach whose notice is still queued behind
       // this op) or the clock lapsed: never re-open on either.
@@ -1400,7 +1530,11 @@ export default function mirrorLinkSession(
       if (!activeController()?.clockCalibrated)
         return abortScanNow("controller clock not calibrated");
       let built = buildScan();
-      if (runSpec && built.mode === runMode && built.spec.periodUs === runSpec.periodUs)
+      if (
+        runSpec &&
+        built.mode === runMode &&
+        built.spec.periodUs === runSpec.periodUs
+      )
         return replaceNow(); // same period after all (e.g. a no-op write)
       cancelReplace();
       await closeTrajectory();
@@ -1475,7 +1609,8 @@ export default function mirrorLinkSession(
       if (!scanActive || !traj || !t || !runSpec) return;
       if (!scanAllowed || stopsPending > 0) return;
       let built = buildScan();
-      if (built.mode !== runMode || built.spec.periodUs !== runSpec.periodUs) return;
+      if (built.mode !== runMode || built.spec.periodUs !== runSpec.periodUs)
+        return;
       const pulse0 = built.raw[0]?.pulseUs ?? 0;
       const prevPulseUs = appliedPulseUs;
       let retimedBefore = false;
@@ -1490,7 +1625,10 @@ export default function mirrorLinkSession(
             try {
               await retimeIfNeeded(t, pulse0);
             } catch (e) {
-              await abortScanNow(`exposure re-apply failed: ${errorLine(e)}`, traj);
+              await abortScanNow(
+                `exposure re-apply failed: ${errorLine(e)}`,
+                traj,
+              );
               return;
             }
             retimedBefore = true;
@@ -1519,7 +1657,8 @@ export default function mirrorLinkSession(
       }
       if (trajectory !== traj) return;
       const ended =
-        traj.state !== "running" || (error instanceof TrajectoryReplaceError && !error.running);
+        traj.state !== "running" ||
+        (error instanceof TrajectoryReplaceError && !error.running);
       if (ended) {
         await abortScanNow(
           failed
@@ -1544,7 +1683,10 @@ export default function mirrorLinkSession(
           try {
             await retimeIfNeeded(t, prevPulseUs);
           } catch (e) {
-            await abortScanNow(`exposure re-apply failed: ${errorLine(e)}`, traj);
+            await abortScanNow(
+              `exposure re-apply failed: ${errorLine(e)}`,
+              traj,
+            );
             return;
           }
         publishScanTelemetry();
@@ -1722,7 +1864,8 @@ export default function mirrorLinkSession(
           flips[side]?.pipeId ?? nodeId.convert(t.leases[side].camera.serial);
         const handle = broker.connect(pipeId);
         pipeIds.push(pipeId);
-        const { width, height, channels, bytesPerFrame, maxBytes } = handle.spec;
+        const { width, height, channels, bytesPerFrame, maxBytes } =
+          handle.spec;
         return {
           role: side,
           shmName: handle.shmName,
@@ -1976,7 +2119,11 @@ export default function mirrorLinkSession(
     }
 
     function matchZoom(): number {
-      return matchMagnification(measuredMatchZoom(), 0, triple?.zoomOverride ?? null);
+      return matchMagnification(
+        measuredMatchZoom(),
+        0,
+        triple?.zoomOverride ?? null,
+      );
     }
 
     /** The needle scaler's zoom + BASE DIMS, paired by the zoom's units —
@@ -2072,7 +2219,11 @@ export default function mirrorLinkSession(
       latestMatch[side] = m;
       // ABSOLUTE wide px, not strip-local: the wide view draws these directly.
       const abs = {
-        rect: { ...rectFull, x: v.origin.x + rectFull.x, y: v.origin.y + rectFull.y },
+        rect: {
+          ...rectFull,
+          x: v.origin.x + rectFull.x,
+          y: v.origin.y + rectFull.y,
+        },
         score: v.score,
       };
       s.telemetry(side === "L" ? { match_left: abs } : { match_right: abs });
@@ -2197,7 +2348,8 @@ export default function mirrorLinkSession(
       const connect = (role: string, pipeId: string): PipeInput => {
         const handle = broker.connect(pipeId);
         pipeIds.push(pipeId);
-        const { width, height, channels, bytesPerFrame, maxBytes } = handle.spec;
+        const { width, height, channels, bytesPerFrame, maxBytes } =
+          handle.spec;
         return {
           role,
           shmName: handle.shmName,
@@ -2258,7 +2410,11 @@ export default function mirrorLinkSession(
           },
         );
       }
-      const rgba = { kind: "frame", pixelFormat: "RGBA8", dtype: "U8" } as const;
+      const rgba = {
+        kind: "frame",
+        pixelFormat: "RGBA8",
+        dtype: "U8",
+      } as const;
       const analysis = { kind: "analysis", schema: "template-match" } as const;
       const unregister = registerGraphWiring({
         nodes: SIDES.map((side) => ({
@@ -2350,9 +2506,16 @@ export default function mirrorLinkSession(
       // now aimed (the same collective apply the old servo did).
       if (vergenceEngaged && triple?.undistort) {
         writeBackDof(true);
-        targetAngle = { x: targetAngle.x + pan.value.x, y: targetAngle.y + pan.value.y };
+        targetAngle = {
+          x: targetAngle.x + pan.value.x,
+          y: targetAngle.y + pan.value.y,
+        };
         target = triple.conv.A2P.C(targetAngle, false);
-        recordTarget(targetRing, { t: Number(hostNowNs()), target }, TARGET_RING_CAP);
+        recordTarget(
+          targetRing,
+          { t: Number(hostNowNs()), target },
+          TARGET_RING_CAP,
+        );
         s.telemetry({ target, target_angle: targetAngle });
         pan.value = { x: 0, y: 0 };
       }
@@ -2548,7 +2711,8 @@ export default function mirrorLinkSession(
         scope.defer(() => held.release());
       }
       {
-        const capCenterId = undistortC ?? nodeId.convert(t.leases.C.camera.serial);
+        const capCenterId =
+          undistortC ?? nodeId.convert(t.leases.C.camera.serial);
         const capCenter = broker.connect(capCenterId);
         scope.defer(() => void broker.disconnect(capCenterId));
         centerPipe = {
@@ -2734,7 +2898,10 @@ export default function mirrorLinkSession(
         // ARE the loop's DOF: while engaged a MANUAL write re-seeds that
         // controller (the write-back's own values compare equal and no-op).
         verge() {
-          if (vergenceEngaged && Math.abs(s.state.verge - verge.value) > DOF_EPS)
+          if (
+            vergenceEngaged &&
+            Math.abs(s.state.verge - verge.value) > DOF_EPS
+          )
             verge.value = s.state.verge;
           publishScanGeometry();
         },
@@ -2797,14 +2964,18 @@ export default function mirrorLinkSession(
         tri_window_rise(v) {
           const w = windowFrom(v);
           if (!sameWindow(w, v)) s.setState("tri_window_rise", w);
-          if (s.state.tri_window_sync && !sameWindow(w, s.state.tri_window_fall))
+          if (
+            s.state.tri_window_sync &&
+            !sameWindow(w, s.state.tri_window_fall)
+          )
             s.setState("tri_window_fall", [w[0], w[1]]);
           publishScanGeometry();
         },
         tri_window_fall(v) {
           const rise = s.state.tri_window_rise;
           if (s.state.tri_window_sync) {
-            if (!sameWindow(rise, v)) s.setState("tri_window_fall", [rise[0], rise[1]]);
+            if (!sameWindow(rise, v))
+              s.setState("tri_window_fall", [rise[0], rise[1]]);
           } else {
             const w = windowFrom(v);
             if (!sameWindow(w, v)) s.setState("tri_window_fall", w);
@@ -2826,7 +2997,8 @@ export default function mirrorLinkSession(
           publishScanGeometry();
         },
         scan_mode(m) {
-          if (m !== "ellipse" && m !== "triangle") s.setState("scan_mode", "ellipse");
+          if (m !== "ellipse" && m !== "triangle")
+            s.setState("scan_mode", "ellipse");
           if (scanActive) void queueScanOp(restartScanNow);
           publishScanGeometry();
         },
@@ -2855,7 +3027,10 @@ export default function mirrorLinkSession(
         async setAxis(px) {
           const und = triple?.undistort;
           if (!und) return;
-          const deg = axisDegFromPixelRay(scanCenterAngle(), und.angular([px], false)[0]);
+          const deg = axisDegFromPixelRay(
+            scanCenterAngle(),
+            und.angular([px], false)[0],
+          );
           if (deg === null) return;
           if (deg === s.state.scan_axis_deg) return;
           s.setState("scan_axis_deg", deg); // a server write fires no watch
@@ -2908,7 +3083,9 @@ export default function mirrorLinkSession(
           await captureHelper.captureShot(tag);
         },
         async getCapturePreview({ resource, index }) {
-          return captureHelper ? captureHelper.getPreview(resource, index) : null;
+          return captureHelper
+            ? captureHelper.getPreview(resource, index)
+            : null;
         },
         async saveCapture({ path, format }) {
           await captureHelper?.save(path, format);

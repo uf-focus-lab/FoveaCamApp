@@ -146,7 +146,10 @@ export interface NodeTrajectory {
    *  notification when a v2.2 controller is bound again — the cue for the
    *  session to decide whether to `reupload()` (never automatic). */
   onStateChange(
-    cb: (state: NodeTrajectoryState, detail: { controllerAvailable: boolean }) => void,
+    cb: (
+      state: NodeTrajectoryState,
+      detail: { controllerAvailable: boolean },
+    ) => void,
   ): () => void;
   /** Re-upload the same spec to the currently bound v2.2 controller (only
    *  from `detached`); back to `ready` on success, `detached` on failure. */
@@ -219,8 +222,12 @@ const V1_INTERVAL_MS = 1;
 /** Non-OK trajectory pushes log at most once per status per this window. */
 const TRAJECTORY_LOG_INTERVAL_MS = 1000;
 /** Graph node id of the (single) uploaded-trajectory input. */
-export const trajectoryNodeId = (): string => `${nodeId.controller()}/trajectory`;
-const TRAJECTORY_STREAM: StreamType = { kind: "analysis", schema: "trajectory" };
+export const trajectoryNodeId = (): string =>
+  `${nodeId.controller()}/trajectory`;
+const TRAJECTORY_STREAM: StreamType = {
+  kind: "analysis",
+  schema: "trajectory",
+};
 
 /** Expected host-ns trigger instant of `marker` in `cycle` of a run started
  *  at `startHostNs`: start + cycle·period + marker offset (µs → ns). */
@@ -254,7 +261,9 @@ export class RateLimitedLog {
       entry.suppressed++;
       return;
     }
-    const suffix = entry?.suppressed ? ` (+${entry.suppressed} suppressed)` : "";
+    const suffix = entry?.suppressed
+      ? ` (+${entry.suppressed} suppressed)`
+      : "";
     this.last.set(key, { at: t, suppressed: 0 });
     this.sink(msg + suffix);
   }
@@ -294,10 +303,15 @@ export class ControllerNode {
     output: null,
     transport: "native",
   };
-  private readonly wiring: GraphWiring = { nodes: [this.wiringNode], edges: [] };
+  private readonly wiring: GraphWiring = {
+    nodes: [this.wiringNode],
+    edges: [],
+  };
   private readonly unregisterWiring: () => void;
 
-  constructor(initial: PositionPair = { left: { x: 0, y: 0 }, right: { x: 0, y: 0 } }) {
+  constructor(
+    initial: PositionPair = { left: { x: 0, y: 0 }, right: { x: 0, y: 0 } },
+  ) {
     this.latestPose = clonePair(initial);
     this.unregisterWiring = registerGraphWiring(this.wiring);
   }
@@ -508,7 +522,11 @@ export class ControllerNode {
       tExposure: f.tExposure,
       left: f.left,
       right: f.right,
-      trajectory: { id: f.trajectoryId, marker: f.marker ?? -1, cycle: f.cycle },
+      trajectory: {
+        id: f.trajectoryId,
+        marker: f.marker ?? -1,
+        cycle: f.cycle,
+      },
     });
   }
 
@@ -563,7 +581,8 @@ export class ControllerNode {
     const newest = mirrorHistory.newest();
     if (newest && t < newest.hostNs) return null;
     if (newest && t > now) {
-      if (newest.hostNs < now) mirrorHistory.record(now, newest.left, newest.right);
+      if (newest.hostNs < now)
+        mirrorHistory.record(now, newest.left, newest.right);
       if (!interpolate) mirrorHistory.record(t, newest.left, newest.right);
     }
     mirrorHistory.record(t, predicted.left, predicted.right);
@@ -590,10 +609,17 @@ export class ControllerNode {
     if (this.lastInput === input) this.lastInput = null;
     // Retire the input's graph edge.
     const idx = this.wiring.edges.findIndex(
-      (e) => e.to === nodeId.controller() && e.port === input.name && e.from === input.from,
+      (e) =>
+        e.to === nodeId.controller() &&
+        e.port === input.name &&
+        e.from === input.from,
     );
     if (idx >= 0) this.wiring.edges.splice(idx, 1);
-    if (this.inputs.size === 0 && this.nativeInputs.size === 0 && !this.trajectory)
+    if (
+      this.inputs.size === 0 &&
+      this.nativeInputs.size === 0 &&
+      !this.trajectory
+    )
       await this.disableIfLast();
   }
 
@@ -620,7 +646,11 @@ export class ControllerNode {
   /** @internal — native-input retire: same disable-iff-last discipline. */
   async retireNativeInput(input: NativePositionInputImpl): Promise<void> {
     this.nativeInputs.delete(input);
-    if (this.inputs.size === 0 && this.nativeInputs.size === 0 && !this.trajectory)
+    if (
+      this.inputs.size === 0 &&
+      this.nativeInputs.size === 0 &&
+      !this.trajectory
+    )
       await this.disableIfLast();
   }
 
@@ -885,7 +915,11 @@ class PositionInputImpl implements PositionInput {
         const s = await c.createStream(this.latest);
         // The node may have unbound / swapped / closed — or a NATIVE input may
         // have engaged (dual-cmd-stream-handoff-race) — while awaiting.
-        if (this.closed || this.node.liveController !== c || this.node.nativeEngaged()) {
+        if (
+          this.closed ||
+          this.node.liveController !== c ||
+          this.node.nativeEngaged()
+        ) {
           await safeClose(s);
           return;
         }
@@ -1021,13 +1055,21 @@ class NodeTrajectoryImpl implements NodeTrajectory {
   /** The controller the uploaded table lives on (null while detached). */
   owner: Controller | null = null;
   private unsubscribe: (() => void) | null = null;
-  private readonly frameListeners = new Set<(f: TrajectoryFrameOutcome) => void>();
+  private readonly frameListeners = new Set<
+    (f: TrajectoryFrameOutcome) => void
+  >();
   private readonly stateListeners = new Set<
-    (state: NodeTrajectoryState, detail: { controllerAvailable: boolean }) => void
+    (
+      state: NodeTrajectoryState,
+      detail: { controllerAvailable: boolean },
+    ) => void
   >();
   private readonly log = new RateLimitedLog();
   // Run + lifetime stats.
   private startHostNs: bigint | null = null;
+  /** The controller offset `startHostNs` is expressed under (a re-ping moves
+   *  it; `rebaseStart` follows, so lateness never steps). */
+  private startOffsetNs = 0n;
   private startExact = false;
   private cyclesSeen = 0;
   private lastMarker: number | null = null;
@@ -1083,12 +1125,29 @@ class NodeTrajectoryImpl implements NodeTrajectory {
     return this._state;
   }
 
+  /** Re-express `startHostNs` under the controller's CURRENT MCU→host offset:
+   *  push timestamps ride that offset, the START carried an MCU instant. */
+  private rebaseStart(): void {
+    const offset = this.node.liveController?.clockOffsetNs;
+    if (
+      typeof offset !== "bigint" ||
+      offset === this.startOffsetNs ||
+      this.startHostNs === null
+    )
+      return;
+    this.startHostNs += offset - this.startOffsetNs;
+    this.startOffsetNs = offset;
+  }
+
   /** Unnarrowed state probe (the state changes across awaits). */
   private isState(state: NodeTrajectoryState): boolean {
     return this._state === state;
   }
 
-  private setState(state: NodeTrajectoryState, controllerAvailable = false): void {
+  private setState(
+    state: NodeTrajectoryState,
+    controllerAvailable = false,
+  ): void {
     this._state = state;
     for (const cb of this.stateListeners) {
       try {
@@ -1140,15 +1199,19 @@ class NodeTrajectoryImpl implements NodeTrajectory {
       throw new Error(
         `Trajectory "${this.name}" is detached (controller unbound or swapped) — reupload() or close() it`,
       );
-    if (this._state === "closed") throw new Error(`Trajectory "${this.name}" is closed`);
+    if (this._state === "closed")
+      throw new Error(`Trajectory "${this.name}" is closed`);
     if (this._state === "uploading")
       throw new Error(`Trajectory "${this.name}" is still uploading`);
     if (this._state === "running")
-      throw new Error(`Trajectory "${this.name}" is already running — stop() it first`);
+      throw new Error(
+        `Trajectory "${this.name}" is already running — stop() it first`,
+      );
     const h = this.handle!;
     // Per-run stats. t_start = 0 ("now" on the MCU) leaves only a host-side
     // estimate of the start instant — lateness is then approximate.
     this.startHostNs = atHostNs ?? hostNowNs();
+    this.startOffsetNs = this.node.liveController?.clockOffsetNs ?? 0n;
     this.startExact = atHostNs !== undefined;
     this.cyclesSeen = 0;
     this.lastMarker = null;
@@ -1182,7 +1245,8 @@ class NodeTrajectoryImpl implements NodeTrajectory {
     // A possibly-live replacement is done with once the run ends (the
     // controller's stop() STOPs it and graces its id).
     for (const [id, r] of this.retired)
-      if (r.untilNs === null) this.graceRetired(id, r.spec, trajectoryGraceUs(r.spec));
+      if (r.untilNs === null)
+        this.graceRetired(id, r.spec, trajectoryGraceUs(r.spec));
     this.setState("ready");
     this.node.resumeInputs();
   }
@@ -1193,7 +1257,9 @@ class NodeTrajectoryImpl implements NodeTrajectory {
     // lands first so its tables are known before STOP/DELETE.
     const pending = this.replacePending;
     this.replacePending = null;
-    pending?.reject(new Error(`Trajectory "${this.name}" closed before the replace was sent`));
+    pending?.reject(
+      new Error(`Trajectory "${this.name}" closed before the replace was sent`),
+    );
     if (this.replaceInflight) {
       await this.drainReplace();
       if (this.isState("closed")) return; // a concurrent close won
@@ -1232,7 +1298,10 @@ class NodeTrajectoryImpl implements NodeTrajectory {
   }
 
   onStateChange(
-    cb: (state: NodeTrajectoryState, detail: { controllerAvailable: boolean }) => void,
+    cb: (
+      state: NodeTrajectoryState,
+      detail: { controllerAvailable: boolean },
+    ) => void,
   ): () => void {
     this.stateListeners.add(cb);
     return () => {
@@ -1270,7 +1339,8 @@ class NodeTrajectoryImpl implements NodeTrajectory {
       throw new Error(
         `Trajectory "${this.name}" is detached (controller unbound or swapped) — reupload() or close() it`,
       );
-    if (this._state === "closed") throw new Error(`Trajectory "${this.name}" is closed`);
+    if (this._state === "closed")
+      throw new Error(`Trajectory "${this.name}" is closed`);
     if (this._state === "uploading")
       throw new Error(`Trajectory "${this.name}" is still uploading`);
     const current = this.replacingSpec ?? this.spec;
@@ -1306,7 +1376,10 @@ class NodeTrajectoryImpl implements NodeTrajectory {
     // new id is current (scored against `spec`) and each retired id is
     // scored against its own spec for exactly the controller's grace.
     let swapped = false;
-    const landSwap = (to: number, retired: ReadonlyArray<{ id: number; graceUs: number }>) => {
+    const landSwap = (
+      to: number,
+      retired: ReadonlyArray<{ id: number; graceUs: number }>,
+    ) => {
       if (swapped || this.handle !== h) return;
       swapped = true;
       for (const r of retired)
@@ -1328,7 +1401,8 @@ class NodeTrajectoryImpl implements NodeTrajectory {
       // The replacement table id stays routed here after the failure (it may
       // have played for a moment, or may be live): its pushes belong to `spec`.
       if (e?.replacement && this.handle === h) {
-        if (e.replacement.maybeLive) this.retired.set(e.replacement.id, { spec, untilNs: null });
+        if (e.replacement.maybeLive)
+          this.retired.set(e.replacement.id, { spec, untilNs: null });
         else this.graceRetired(e.replacement.id, spec, trajectoryGraceUs(spec));
       }
       // The swap failed and the old table could not be re-STARTed: the run
@@ -1349,10 +1423,17 @@ class NodeTrajectoryImpl implements NodeTrajectory {
   }
 
   /** Score `id`'s pushes against `spec` for `graceUs` from now (0: forget). */
-  private graceRetired(id: number, spec: TrajectorySpec, graceUs: number): void {
+  private graceRetired(
+    id: number,
+    spec: TrajectorySpec,
+    graceUs: number,
+  ): void {
     if (graceUs <= 0) this.retired.delete(id);
     else
-      this.retired.set(id, { spec, untilNs: hostNowNs() + BigInt(Math.ceil(graceUs)) * 1000n });
+      this.retired.set(id, {
+        spec,
+        untilNs: hostNowNs() + BigInt(Math.ceil(graceUs)) * 1000n,
+      });
   }
 
   /** The spec a push of table `id` is scored against: the current table's;
@@ -1375,11 +1456,15 @@ class NodeTrajectoryImpl implements NodeTrajectory {
 
   async reupload(): Promise<void> {
     if (this._state !== "detached")
-      throw new Error(`Trajectory "${this.name}" is ${this._state}, not detached`);
+      throw new Error(
+        `Trajectory "${this.name}" is ${this._state}, not detached`,
+      );
     const c = this.node.liveController;
     if (!c) throw new Error("reupload requires a bound controller");
     if (!c.v22Capable)
-      throw new Error("reupload requires firmware >= 2.2.0 (CMD_TRAJECTORY unavailable)");
+      throw new Error(
+        "reupload requires firmware >= 2.2.0 (CMD_TRAJECTORY unavailable)",
+      );
     try {
       await this.upload(c);
     } catch (error) {
@@ -1406,7 +1491,8 @@ class NodeTrajectoryImpl implements NodeTrajectory {
 
   /** @internal — a controller bound while detached: report, never reupload. */
   notifyRebind(controllerAvailable: boolean): void {
-    if (this._state === "detached") this.setState("detached", controllerAvailable);
+    if (this._state === "detached")
+      this.setState("detached", controllerAvailable);
   }
 
   private onPush(f: TrajectoryFrameOutcome): void {
@@ -1422,22 +1508,34 @@ class NodeTrajectoryImpl implements NodeTrajectory {
       // against its own spec, the new table mid-swap against the in-flight one.
       const spec = this.specForPush(f.trajectoryId);
       const marker = spec.markers?.[f.marker];
-      if (marker && this.startHostNs !== null)
+      if (marker && this.startHostNs !== null) {
+        this.rebaseStart();
         this.lastLatenessUs =
           Number(
             f.tTrigger -
-              expectedTriggerNs(this.startHostNs, f.cycle, spec.periodUs, marker.tOffsetUs),
+              expectedTriggerNs(
+                this.startHostNs,
+                f.cycle,
+                spec.periodUs,
+                marker.tOffsetUs,
+              ),
           ) / 1000;
+      }
       this.node.forwardTrajectoryFrame(f);
     } else {
       this.log.note(
         f.status,
         `controller: trajectory "${this.name}" (id ${f.trajectoryId}) push ${f.status}` +
-          (f.marker === null ? " (run-level)" : ` at marker ${f.marker}, cycle ${f.cycle}`),
+          (f.marker === null
+            ? " (run-level)"
+            : ` at marker ${f.marker}, cycle ${f.cycle}`),
       );
       // Run-level end: the MCU no longer owns the DAC (ENDED → HOLD at phase
       // 0; CANCELLED → system disabled).
-      if (f.marker === null && (f.status === "ENDED" || f.status === "CANCELLED"))
+      if (
+        f.marker === null &&
+        (f.status === "ENDED" || f.status === "CANCELLED")
+      )
         this.endRun();
     }
     for (const cb of this.frameListeners) {
@@ -1479,7 +1577,10 @@ async function safeClose(s: StreamHandle): Promise<void> {
 }
 
 function clonePair(p: PositionPair): PositionPair {
-  return { left: { x: p.left.x, y: p.left.y }, right: { x: p.right.x, y: p.right.y } };
+  return {
+    left: { x: p.left.x, y: p.left.y },
+    right: { x: p.right.x, y: p.right.y },
+  };
 }
 
 // --- module singleton (obtained like `activeController`) ---------------------

@@ -263,7 +263,9 @@ stopping the scan. MirrorLink calls it on every steer drag or slider move, at mo
   - `lastLatenessUs`, the lateness of the last OK push: `t_trigger` −
     (`t_start` + cycle·period + marker offset). It is exact only when `start(atHostNs)`
     named the instant (`latenessExact`). A "now" start uses the host's send-time
-    estimate, so the figure includes the serial latency.
+    estimate, so the figure includes the serial latency. The start instant is held in
+    host ns under the offset in force at the start and re-based by the difference when
+    a re-ping moves `Controller.clockOffsetNs`, so the figure never steps with it.
 - `node.statsSnapshot()` adds the per-input hold/schedule counters.
 
 ### Enable lifecycle

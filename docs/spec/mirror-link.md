@@ -691,9 +691,9 @@ the table running), `pushes` by status (`ok` / `timeout` = STROBE_TIMEOUT / `bus
 — run-level ENDED/CANCELLED and UNKNOWN), `lateness_us` of the last OK push against the
 EXPLICIT start (`tTrigger − (t_start + cycle·period + marker offset)`, exact because the
 session always starts at an explicit instant; scored against the spec of the table that
-pushed — in host-steady ns: the controller exposes no MCU↔host offset getter, so when the
-30 s re-ping moves the offset, `lateness_us` STEPS by the offset change, a bookkeeping
-artefact, not a timing change on the MCU), `reuploads` (successful replaces this scan), `last_swap` (`atomic` /
+pushed — in host-steady ns under the controller's CURRENT MCU→host offset: when the 30 s
+re-ping moves the offset, the session re-bases the run's start instant by the same
+difference before scoring, so `lateness_us` does not step), `reuploads` (successful replaces this scan), `last_swap` (`atomic` /
 `stop-start` / null, from the node's trajectory row), and from the flip bricks
 (§triangle-flip; 0 in ellipse mode) `flipped` / `unmatched` per eye — accumulated across
 brick rebuilds within one scan — the matched frames' mean `skew_us` per eye and the

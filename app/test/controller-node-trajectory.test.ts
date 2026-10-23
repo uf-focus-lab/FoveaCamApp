@@ -25,7 +25,10 @@ import {
   resetControllerNodeForTest,
   trajectoryNodeId,
 } from "@orchestrator/controller-node";
-import { buildTopology, resetTopologyStateForTest } from "@orchestrator/graph-topology";
+import {
+  buildTopology,
+  resetTopologyStateForTest,
+} from "@orchestrator/graph-topology";
 import { mirrorHistory } from "@orchestrator/mirror-history";
 import { AnchorNode } from "@orchestrator/anchor-node";
 import { setHostClock } from "@orchestrator/time-align";
@@ -99,7 +102,10 @@ function makeTrajectoryHandle(id = 0) {
       current += 1;
       this.lastSwap = this.swapKind;
       if (this.callsOnSwap)
-        opts?.onSwap?.({ to: current, retired: [{ id: from, graceUs: this.graceUs }] });
+        opts?.onSwap?.({
+          to: current,
+          retired: [{ id: from, graceUs: this.graceUs }],
+        });
       if (this.gate) await this.gate;
     }),
     start: vi.fn(async (_at?: bigint, _cycles?: number) => {}),
@@ -132,7 +138,9 @@ function makeTrajectoryHandle(id = 0) {
   };
 }
 
-function makeController(opts: { v22?: boolean; enabled?: boolean; port?: string } = {}) {
+function makeController(
+  opts: { v22?: boolean; enabled?: boolean; port?: string } = {},
+) {
   const streams: Array<{
     id: number;
     update: ReturnType<typeof vi.fn>;
@@ -146,6 +154,7 @@ function makeController(opts: { v22?: boolean; enabled?: boolean; port?: string 
     v22Capable: opts.v22 ?? true,
     connected: true,
     enabled: opts.enabled ?? false,
+    clockOffsetNs: 0n,
     enable: vi.fn(async () => {
       c.enabled = true;
     }),
@@ -218,7 +227,9 @@ describe("openTrajectory — gating and exclusivity", () => {
     node = new ControllerNode();
     const c = makeController({ v22: false });
     node.bindController(c as never);
-    await expect(node.openTrajectory(SPEC, { name: "ml" })).rejects.toThrow(/2\.2\.0/);
+    await expect(node.openTrajectory(SPEC, { name: "ml" })).rejects.toThrow(
+      /2\.2\.0/,
+    );
     expect(c.uploadTrajectory).not.toHaveBeenCalled();
     expect(c.enable).not.toHaveBeenCalled();
     expect(node.trajectorySnapshot()).toBeNull();
@@ -233,7 +244,9 @@ describe("openTrajectory — gating and exclusivity", () => {
       /already open.*close it first/,
     );
     const t = await first;
-    await expect(node.openTrajectory(SPEC, { name: "b" })).rejects.toThrow(/already open/);
+    await expect(node.openTrajectory(SPEC, { name: "b" })).rejects.toThrow(
+      /already open/,
+    );
     expect(c.uploadTrajectory).toHaveBeenCalledTimes(1);
     await t.close();
     // The slot frees on close.
@@ -247,7 +260,9 @@ describe("openTrajectory — gating and exclusivity", () => {
     const c = makeController();
     c.uploadTrajectory.mockRejectedValueOnce(new Error("Trajectory pool full"));
     node.bindController(c as never);
-    await expect(node.openTrajectory(SPEC, { name: "ml" })).rejects.toThrow(/pool full/);
+    await expect(node.openTrajectory(SPEC, { name: "ml" })).rejects.toThrow(
+      /pool full/,
+    );
     expect(c.enable).toHaveBeenCalledTimes(1);
     expect(c.disable).toHaveBeenCalledTimes(1);
     expect(node.trajectorySnapshot()).toBeNull();
@@ -347,7 +362,9 @@ describe("position inputs while a trajectory runs", () => {
     // The latest held pose, FORCED past the gate (the firmware HOLDs the
     // trajectory's last position until the next stream write).
     expect(stream.update).toHaveBeenCalledTimes(1);
-    expect(stream.update).toHaveBeenCalledWith(PAIR(P(7, 7), P(8, 8)), { force: true });
+    expect(stream.update).toHaveBeenCalledWith(PAIR(P(7, 7), P(8, 8)), {
+      force: true,
+    });
     expect(record).toHaveBeenCalledWith(nowNs, P(7, 7), P(8, 8));
 
     // Normal streaming afterwards.
@@ -364,7 +381,9 @@ describe("position inputs while a trajectory runs", () => {
     await t.start();
     stream.update.mockClear();
     await t.stop();
-    expect(stream.update).toHaveBeenCalledWith(PAIR(P(1, 1), P(1, 1)), { force: true });
+    expect(stream.update).toHaveBeenCalledWith(PAIR(P(1, 1), P(1, 1)), {
+      force: true,
+    });
     await t.close();
   });
 
@@ -378,7 +397,9 @@ describe("position inputs while a trajectory runs", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     c.trajectories[0]!.push({ marker: null, cycle: 3, status: "ENDED" });
     expect(t.state).toBe("ready");
-    expect(stream.update).toHaveBeenCalledWith(PAIR(P(2, 2), P(2, 2)), { force: true });
+    expect(stream.update).toHaveBeenCalledWith(PAIR(P(2, 2), P(2, 2)), {
+      force: true,
+    });
     expect(warn).toHaveBeenCalledTimes(1);
     await t.close();
   });
@@ -386,7 +407,9 @@ describe("position inputs while a trajectory runs", () => {
   it("a failed START un-holds the inputs", async () => {
     const { c, input, n } = await withStream();
     const t = await n.openTrajectory(SPEC, { name: "ml" });
-    c.trajectories[0]!.start.mockRejectedValueOnce(new Error("system is not enabled"));
+    c.trajectories[0]!.start.mockRejectedValueOnce(
+      new Error("system is not enabled"),
+    );
     await expect(t.start()).rejects.toThrow(/not enabled/);
     expect(t.state).toBe("ready");
     c.streams[0]!.update.mockClear();
@@ -484,7 +507,11 @@ describe("trajectory FIN routing", () => {
     node.onFin((o) => anchors.ingest(o));
     const t = await node.openTrajectory(SPEC, { name: "ml" });
     await t.start();
-    c.trajectories[0]!.push({ tExposure: 7_000_000n, left: P(1, 2), right: P(3, 4) });
+    c.trajectories[0]!.push({
+      tExposure: 7_000_000n,
+      left: P(1, 2),
+      right: P(3, 4),
+    });
     expect(pushAnchor).toHaveBeenCalledWith({
       tExposure: 7_000_000n,
       stream: 0,
@@ -604,7 +631,9 @@ describe("position input updateAt (CMD_SCHEDULE)", () => {
     const { c, input } = await withStream();
     const stream = c.streams[0]!;
     const at = nowNs + 5_000_000n;
-    const out = input.updateAt(at, PAIR(P(2, 3), P(4, 5)), { interpolate: true });
+    const out = input.updateAt(at, PAIR(P(2, 3), P(4, 5)), {
+      interpolate: true,
+    });
     expect(out).toEqual(PAIR(P(2, 3), P(4, 5)));
     expect(stream.scheduleAt).toHaveBeenCalledWith(at, PAIR(P(2, 3), P(4, 5)), {
       interpolate: true,
@@ -612,7 +641,10 @@ describe("position input updateAt (CMD_SCHEDULE)", () => {
     expect(input.scheduleFallbacks).toBe(0);
     // Interpolated keyframe: the ramp starts at the arrival instant from the
     // last position and lands on the target AT `at`.
-    expect(mirrorHistory.mirrorAt(at)).toMatchObject({ left: P(2, 3), right: P(4, 5) });
+    expect(mirrorHistory.mirrorAt(at)).toMatchObject({
+      left: P(2, 3),
+      right: P(4, 5),
+    });
     expect(mirrorHistory.mirrorAt(nowNs)).toMatchObject({ left: P(1, 1) });
     const mid = mirrorHistory.mirrorAt(nowNs + 2_500_000n)!;
     expect(mid.left.x).toBeCloseTo(1.5);
@@ -640,9 +672,13 @@ describe("position input updateAt (CMD_SCHEDULE)", () => {
 
   it("an out-of-order keyframe is sent but not recorded (history stays monotonic)", async () => {
     const { c, input } = await withStream();
-    input.updateAt(nowNs + 8_000_000n, PAIR(P(2, 2), P(2, 2)), { interpolate: true });
+    input.updateAt(nowNs + 8_000_000n, PAIR(P(2, 2), P(2, 2)), {
+      interpolate: true,
+    });
     const record = vi.spyOn(mirrorHistory, "record");
-    input.updateAt(nowNs + 4_000_000n, PAIR(P(3, 3), P(3, 3)), { interpolate: true });
+    input.updateAt(nowNs + 4_000_000n, PAIR(P(3, 3), P(3, 3)), {
+      interpolate: true,
+    });
     expect(c.streams[0]!.scheduleAt).toHaveBeenCalledTimes(2);
     expect(record).not.toHaveBeenCalled();
     expect(node!.statsSnapshot().inputs[0]).toMatchObject({
@@ -658,9 +694,14 @@ describe("position input updateAt (CMD_SCHEDULE)", () => {
     input.updateAt(at, PAIR(P(2, 2), P(2, 2)), { interpolate: true });
     advance(1_000_000n);
     input.update(PAIR(P(9, 9), P(9, 9)));
-    expect(c.streams[0]!.update).toHaveBeenLastCalledWith(PAIR(P(9, 9), P(9, 9)));
+    expect(c.streams[0]!.update).toHaveBeenLastCalledWith(
+      PAIR(P(9, 9), P(9, 9)),
+    );
     // The firmware cleared the schedule: the keyframe at `at` never happens.
-    expect(mirrorHistory.newest()).toMatchObject({ hostNs: nowNs, left: P(9, 9) });
+    expect(mirrorHistory.newest()).toMatchObject({
+      hostNs: nowNs,
+      left: P(9, 9),
+    });
     expect(mirrorHistory.mirrorAt(at)).toMatchObject({ left: P(9, 9) });
   });
 
@@ -675,7 +716,9 @@ describe("position input updateAt (CMD_SCHEDULE)", () => {
 
   it("update() after every keyframe came due is the unchanged legacy path", async () => {
     const { input } = await withStream();
-    input.updateAt(nowNs + 1_000_000n, PAIR(P(2, 2), P(2, 2)), { interpolate: true });
+    input.updateAt(nowNs + 1_000_000n, PAIR(P(2, 2), P(2, 2)), {
+      interpolate: true,
+    });
     advance(2_000_000n);
     const truncate = vi.spyOn(mirrorHistory, "truncateAfter");
     const record = vi.spyOn(mirrorHistory, "record");
@@ -732,7 +775,11 @@ describe("trajectory graph wiring", () => {
     const c = makeController();
     node.bindController(c as never);
     const t = await node.openTrajectory(SPEC, { name: "mirrorlink" });
-    let topo = buildTopology({ listPipes: () => [], workloads: () => ({}), now: () => 0 });
+    let topo = buildTopology({
+      listPipes: () => [],
+      workloads: () => ({}),
+      now: () => 0,
+    });
     expect(topo.nodes.find((x) => x.id === trajectoryNodeId())).toMatchObject({
       kind: "trajectory",
       transport: "native",
@@ -745,7 +792,11 @@ describe("trajectory graph wiring", () => {
       }),
     );
     await t.close();
-    topo = buildTopology({ listPipes: () => [], workloads: () => ({}), now: () => 0 });
+    topo = buildTopology({
+      listPipes: () => [],
+      workloads: () => ({}),
+      now: () => 0,
+    });
     expect(topo.nodes.find((x) => x.id === trajectoryNodeId())).toBeUndefined();
     expect(topo.edges.find((e) => e.port === "mirrorlink")).toBeUndefined();
   });
@@ -755,7 +806,11 @@ describe("RateLimitedLog", () => {
   it("logs once per key per window and reports the suppressed count", () => {
     let t = 0;
     const lines: string[] = [];
-    const log = new RateLimitedLog(1000, (m) => lines.push(m), () => t);
+    const log = new RateLimitedLog(
+      1000,
+      (m) => lines.push(m),
+      () => t,
+    );
     log.note("A", "a1");
     log.note("A", "a2");
     log.note("B", "b1");
@@ -810,7 +865,9 @@ describe("NodeTrajectory.replace", () => {
     stream.update.mockClear();
 
     await t.replace(RESHAPED);
-    expect(h.replace).toHaveBeenCalledWith(RESHAPED, { onSwap: expect.any(Function) });
+    expect(h.replace).toHaveBeenCalledWith(RESHAPED, {
+      onSwap: expect.any(Function),
+    });
     expect(h.start).toHaveBeenCalledTimes(1); // the handle re-STARTs, not the node
     expect(h.stop).not.toHaveBeenCalled();
     expect(t.state).toBe("running");
@@ -834,11 +891,16 @@ describe("NodeTrajectory.replace", () => {
     const expected = expectedTriggerNs(startNs, 7, 10_000, 4_000);
     h.push({ marker: 0, cycle: 7, tTrigger: expected + 30_000n });
     expect(frames.map((f) => f.trajectoryId)).toEqual([1]);
-    expect(n.trajectorySnapshot()).toMatchObject({ lastLatenessUs: 30, cyclesSeen: 8 });
+    expect(n.trajectorySnapshot()).toMatchObject({
+      lastLatenessUs: 30,
+      cyclesSeen: 8,
+    });
 
     // stop() hands the DAC back with the latest held pose.
     await t.stop();
-    expect(stream.update).toHaveBeenCalledWith(PAIR(P(6, 6), P(6, 6)), { force: true });
+    expect(stream.update).toHaveBeenCalledWith(PAIR(P(6, 6), P(6, 6)), {
+      force: true,
+    });
     await t.close();
     await input.close();
   });
@@ -851,7 +913,10 @@ describe("NodeTrajectory.replace", () => {
     const spec = withPeriod(20_000);
     await t.replace(spec);
     expect(t.state).toBe("ready");
-    expect(node.trajectorySnapshot()).toMatchObject({ periodUs: 20_000, reuploads: 1 });
+    expect(node.trajectorySnapshot()).toMatchObject({
+      periodUs: 20_000,
+      reuploads: 1,
+    });
 
     // Lateness uses the new period after a start.
     const startNs = 3_000_000_000n;
@@ -895,7 +960,10 @@ describe("NodeTrajectory.replace", () => {
     // A, then C (B was superseded before it was ever sent).
     expect(h.replace.mock.calls.map(([s]) => s)).toEqual([A, C]);
     expect(order).toEqual(["A", "B", "C"]);
-    expect(node.trajectorySnapshot()).toMatchObject({ reuploads: 2, state: "running" });
+    expect(node.trajectorySnapshot()).toMatchObject({
+      reuploads: 2,
+      state: "running",
+    });
     await t.close();
   });
 
@@ -917,8 +985,14 @@ describe("NodeTrajectory.replace", () => {
     g.release();
     const [ra, rb, rc] = await settled;
     expect(ra.status).toBe("fulfilled");
-    expect(rb).toMatchObject({ status: "rejected", reason: { message: "Trajectory pool full" } });
-    expect(rc).toMatchObject({ status: "rejected", reason: { message: "Trajectory pool full" } });
+    expect(rb).toMatchObject({
+      status: "rejected",
+      reason: { message: "Trajectory pool full" },
+    });
+    expect(rc).toMatchObject({
+      status: "rejected",
+      reason: { message: "Trajectory pool full" },
+    });
     expect(t.state).toBe("running"); // the old table kept running
     expect(node.trajectorySnapshot()!.reuploads).toBe(1);
     await t.close();
@@ -968,7 +1042,9 @@ describe("NodeTrajectory.replace", () => {
     expect(h.dispose).not.toHaveBeenCalled();
     g.release();
     await expect(p1).resolves.toBeUndefined();
-    expect(await p2).toMatchObject({ message: expect.stringMatching(/closed before the replace was sent/) });
+    expect(await p2).toMatchObject({
+      message: expect.stringMatching(/closed before the replace was sent/),
+    });
     await closed;
     expect(h.replace).toHaveBeenCalledTimes(1);
     expect(h.stop).toHaveBeenCalledTimes(1);
@@ -1024,16 +1100,24 @@ describe("NodeTrajectory.replace", () => {
     stream.update.mockClear();
     const h = c.trajectories[0]!;
     h.replace.mockRejectedValueOnce(
-      Object.assign(new Error("START of the replacement table failed"), { running: false }),
+      Object.assign(new Error("START of the replacement table failed"), {
+        running: false,
+      }),
     );
-    await expect(t.replace(RESHAPED)).rejects.toThrow(/replacement table failed/);
+    await expect(t.replace(RESHAPED)).rejects.toThrow(
+      /replacement table failed/,
+    );
     expect(t.state).toBe("ready");
-    expect(stream.update).toHaveBeenCalledWith(PAIR(P(4, 4), P(4, 4)), { force: true });
+    expect(stream.update).toHaveBeenCalledWith(PAIR(P(4, 4), P(4, 4)), {
+      force: true,
+    });
     expect(n.trajectorySnapshot()!.reuploads).toBe(0);
 
     // A plain upload failure (old table still running) leaves the run alone.
     await t.start();
-    h.replace.mockRejectedValueOnce(new Error("DATA chunk past the end of the table"));
+    h.replace.mockRejectedValueOnce(
+      new Error("DATA chunk past the end of the table"),
+    );
     await expect(t.replace(RESHAPED)).rejects.toThrow(/past the end/);
     expect(t.state).toBe("running");
     await t.close();
@@ -1050,7 +1134,10 @@ describe("NodeTrajectory.replace", () => {
     await t.start(startNs);
     const h = c.trajectories[0]!;
     await t.replace(RESHAPED); // 0 -> 1, atomic
-    expect(node.trajectorySnapshot()).toMatchObject({ id: 1, lastSwap: "atomic" });
+    expect(node.trajectorySnapshot()).toMatchObject({
+      id: 1,
+      lastSwap: "atomic",
+    });
 
     // An in-flight capture of the OLD table (id 0, marker 1 at 7 000 µs in
     // SPEC — RESHAPED has no marker 1) lands after the swap, inside the
@@ -1059,7 +1146,11 @@ describe("NodeTrajectory.replace", () => {
     h.push({ trajectoryId: 0, marker: 1, cycle: 3, tTrigger: late });
     expect(node.trajectorySnapshot()!.lastLatenessUs).toBe(20);
     // The new table's pushes score against RESHAPED (marker 0 at 4 000 µs).
-    h.push({ marker: 0, cycle: 4, tTrigger: expectedTriggerNs(startNs, 4, 10_000, 4_000) + 5_000n });
+    h.push({
+      marker: 0,
+      cycle: 4,
+      tTrigger: expectedTriggerNs(startNs, 4, 10_000, 4_000) + 5_000n,
+    });
     expect(node.trajectorySnapshot()!.lastLatenessUs).toBe(5);
 
     h.swapKind = "stop-start";
@@ -1071,7 +1162,10 @@ describe("NodeTrajectory.replace", () => {
 
   describe("per-id straggler scoring", () => {
     /** A third shape: one marker at 6 000 µs. */
-    const THIRD: TrajectorySpec = { ...RESHAPED, markers: [{ tOffsetUs: 6_000, pulseUs: 800 }] };
+    const THIRD: TrajectorySpec = {
+      ...RESHAPED,
+      markers: [{ tOffsetUs: 6_000, pulseUs: 800 }],
+    };
     const START_NS = 2_000_000_000n;
     /** Push `marker` of table `id` at cycle 3, `lateUs` after the phase of
      *  `offsetUs`; returns the node's lateness reading. */
@@ -1086,7 +1180,9 @@ describe("NodeTrajectory.replace", () => {
         trajectoryId: id,
         marker,
         cycle: 3,
-        tTrigger: expectedTriggerNs(START_NS, 3, 10_000, offsetUs) + BigInt(lateUs) * 1000n,
+        tTrigger:
+          expectedTriggerNs(START_NS, 3, 10_000, offsetUs) +
+          BigInt(lateUs) * 1000n,
       });
       return node!.trajectorySnapshot()!.lastLatenessUs;
     };
@@ -1118,6 +1214,25 @@ describe("NodeTrajectory.replace", () => {
       hold.release();
       await swapping;
       expect(lateness(h, 0, 1, 7_000, 12)).toBe(12);
+      await t.close();
+    });
+
+    it("a re-ping that moves the clock offset does not step the lateness", async () => {
+      const { t, h } = await runningOn();
+      expect(lateness(h, 0, 0, 2_000, 9)).toBe(9);
+      // The offset moves by +40 µs: pushes decoded after it carry the new
+      // offset, so the same MCU instant reads 40 µs later in host ns…
+      const c = node!.liveController as unknown as { clockOffsetNs: bigint };
+      c.clockOffsetNs += 40_000n;
+      h.push({
+        trajectoryId: 0,
+        marker: 0,
+        cycle: 4,
+        tTrigger:
+          expectedTriggerNs(START_NS, 4, 10_000, 2_000) + 9_000n + 40_000n,
+      });
+      // …and the start is re-based by the same difference: still 9 µs late.
+      expect(node!.trajectorySnapshot()!.lastLatenessUs).toBe(9);
       await t.close();
     });
 
