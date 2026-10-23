@@ -206,7 +206,9 @@ offset ping lands). The checks:
   start `t_offset_us` into the period (`scan.windows`); move the window
   sliders and watch both follow without a missed trigger. A model without
   TriggerWidth falls back to Timed: both triangle markers then carry the same
-  pulse and `mismatch_reason` names unequal windows.
+  pulse; only with unequal windows (**Sync Windows** off) does `mismatch_reason`
+  name unequal windows — with Sync on the windows are equal and there is no
+  mismatch.
 - **Both triangle frames.** In the triangle, rising and falling frames
   alternate, two per 2T period. With a vertical scan axis (90°) the falling
   frame arrives on the views VERTICALLY flipped so it reads like the rising

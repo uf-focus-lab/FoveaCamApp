@@ -228,6 +228,10 @@ const REPLACE_INTERVAL_MS = 100;
  *  warns once (spec §exposure-windows). */
 const NO_OK_PERIODS = 2;
 
+/** The axis slider's left end (the pane's `AXIS_MIN`: the 0.5° grid over
+ *  (-180, 180]) — `setAxis` folds (-180, -179.5) onto it. */
+const AXIS_SLIDER_MIN_DEG = -179.5;
+
 /** Unmatched-flip watchdog (spec §triangle-flip): over the last two periods
  *  (at least this long, so a slow scan still averages a few frames), more than
  *  this fraction of the flipped + unmatched frames being unmatched warns once
@@ -736,6 +740,10 @@ export default function mirrorLinkSession(
     let reuploads = 0;
     let lastSwap: TrajectoryTelemetry["last_swap"] = null;
     let lastOkMs = 0;
+    /** No OK push for {@link NO_OK_PERIODS} periods of the active run — the
+     *  no-OK watchdog's condition, `perf.trajectory.stalled` (see
+     *  {@link watchNoOk}). */
+    let stalled = false;
     /** Flip counters for THIS run: `base` holds what retired bricks counted
      *  (a tolerance change or a restart rebuilds them), `flipCounts` is base +
      *  the live bricks' own counters (spec §triangle-flip). */
@@ -772,6 +780,7 @@ export default function mirrorLinkSession(
       reuploads = 0;
       lastSwap = null;
       lastOkMs = 0;
+      stalled = false;
       flipBase.flipped = { L: 0, R: 0 };
       flipBase.unmatched = { L: 0, R: 0 };
       flipCounts.flipped = { L: 0, R: 0 };
@@ -793,6 +802,7 @@ export default function mirrorLinkSession(
         flip_tolerance_us:
           flips.L || flips.R ? Number(flipToleranceNs) / 1000 : 0,
         last_swap: lastSwap,
+        stalled: scanActive && stalled,
       };
     }
 
@@ -818,6 +828,10 @@ export default function mirrorLinkSession(
         }
         pushes.ok++;
         lastOkMs = now();
+        if (stalled) {
+          stalled = false;
+          publishPerf();
+        }
         if (m && spec) {
           rebaseRunStart();
           latenessUs =
@@ -866,12 +880,15 @@ export default function mirrorLinkSession(
       publishScanTelemetry();
     }
 
-    /** No OK push for {@link NO_OK_PERIODS} periods → one warning per run. */
-
+    /** No OK push for {@link NO_OK_PERIODS} periods → `stalled` (the status
+     *  line's amber, spec §views) and one warning per run. Re-evaluated at the
+     *  telemetry throttle, whose `perf` patch republishes it; the next OK push
+     *  clears it at once. */
     function watchNoOk(tick: number): void {
-      if (!scanActive || !runSpec || warnedNoOk) return;
+      if (!scanActive || !runSpec) return;
       const since = Math.max(lastOkMs, runStartMs);
-      if (tick - since <= (NO_OK_PERIODS * runSpec.periodUs) / 1000) return;
+      stalled = tick - since > (NO_OK_PERIODS * runSpec.periodUs) / 1000;
+      if (!stalled || warnedNoOk) return;
       warnedNoOk = true;
       report(
         "mirror-link",
@@ -970,6 +987,7 @@ export default function mirrorLinkSession(
       runStartOffsetNs = activeController()?.clockOffsetNs ?? 0n;
       runStartMs = now() + Number(SCAN_START_LEAD_NS) / 1e6;
       lastOkMs = 0;
+      stalled = false;
       warnedNoOk = false;
       warnedUnmatched = false;
       flipWindow = [];
@@ -3093,11 +3111,14 @@ export default function mirrorLinkSession(
         async setAxis(px) {
           const und = triple?.undistort;
           if (!und) return;
-          const deg = axisDegFromPixelRay(
+          const raw = axisDegFromPixelRay(
             scanCenterAngle(),
             und.angular([px], false)[0],
           );
-          if (deg === null) return;
+          if (raw === null) return;
+          // Fold into the slider's domain (a 0.5° fold at the seam): the state
+          // never holds an angle the slider cannot show (spec §scan-patterns).
+          const deg = Math.max(raw, AXIS_SLIDER_MIN_DEG);
           if (deg === s.state.scan_axis_deg) return;
           s.setState("scan_axis_deg", deg); // a server write fires no watch
           publishScanGeometry();

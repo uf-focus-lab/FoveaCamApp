@@ -45,10 +45,10 @@ const MODE_OPTIONS: readonly SingleSelectOption<ScanMode>[] = [
 
 const ellipse = computed(() => state.scan_mode === "ellipse");
 /** The axis slider's range: the 0.5° grid over (-180, 180]. A handle drag
- *  (`setAxis`) may leave the state in (-180, -179.5), which the slider cannot
- *  show — the proxy clamps on READ so the thumb stays on the track and the
- *  arrow keys step from the shown value; the state keeps the exact angle
- *  until the slider writes. */
+ *  (`setAxis`) folds (-180, -179.5) onto the left end, so the state stays in
+ *  the slider's domain; the proxy still clamps on READ as a guard (a direct
+ *  state write the session only normalizes), keeping the thumb on the track
+ *  and the arrow keys stepping from the shown value. */
 const AXIS_MIN = -179.5;
 const AXIS_MAX = 180;
 const axisDeg = computed<number>({

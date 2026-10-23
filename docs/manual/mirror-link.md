@@ -206,7 +206,8 @@ leave the app.
 A camera model that cannot take the trigger's length as its exposure falls back
 to a fixed exposure as long as the first window; the status line then ends in
 `· timed`. The status line turns amber when the cameras stop answering the
-trigger, or when the scan cannot run exactly as set — its hover starts with
+trigger (no exposure has completed for two scan periods — also mid-run, after
+good frames, e.g. a trigger cable coming loose), or when the scan cannot run exactly as set — its hover starts with
 *Exposure mismatch —* and names why. Hover it while idle to see what the
 current settings would run.
 
@@ -216,7 +217,7 @@ current settings would run.
 | exposures closer than the sensor readout | One exposure starts before the sensor has finished reading out the previous frame — in triangle mode move the two windows' ends apart (more time from one window's end to the next one's start), or lower **Scan Frequency**. |
 | exposure windows too close for reliable flipping at this frequency | The two triangle frames are too close together in time to tell apart which one to flip — widen the spacing between the windows, or lower **Scan Frequency**. |
 | unequal windows: Timed exposure gives both the rising window's length | On a timed-fallback camera with **Sync Windows** off, the camera takes the rising window's length for both frames; set the windows equal (or turn Sync on) if that is not what you want. |
-| Timed exposure would run into the next trigger | On a timed-fallback camera the (equal) exposure is longer than the gap to the next trigger, so the second frame would start exposing before the first one ends — shorten the windows, or lower **Scan Frequency**. |
+| Timed exposure would run into the next trigger | On a timed-fallback camera the exposure the camera can take is longer than a whole sweep (its minimum exposure is above the scan period), so a frame would still be exposing when the next trigger arrives — lower **Scan Frequency**. Shortening the windows does not help: the app already keeps a shorter exposure inside its sweep. |
 | Timed exposure clamped to the camera's exposure range | On a timed-fallback camera the window is longer or shorter than the camera can expose — change the window's length. |
 | controller clock calibration lapsed | The controller's clock link stopped answering mid-scan, so the frames can no longer be timed against the path — check the controller's connection. |
 

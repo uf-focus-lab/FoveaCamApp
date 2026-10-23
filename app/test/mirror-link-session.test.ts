@@ -1639,6 +1639,7 @@ describe("telemetry", () => {
       skew_us: { L: 0, R: 0 },
       flip_tolerance_us: 0,
       last_swap: null,
+      stalled: false,
     });
   });
 
@@ -1693,6 +1694,46 @@ describe("telemetry", () => {
     ).toBe(true);
   });
 
+  it("stalled: no OK push for two periods after good ones → true at the throttle, an OK push clears it", async () => {
+    const h = await harness();
+    await h.call("startScan");
+    const ok = (cycle: number) =>
+      h.traj().push({ status: "OK", marker: 0, cycle });
+    perfNow += 100;
+    ok(1);
+    perfNow += 100;
+    ok(2);
+    await h.tick(0);
+    expect(h.tele.perf.trajectory.stalled).toBe(false);
+    expect(h.tele.perf.trajectory.pushes.ok).toBe(2);
+    // The cable comes loose: timeouts only. 2 periods (200 ms) is not yet.
+    h.traj().push({ status: "STROBE_TIMEOUT", marker: 0, cycle: 3 });
+    perfNow += 200;
+    await h.tick(0);
+    expect(h.tele.perf.trajectory.stalled).toBe(false);
+    perfNow += 50;
+    await h.tick(0);
+    expect(h.tele.perf.trajectory.stalled).toBe(true); // republished
+    perfNow += 400;
+    await h.tick(0);
+    expect(h.tele.perf.trajectory.stalled).toBe(true);
+    // The watchdog's warning still fires exactly once.
+    expect(
+      ctl.reports.filter((r) => r.includes("no fovea exposure")),
+    ).toHaveLength(1);
+    // An OK push clears it at once (no throttle tick needed)...
+    ok(9);
+    await settle();
+    expect(h.tele.perf.trajectory.stalled).toBe(false);
+    // ...and a stop publishes it false.
+    perfNow += 1000;
+    await h.tick(0);
+    expect(h.tele.perf.trajectory.stalled).toBe(true);
+    await h.call("stopScan");
+    await settle();
+    expect(h.tele.perf.trajectory.stalled).toBe(false);
+  });
+
   it("a clock lapse mid-scan is a mismatch_reason (no stop), re-evaluated at the throttle", async () => {
     const h = await harness();
     await h.call("startScan");
@@ -1721,6 +1762,22 @@ describe("telemetry", () => {
     await h.call("setAxis", { x: 10, y: 10 });
     await settle();
     expect(h.state.scan_axis_deg).toBeCloseTo(90, 9);
+    // Just past the seam (-179.8°): folded onto the slider's left end.
+    const r = 100;
+    const a = 0.2 * (Math.PI / 180);
+    await h.call("setAxis", {
+      x: 10 - r * Math.cos(a),
+      y: 10 - r * Math.sin(a),
+    });
+    await settle();
+    expect(h.state.scan_axis_deg).toBe(-179.5);
+    // +179.8° is on the slider: kept exactly.
+    await h.call("setAxis", {
+      x: 10 - r * Math.cos(a),
+      y: 10 + r * Math.sin(a),
+    });
+    await settle();
+    expect(h.state.scan_axis_deg).toBeCloseTo(179.8, 9);
     const u = await harness({ calibrated: false });
     await u.call("setAxis", { x: 5, y: 5 });
     await settle();

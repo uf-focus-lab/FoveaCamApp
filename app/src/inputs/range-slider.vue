@@ -167,7 +167,7 @@ function handleKeydown(e: KeyboardEvent) {
     class="range-slider"
     role="slider"
     :style="{ color }"
-    :tabindex="disabled ? -1 : 0"
+    :tabindex="disabled ? undefined : 0"
     :aria-valuemin="min"
     :aria-valuemax="max"
     :aria-valuenow="modelValue"
@@ -208,13 +208,15 @@ function handleKeydown(e: KeyboardEvent) {
     opacity: 0.5;
     filter: grayscale(0.5);
   }
+  // Never on a disabled slider: a click must not light it back up (it holds
+  // no tabindex while disabled, and `:active` still matches a mousedown).
   &:not([disabled]):hover,
-  &:active,
-  &:focus {
+  &:not([disabled]):active,
+  &:not([disabled]):focus {
     opacity: 1;
   }
-  &:active,
-  &:focus {
+  &:not([disabled]):active,
+  &:not([disabled]):focus {
     outline: 2px solid var(--theme, var(--accent));
   }
   .intent {
@@ -283,8 +285,8 @@ function handleKeydown(e: KeyboardEvent) {
     }
   }
   &:not([disabled]):hover,
-  &:active,
-  &:focus {
+  &:not([disabled]):active,
+  &:not([disabled]):focus {
     .cursor::before,
     .cursor::after {
       opacity: 1;

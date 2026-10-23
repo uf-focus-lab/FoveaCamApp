@@ -398,7 +398,8 @@ the exposure windows as asked: <reason>…", "warning")`).
 
 **Ground truth.** OK marker pushes ARE the exposure record. `STROBE_TIMEOUT`, `BUSY` and the
 rest count into `perf.trajectory.pushes` (§actuation); a run with NO OK push for two
-periods (measured from the start instant, or the last OK push) warns ONCE per run, naming
+periods (measured from the start instant, or the last OK push) sets
+`perf.trajectory.stalled` while it lasts (the status line's amber, §views) and warns ONCE per run, naming
 the timeout/busy counts and the BUSY-after-a-missed-strobe case: a missed strobe holds the
 capture engine for the pulse plus the 5 ms strobe margin, so when the gap after the window
 is under 5 ms it is still busy at the next trigger, which pushes `BUSY` ("a missed strobe
@@ -538,7 +539,9 @@ a compact status span — `mode · hz · period · windows` while active (the pe
 TRAJECTORY period, T or 2T; each `ScanTelemetry.windows` entry as `start–end` ms within
 it, joined by `+`; a trailing `· timed` on the `Timed` exposure fallback), `idle` /
 `idle — refused` otherwise. Warn-toned on `mismatch`, on a run whose
-`perf.trajectory.pushes` show failures and no OK push, or on a refusal. The `title`
+`perf.trajectory.pushes` show failures and no OK push, on `perf.trajectory.stalled` (no
+OK push for two periods — a trigger that stops answering mid-run, after good exposures;
+the `title` then says no exposure has completed for two scan periods), or on a refusal. The `title`
 carries, on a mismatch, the NEUTRAL lead-in "Exposure mismatch — " (not every reason is a
 camera limit: the flip-spacing one is the windows' own geometry) followed by
 `ScanTelemetry.mismatch_reason` with no second colon — or, with no reason, "the cameras
@@ -572,7 +575,10 @@ Rows, top to bottom: a `SCAN PATTERN` group heading; **Mode** — a two-option h
 `SingleSelect` (Ellipse | Triangle) on `scan_mode`; **Axis** — RangeSlider on
 `scan_axis_deg`, −179.5..180°, step 0.5, neutral 0, readout `+12.5°`, its hover naming
 the center-view handle as the other way to set it (the left end is −179.5, not −180: the
-session normalizes −180 to 180, which would make the thumb jump to the right edge; the slider's v-model clamps a handle-dragged angle in (−180, −179.5) to −179.5 on read, the state keeps the exact angle); **Amplitude** — `scan_amp`, 0..2°, step
+session normalizes −180 to 180, which would make the thumb jump to the right edge; `setAxis`
+folds a handle-dragged angle in (−180, −179.5) to −179.5 — a 0.5° fold at the seam — so
+the state never holds a value the slider cannot show; the slider's v-model still clamps on
+read, as a guard for a direct state write); **Amplitude** — `scan_amp`, 0..2°, step
 0.01, neutral 0.5 (moved here from the right column). Then per mode — Ellipse:
 **Ratio** (`scan_ratio`, 0..1, step 0.01, neutral 1, readout `1.00`, `line` at 0, a
 `detents: [0]` so a drag can land on the line exactly) and **Exposure Window**
@@ -676,8 +682,10 @@ swap first — firmware 2.2.1 accepts `START {id = new, t_start = the run's exac
 while the old table runs and switches tables in place, keeping the phase clock and the
 marker crossing state (no HOLD, no push; a marker is never doubled, and a marker moved
 before the swap phase first fires next cycle) — and falls back to the
-back-to-back STOP(old) + START(new, same `t_start`) pair on a REJ (older firmware), so the
-new table joins the run's phase either way; `perf.trajectory.last_swap` says which landed.
+back-to-back STOP(old) + START(new, same `t_start`) pair only on a REJ "already running"
+(older firmware), so the new table joins the run's phase either way; any other REJ swaps
+nothing (the old table keeps running, the replace fails `running: true` — the decision
+table in controller.md); `perf.trajectory.last_swap` says which landed.
 An in-flight capture of the OLD table keeps pushing after the swap, so the host keeps the
 retired id routed to the same listeners for a grace (max pulse + 5 ms + slack,
 `trajectoryGraceUs`) and does not reuse it meanwhile — after it, the id is free again, so
@@ -699,7 +707,11 @@ difference before scoring, so `lateness_us` does not step), `reuploads` (success
 `stop-start` / null, from the node's trajectory row), and from the flip bricks
 (§triangle-flip; 0 in ellipse mode) `flipped` / `unmatched` per eye — accumulated across
 brick rebuilds within one scan — the matched frames' mean `skew_us` per eye and the
-`flip_tolerance_us` in force. `telemetry.volt` is the commanded pose while idle and the
+`flip_tolerance_us` in force, and `stalled` — true while the scan is active and no OK push
+has arrived for `NO_OK_PERIODS` (2) periods (measured from the start instant or the last
+OK push: the no-OK watchdog's condition, §exposure-windows), re-evaluated at the throttle
+and republished with it; false again on the next OK push (published at once) and at run
+start. `telemetry.volt` is the commanded pose while idle and the
 pattern's CENTER while
 scanning; `perf.actuateMs` / `perf.tickGapMs` keep their meaning for the idle path.
 

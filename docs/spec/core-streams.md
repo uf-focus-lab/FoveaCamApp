@@ -225,7 +225,12 @@ frames matched to an anchor marked `flip`.
   edge gap (`docs/spec/mirror-link-scan-patterns.md`, review rounds 1 and 2); when the
   floor exceeds the cap the windows are too close to flip reliably at that frequency and
   the scan reports `mismatch`. Bounding by the edge gap keeps a frame whose own anchor is
-  late from matching the neighbouring marker's nearer edge.
+  late from matching the neighbouring marker's nearer edge. The formula is what a brick
+  is ATTACHED with (run start, restart); after a live window change the session keeps the
+  brick's tolerance anywhere inside the hysteresis band — rebuilding only when it exceeds
+  the new cap, sits below the floor while the floor fits under the new cap, or falls
+  below half the new value (`scan.ts` `flipRebuildNeeded`; review rounds 1–3) — so
+  `flipProbe().toleranceNs` may differ from the formula for the current windows.
 - **Counters.** `flipProbe(pipeId)` returns the thread meter (input `frame`, output
   `flip`) plus `frames`, `flipped`, `unmatched`, `anchorPoolSize`, `anchorDrops`,
   `toleranceNs` and `matchedSkewNs`, or `null` for an unknown pipe; `flipProbeAll()`

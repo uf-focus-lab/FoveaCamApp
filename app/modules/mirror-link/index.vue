@@ -197,7 +197,9 @@ const trajectoryDetail = computed(() => {
   let s =
     `Marker pushes: ${n.ok} ok · ${n.timeout} timeout · ${n.busy} busy · ${n.other} other; ` +
     `last lateness ${p.lateness_us.toFixed(0)} µs; ${p.reuploads} live re-uploads` +
-    (p.last_swap ? ` (last swap ${p.last_swap === "atomic" ? "atomic" : "stop + start"})` : "");
+    (p.last_swap
+      ? ` (last swap ${p.last_swap === "atomic" ? "atomic" : "stop + start"})`
+      : "");
   if (telemetry.scan?.mode === "triangle")
     s +=
       `; flipped L ${p.flipped.L} · R ${p.flipped.R}, ` +
@@ -216,7 +218,8 @@ const scanStatus = computed<{ text: string; tone: string; title: string }>(
         `${t.mode} · ${t.hz.toFixed(1)} Hz · ${ms(t.period_us)} ms · ` +
         `${t.windows.map(windowText).join(" + ")} ms` +
         (timed ? " · timed" : "");
-      const p = telemetry.perf.trajectory.pushes;
+      const traj = telemetry.perf.trajectory;
+      const p = traj.pushes;
       const failed = p.timeout + p.busy + p.other;
       if (t.mismatch)
         return {
@@ -229,18 +232,24 @@ const scanStatus = computed<{ text: string; tone: string; title: string }>(
             (t.mismatch_reason
               ? t.mismatch_reason.replace(/\.\s*$/, "")
               : `the cameras cannot take the requested ${t.mode === "triangle" ? "windows" : "window"}`) +
-            (timed ? " (Timed fallback: no TriggerWidth exposure on this model)" : "") +
+            (timed
+              ? " (Timed fallback: no TriggerWidth exposure on this model)"
+              : "") +
             ". " +
             `Applied exposure L ${ms(t.exposure_us.L)} ms · R ${ms(t.exposure_us.R)} ms, ` +
             `frame rate L ${t.frame_rate.L.toFixed(1)} Hz · R ${t.frame_rate.R.toFixed(1)} Hz. ` +
             trajectoryDetail.value,
         };
-      if (p.ok === 0 && failed > 0)
+      // Amber also mid-run: `stalled` = no OK push for two periods (a cable
+      // coming loose after N good exposures), not only "none ever succeeded".
+      if (traj.stalled || (p.ok === 0 && failed > 0))
         return {
           text,
           tone: "warn",
           title:
-            "No exposure has completed this run — the cameras are not answering the trigger. " +
+            (traj.stalled
+              ? "No exposure has completed for two scan periods — the cameras stopped answering the trigger. "
+              : "No exposure has completed this run — the cameras are not answering the trigger. ") +
             trajectoryDetail.value,
         };
       return {
@@ -395,7 +404,11 @@ const vergenceStatus = computed<{ text: string; tone: string; title: string }>(
           "The wide camera has no undistort calibration, so the loop has no " +
           "pixel→angle map to steer with. Calibrate it first.",
       };
-    return { text, tone: "warn", title: `${text} — match confidence ${scores} ${min}.` };
+    return {
+      text,
+      tone: "warn",
+      title: `${text} — match confidence ${scores} ${min}.`,
+    };
   },
 );
 
@@ -616,11 +629,7 @@ const statusR = computed(() => ringStatus("R"));
         :payload="frameL"
         :theme="THEME.L"
       >
-        <RingOverlay
-          v-if="state.ring_reader"
-          :view="ringL"
-          :color="THEME.L"
-        />
+        <RingOverlay v-if="state.ring_reader" :view="ringL" :color="THEME.L" />
       </StreamView>
       <div
         v-if="state.ring_reader"
@@ -816,11 +825,7 @@ const statusR = computed(() => ringStatus("R"));
         :payload="frameR"
         :theme="THEME.R"
       >
-        <RingOverlay
-          v-if="state.ring_reader"
-          :view="ringR"
-          :color="THEME.R"
-        />
+        <RingOverlay v-if="state.ring_reader" :view="ringR" :color="THEME.R" />
       </StreamView>
       <div
         v-if="state.ring_reader"
@@ -1327,7 +1332,6 @@ const statusR = computed(() => ringStatus("R"));
       cursor: not-allowed;
     }
   }
-
 }
 
 .status-row {

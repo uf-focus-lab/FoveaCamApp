@@ -20,8 +20,9 @@ import type { RingReadout } from "@lib/ring-code";
 
 /** The applied scan timing, published exactly while the scan is ACTIVE (spec
  *  §lifecycle). `exposure_us`/`frame_rate` are the values the cameras actually
- *  took (post-clamp, 0 in TriggerWidth where the pulse IS the exposure), so a
- *  rig that can't reach `hz` is visible; `mismatch` / `mismatch_reason` name
+ *  took — `exposure_us` post-clamp (0 in TriggerWidth, where the pulse IS the
+ *  exposure), `frame_rate` the camera's readback (never 0) — so a rig that
+ *  can't reach `hz` is visible; `mismatch` / `mismatch_reason` name
  *  the feasibility check that failed (spec §exposure-windows, the reason table).
  *
  *  MUST stay a `type` alias, NOT an `interface` — a telemetry slot's value is
@@ -97,6 +98,11 @@ export type TrajectoryTelemetry = {
   flip_tolerance_us: number;
   /** How the last live re-upload swapped tables (`TrajectoryStat.lastSwap`); null before any. */
   last_swap: "atomic" | "stop-start" | null;
+  /** True while the scan is active and no OK push has arrived for two
+   *  periods (`NO_OK_PERIODS`, the no-OK watchdog's condition) — re-evaluated
+   *  at the telemetry throttle, false again on the next OK push and at run
+   *  start. The status line turns amber on it (spec §views). */
+  stalled: boolean;
 };
 
 /** Matched fovea footprint + confidence, lifted into wide-frame pixels — the
@@ -117,7 +123,7 @@ export const mirrorLink = defineContract({
     // Alignment parameters (spec §targeting).
     baseline: 200, // stereo baseline (mm)
     verge: 0, // verge slider (0 → ∞ distance)
-    shift: 0, // vertical toe shift (deg, ±0.5) — +s raises L, lowers R
+    shift: 0, // vertical toe shift (deg, SHIFT_RANGE_DEG = ±VSHIFT_LIMIT_DEG) — +s raises L, lowers R
     /** Session-wide fovea gain override (dB, BOTH eyes; spec §gain). Null =
      *  never set — the session seeds it from the leased cameras instead of
      *  writing one. */
@@ -259,6 +265,7 @@ export const mirrorLink = defineContract({
         skew_us: { L: 0, R: 0 },
         flip_tolerance_us: 0,
         last_swap: null,
+        stalled: false,
       } as TrajectoryTelemetry,
     },
     // Capture manifest telemetry (spec §capture); image data pulled via
