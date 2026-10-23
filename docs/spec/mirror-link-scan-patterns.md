@@ -407,3 +407,44 @@ one should-fix (a vacuous test). Fixed in round 5:
   v2.2.1 tags on the Actuate/Trigger/START refusals and the HOLD Actuate
   in both protocol docs; the manual's overrun row says one sweep; the
   `replace` doc's lead says atomic first.
+
+## Review round 6 (2026-10-23) — findings and decisions
+
+Four reviews on acbd07c. No blockers; no firmware or UI code defect. Fixed
+in round 6:
+
+- **Failed swap, routed new id (should-fix):** the session registers
+  `TrajectoryReplaceError.replacement` in `specById` against the spec it
+  carries — for the grace when `maybeLive` is false, open-ended while true
+  (retired at the next landed swap or the run's end) — and in the Timed
+  fallback skips the pre-swap exposure write-back while the new table may
+  be live (the shorter exposure is safe under either table).
+- **Controller tests:** the "run is over" branch is covered with siblings
+  (every sibling STOPped; a sibling whose STOP failed stays reserved and a
+  later `stop()` STOPs + DELETEs it); the `endRun` comment names every path
+  that graces a sibling. The stall test pins the republished lateness.
+- **Docs:** the manual's readout row says END-to-END; "scan center" rather
+  than "crosshair" for the always-aims zone (under a vergence pan the
+  crosshair sits off the center) — manual, spec and the overlay comment;
+  `no ring` no longer lists "the scan is not running" (that reads `idle`);
+  the spec's status `title` text covers the stalled-with-no-OK run and the
+  stall sentence inside a mismatch hover; Ctrl-backtick rendered correctly.
+- **Simulator harness (host/sim timing, not firmware):** decisions —
+  (a) the swap instant is MEASURED: the swap START goes out with a
+  `GET SYS_TIMESTAMP` in one burst, and a push that arrives before the ACK
+  is a firmware fault only when the measured instant was inside the window
+  (else a fixture miss) — this replaces C6a's post-ACK heuristic; (b) C5
+  sends the swap only after this cycle's injected strobe rises have been
+  seen, and a push whose exposure started at/after the swap instant is a
+  fixture miss; (c) after a re-arm C6b reads a's push for the new cycle
+  before polling, as the normal path does for cycle 1; (d) `Wire::recv()`
+  QUEUES CMD_TRAJECTORY pushes instead of dropping them (`recvTrajectoryFrame`
+  pops the queue first), with an explicit discard for C4's endless run and
+  for re-arm-skipped cycles, and an empty-queue assertion before each swap;
+  (e) the sim prints `stall <gap_us> <mcu_us>` when a loop gap exceeds 2 ms,
+  and a timing/identity failure counts as a fixture miss only when a
+  recorded stall at least as large as the violated margin overlaps the
+  window — otherwise strict; the harness header says the sim needs a fair
+  core share; (f) D1 takes the minimum pipelined time over 3 bursts;
+  (g) re-arm diagnostics print cycle and phase separately, and running out
+  of re-arms is a fixture failure of its own (no stage retry on top).
