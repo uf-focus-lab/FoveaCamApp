@@ -11,6 +11,8 @@
 //   (6) updateAt — CMD_SCHEDULE on v2.2 recorded at the SCHEDULED time;
 //       superseded by an immediate update; v2.1 / no-stream fallback counted.
 //   (7) graph wiring + stats snapshot (lateness from t_trigger vs phase).
+//   (8) replace — running stays running (inputs held), spec + stats carry,
+//       concurrent calls coalesce (latest wins), stop/close wait for it.
 //
 // No serial hardware / addon: fake controllers + fake trajectory handles; the
 // host clock is pinned through `setHostClock`.
@@ -62,8 +64,15 @@ const SPEC: TrajectorySpec = {
 
 function makeTrajectoryHandle(id = 0) {
   const listeners = new Set<(f: TrajectoryFrameOutcome) => void>();
+  // The CURRENT table id — a successful replace() swaps it (+1 here).
+  let current = id;
   return {
-    id,
+    get id() {
+      return current;
+    },
+    replace: vi.fn(async (_spec: TrajectorySpec) => {
+      current += 1;
+    }),
     start: vi.fn(async (_at?: bigint, _cycles?: number) => {}),
     stop: vi.fn(async () => {}),
     dispose: vi.fn(async () => {}),
@@ -75,7 +84,7 @@ function makeTrajectoryHandle(id = 0) {
     }),
     push(f: Partial<TrajectoryFrameOutcome>) {
       const full: TrajectoryFrameOutcome = {
-        trajectoryId: id,
+        trajectoryId: current,
         marker: 0,
         cycle: 0,
         status: "OK",
@@ -726,5 +735,279 @@ describe("RateLimitedLog", () => {
     t = 1000;
     log.note("A", "a4");
     expect(lines).toEqual(["a1", "b1", "a4 (+2 suppressed)"]);
+  });
+});
+
+// --- (8) replace ------------------------------------------------------------------
+
+describe("NodeTrajectory.replace", () => {
+  /** Same period, different shape + marker layout (a steer / slider move). */
+  const RESHAPED: TrajectorySpec = {
+    periodUs: 10_000,
+    samples: [
+      { tOffsetUs: 0, left: P(2, 2), right: P(-2, -2) },
+      { tOffsetUs: 5_000, left: P(3, 3), right: P(-3, -3) },
+    ],
+    markers: [{ tOffsetUs: 4_000, pulseUs: 800 }],
+  };
+  const withPeriod = (periodUs: number, base = RESHAPED): TrajectorySpec => ({
+    ...base,
+    periodUs,
+  });
+
+  /** A deferred the fake handle's replace() waits on. */
+  function gate() {
+    let release!: () => void;
+    let fail!: (e: unknown) => void;
+    const promise = new Promise<void>((res, rej) => {
+      release = res;
+      fail = rej;
+    });
+    return { promise, release, fail };
+  }
+
+  it("while running: swaps through the handle, stays running, inputs stay held", async () => {
+    const { c, input, n } = await withStream();
+    const stream = c.streams[0]!;
+    const t = await n.openTrajectory(SPEC, { name: "ml" });
+    const states: string[] = [];
+    t.onStateChange((s) => states.push(s));
+    const frames: TrajectoryFrameOutcome[] = [];
+    t.onFrame((f) => frames.push(f));
+    const startNs = 2_000_000_000n;
+    await t.start(startNs);
+    const h = c.trajectories[0]!;
+    input.update(PAIR(P(5, 5), P(5, 5))); // held
+    stream.update.mockClear();
+
+    await t.replace(RESHAPED);
+    expect(h.replace).toHaveBeenCalledWith(RESHAPED);
+    expect(h.start).toHaveBeenCalledTimes(1); // the handle re-STARTs, not the node
+    expect(h.stop).not.toHaveBeenCalled();
+    expect(t.state).toBe("running");
+    expect(states).toEqual(["running"]); // no ready/running flap
+    expect(t.id).toBe(1); // the swapped table
+    // No resume: nothing re-took the DAC, and pushes keep being held.
+    expect(stream.update).not.toHaveBeenCalled();
+    input.update(PAIR(P(6, 6), P(6, 6)));
+    expect(stream.update).not.toHaveBeenCalled();
+    expect(n.trajectorySnapshot()).toMatchObject({
+      id: 1,
+      state: "running",
+      running: true,
+      markers: 1,
+      heldPushes: 2,
+      reuploads: 1,
+    });
+
+    // Pushes from the new table keep flowing on the same handle, scored
+    // against the NEW spec's marker (4 000 µs) on the ORIGINAL t_start.
+    const expected = expectedTriggerNs(startNs, 7, 10_000, 4_000);
+    h.push({ marker: 0, cycle: 7, tTrigger: expected + 30_000n });
+    expect(frames.map((f) => f.trajectoryId)).toEqual([1]);
+    expect(n.trajectorySnapshot()).toMatchObject({ lastLatenessUs: 30, cyclesSeen: 8 });
+
+    // stop() hands the DAC back with the latest held pose.
+    await t.stop();
+    expect(stream.update).toHaveBeenCalledWith(PAIR(P(6, 6), P(6, 6)), { force: true });
+    await t.close();
+    await input.close();
+  });
+
+  it("from ready: a plain re-upload — any period, stays ready, reupload() sends the new spec", async () => {
+    node = new ControllerNode();
+    const c1 = makeController();
+    node.bindController(c1 as never);
+    const t = await node.openTrajectory(SPEC, { name: "ml" });
+    const spec = withPeriod(20_000);
+    await t.replace(spec);
+    expect(t.state).toBe("ready");
+    expect(node.trajectorySnapshot()).toMatchObject({ periodUs: 20_000, reuploads: 1 });
+
+    // Lateness uses the new period after a start.
+    const startNs = 3_000_000_000n;
+    await t.start(startNs);
+    c1.trajectories[0]!.push({
+      marker: 0,
+      cycle: 2,
+      tTrigger: expectedTriggerNs(startNs, 2, 20_000, 4_000) + 5_000n,
+    });
+    expect(node.trajectorySnapshot()!.lastLatenessUs).toBe(5);
+
+    // A detach + reupload carries the replaced spec, not the opening one.
+    await node.unbindController();
+    const c2 = makeController({ port: "/dev/v22b" });
+    node.bindController(c2 as never);
+    await t.reupload();
+    expect(c2.uploadTrajectory).toHaveBeenCalledWith(spec);
+    await t.close();
+  });
+
+  it("coalesces: while one swap is in flight, the LATEST spec wins and is sent once", async () => {
+    node = new ControllerNode();
+    const c = makeController();
+    node.bindController(c as never);
+    const t = await node.openTrajectory(SPEC, { name: "ml" });
+    await t.start();
+    const h = c.trajectories[0]!;
+    const g = gate();
+    h.replace.mockImplementationOnce(async () => g.promise);
+    const A = { ...RESHAPED, markers: [{ tOffsetUs: 1_000, pulseUs: 100 }] };
+    const B = { ...RESHAPED, markers: [{ tOffsetUs: 2_000, pulseUs: 100 }] };
+    const C = { ...RESHAPED, markers: [{ tOffsetUs: 3_000, pulseUs: 100 }] };
+    const order: string[] = [];
+    const pa = t.replace(A).then(() => order.push("A"));
+    const pb = t.replace(B).then(() => order.push("B"));
+    const pc = t.replace(C).then(() => order.push("C"));
+    await tick();
+    expect(h.replace).toHaveBeenCalledTimes(1);
+    g.release();
+    await Promise.all([pa, pb, pc]);
+    // A, then C (B was superseded before it was ever sent).
+    expect(h.replace.mock.calls.map(([s]) => s)).toEqual([A, C]);
+    expect(order).toEqual(["A", "B", "C"]);
+    expect(node.trajectorySnapshot()).toMatchObject({ reuploads: 2, state: "running" });
+    await t.close();
+  });
+
+  it("a coalesced batch that fails rejects every caller in it; the in-flight one is unaffected", async () => {
+    node = new ControllerNode();
+    const c = makeController();
+    node.bindController(c as never);
+    const t = await node.openTrajectory(SPEC, { name: "ml" });
+    await t.start();
+    const h = c.trajectories[0]!;
+    const g = gate();
+    h.replace.mockImplementationOnce(async () => g.promise);
+    h.replace.mockRejectedValueOnce(new Error("Trajectory pool full"));
+    const settled = Promise.allSettled([
+      t.replace(RESHAPED),
+      t.replace(RESHAPED),
+      t.replace(RESHAPED),
+    ]);
+    g.release();
+    const [ra, rb, rc] = await settled;
+    expect(ra.status).toBe("fulfilled");
+    expect(rb).toMatchObject({ status: "rejected", reason: { message: "Trajectory pool full" } });
+    expect(rc).toMatchObject({ status: "rejected", reason: { message: "Trajectory pool full" } });
+    expect(t.state).toBe("running"); // the old table kept running
+    expect(node.trajectorySnapshot()!.reuploads).toBe(1);
+    await t.close();
+  });
+
+  it("stop() during a replace waits for it (and the pending batch) before STOP", async () => {
+    node = new ControllerNode();
+    const c = makeController();
+    node.bindController(c as never);
+    const t = await node.openTrajectory(SPEC, { name: "ml" });
+    await t.start();
+    const h = c.trajectories[0]!;
+    const g = gate();
+    const log: string[] = [];
+    h.replace.mockImplementation(async (s: TrajectorySpec) => {
+      log.push(`replace:${s.markers?.length}`);
+      if (log.length === 1) await g.promise;
+    });
+    h.stop.mockImplementation(async () => {
+      log.push("stop");
+    });
+    const p1 = t.replace(RESHAPED);
+    const p2 = t.replace(SPEC); // coalesced
+    const stopped = t.stop();
+    await tick();
+    expect(log).toEqual(["replace:1"]);
+    g.release();
+    await Promise.all([p1, p2, stopped]);
+    expect(log).toEqual(["replace:1", "replace:2", "stop"]);
+    expect(t.state).toBe("ready");
+    await t.close();
+  });
+
+  it("close() during a replace drops the pending batch and waits for the in-flight one", async () => {
+    node = new ControllerNode();
+    const c = makeController();
+    node.bindController(c as never);
+    const t = await node.openTrajectory(SPEC, { name: "ml" });
+    await t.start();
+    const h = c.trajectories[0]!;
+    const g = gate();
+    h.replace.mockImplementationOnce(async () => g.promise);
+    const p1 = t.replace(RESHAPED);
+    const p2 = t.replace(SPEC).catch((e: unknown) => e);
+    const closed = t.close();
+    await tick();
+    expect(h.dispose).not.toHaveBeenCalled();
+    g.release();
+    await expect(p1).resolves.toBeUndefined();
+    expect(await p2).toMatchObject({ message: expect.stringMatching(/closed before the replace was sent/) });
+    await closed;
+    expect(h.replace).toHaveBeenCalledTimes(1);
+    expect(h.stop).toHaveBeenCalledTimes(1);
+    expect(h.dispose).toHaveBeenCalledTimes(1);
+    expect(t.state).toBe("closed");
+  });
+
+  it("throws when detached / closed / uploading, and on a period change while running", async () => {
+    node = new ControllerNode();
+    const c = makeController();
+    node.bindController(c as never);
+    const t = await node.openTrajectory(SPEC, { name: "ml" });
+
+    // period change while running → refused before the handle sees it
+    await t.start();
+    await expect(t.replace(withPeriod(20_000))).rejects.toThrow(/same period/);
+    expect(c.trajectories[0]!.replace).not.toHaveBeenCalled();
+    await t.stop();
+
+    // detached
+    await node.unbindController();
+    await expect(t.replace(RESHAPED)).rejects.toThrow(/detached/);
+
+    // uploading (a reupload in flight)
+    const c2 = makeController({ port: "/dev/v22b" });
+    let release2!: () => void;
+    c2.uploadTrajectory.mockImplementationOnce(async (_s: TrajectorySpec) => {
+      await new Promise<void>((r) => (release2 = r));
+      const h = makeTrajectoryHandle(0);
+      c2.trajectories.push(h);
+      return h;
+    });
+    node.bindController(c2 as never);
+    const re = t.reupload();
+    await tick();
+    expect(t.state).toBe("uploading");
+    await expect(t.replace(RESHAPED)).rejects.toThrow(/still uploading/);
+    release2();
+    await re;
+
+    // closed
+    await t.close();
+    await expect(t.replace(RESHAPED)).rejects.toThrow(/closed/);
+    expect(node.trajectorySnapshot()).toBeNull();
+  });
+
+  it("a swap that lost the run (TrajectoryReplaceError running:false) ends it and resumes inputs", async () => {
+    const { c, input, n } = await withStream();
+    const stream = c.streams[0]!;
+    const t = await n.openTrajectory(SPEC, { name: "ml" });
+    await t.start();
+    input.update(PAIR(P(4, 4), P(4, 4))); // held
+    stream.update.mockClear();
+    const h = c.trajectories[0]!;
+    h.replace.mockRejectedValueOnce(
+      Object.assign(new Error("START of the replacement table failed"), { running: false }),
+    );
+    await expect(t.replace(RESHAPED)).rejects.toThrow(/replacement table failed/);
+    expect(t.state).toBe("ready");
+    expect(stream.update).toHaveBeenCalledWith(PAIR(P(4, 4), P(4, 4)), { force: true });
+    expect(n.trajectorySnapshot()!.reuploads).toBe(0);
+
+    // A plain upload failure (old table still running) leaves the run alone.
+    await t.start();
+    h.replace.mockRejectedValueOnce(new Error("DATA chunk past the end of the table"));
+    await expect(t.replace(RESHAPED)).rejects.toThrow(/past the end/);
+    expect(t.state).toBe("running");
+    await t.close();
+    await input.close();
   });
 });

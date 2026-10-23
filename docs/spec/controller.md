@@ -73,7 +73,7 @@ mirror history and FIN routing keep one owner.
 `node.openTrajectory(spec, { name })` uploads `spec` (`Controller.uploadTrajectory`) and
 resolves to the node's handle
 `{ name, id, state, start(atHostNs?, cycles?), stop(), close(), onFrame(cb),
-onStateChange(cb), reupload() }`.
+onStateChange(cb), reupload(), replace(spec) }`.
 
 - **Gate.** It requires a bound `v22Capable` controller and rejects otherwise, like the
   v2 gate for streams. At most ONE trajectory is open: a second `openTrajectory` (even
@@ -107,6 +107,41 @@ onStateChange(cb), reupload() }`.
 - **Teardown.** `close()` STOPs a running trajectory and DELETEs the table. Both are
   best-effort: a dead device never throws out of `close()`. It then resumes the inputs,
   retires the graph input, and applies the disable-iff-we-enabled rule.
+
+**Replace (phase-continuous swap).** `replace(spec)` re-shapes the table without
+stopping the scan. MirrorLink calls it on every steer drag or slider move, at most 10 Hz.
+
+- **States.** It throws when the handle is `detached`, `closed` or `uploading`. From
+  `ready` it is a plain re-upload: any period, and the handle stays `ready`. From
+  `running` the period must match the current one, or it throws before anything is
+  sent (stop, replace, start to change it). The state stays `running`: inputs stay held,
+  nothing resumes, and the stats row and listeners carry over. The new spec is what a
+  later `reupload()` sends and what lateness is scored against. `reuploads` in the
+  stats row counts successful swaps since open.
+- **Wire (`TrajectoryHandle.replace`, `controller.ts`).** The new spec is uploaded
+  (BEGIN/DATA/MARK/COMMIT) to a FREE table id while the old one keeps running. Then
+  `STOP(old)` and `START(new, t_start, cycles)` are written back to back, with no
+  await between them, and both are awaited afterwards. `DELETE(old)` follows,
+  best-effort. The handle's `id` getter then reads the new id. The listener set moves
+  to the new id, and the new id's pushes reach it from START on.
+- **Phase carry.** `t_start` and `cycles` are the run's original values. The firmware
+  joins a past `t_start` in progress, so the mirror continues at the phase the old
+  table was at. For `start(atHostNs)` that is the exact MCU value sent. A "now" start
+  (`t_start = 0` on the wire) has no exact MCU instant, so the handle records the host
+  clock at send time, converted to MCU µs. The carried phase is then approximate to
+  the serial latency, and it relies on the calibrated clock offset.
+- **Failures.** If the upload fails, the partial new table is DELETEd and its id
+  freed. The old table keeps running and the error is rethrown. If `START(new)` is
+  REJected after `STOP(old)` succeeded, the handle re-STARTs the old table at the same
+  `t_start` and throws `TrajectoryReplaceError`. When that restart fails too, the
+  error has `running: false`, and the node ends the run: inputs re-take the DAC.
+- **Concurrency.** The controller handle allows one replace at a time; `start`,
+  `stop` and `dispose` wait for an in-flight one. The node COALESCES: calls made while
+  a swap is in flight collapse into one pending batch. The latest spec wins and is sent
+  once the in-flight swap lands; intermediate specs are never uploaded, and every
+  caller in the batch settles with that one swap. `stop()` waits for the in-flight swap
+  and the pending batch. `close()` rejects the pending batch, waits for the in-flight
+  swap, then STOPs and DELETEs.
 
 **FIN routing.**
 

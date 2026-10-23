@@ -20,6 +20,7 @@ import {
   type Pos,
 } from "@lib/controller-codec";
 import { registerWorkload, type WorkloadHandle } from "./metering.js";
+import { hostNowNs } from "./time-align.js";
 
 type PortInfo = Awaited<ReturnType<typeof SerialPort.list>>[number];
 
@@ -259,6 +260,8 @@ export interface TrajectoryFrameOutcome {
 
 /** An uploaded (committed) MCU trajectory table. */
 export interface TrajectoryHandle {
+  /** The CURRENT MCU table id — a getter: `replace` swaps it to the new
+   *  table (listeners and run state carry over). */
   readonly id: number;
   /** START at host-steady `atHostNs` (default: now) for `cycles` (default 0 =
    *  forever). The mirror pre-positions at phase 0 until then. */
@@ -277,8 +280,39 @@ export interface TrajectoryHandle {
    *  identity (listeners, `id` updates) over. A live steer or slider move in
    *  MirrorLink rides this. Resolves once the new table runs; throws (and
    *  leaves the old table running) if the upload fails. Not running → a plain
-   *  re-upload that leaves the handle `ready`. */
+   *  re-upload that leaves the handle `ready`.
+   *
+   *  Wire order while running: BEGIN/DATA/MARK/COMMIT(new) → STOP(old) +
+   *  START(new, t_start, cycles) written back to back (both awaited after) →
+   *  DELETE(old) best-effort. `t_start`/`cycles` are the run's original: the
+   *  exact MCU value sent by `start(atHostNs)`, or — after a "now" start —
+   *  the host clock at send time converted to MCU µs, so the carried phase is
+   *  then approximate to the serial latency (and relies on the calibrated
+   *  clock offset). One replace at a time per handle (a second concurrent
+   *  call throws; `NodeTrajectory.replace` coalesces); `start`/`stop`/
+   *  `dispose` wait for an in-flight one. A failure AFTER the STOP/START pair
+   *  went out throws `TrajectoryReplaceError` (`running` says whether the old
+   *  table is still running). */
   replace(spec: TrajectorySpec): Promise<void>;
+}
+
+/** A `TrajectoryHandle.replace` that failed after the STOP/START pair: START
+ *  of the new table was REJected. The handle tried to re-START the old table
+ *  at the original `t_start`; `running` is false when that failed too (the
+ *  run is over — the mirror holds its last position). */
+export class TrajectoryReplaceError extends Error {
+  constructor(
+    message: string,
+    readonly running: boolean,
+    readonly cause?: unknown,
+  ) {
+    super(message);
+    this.name = "TrajectoryReplaceError";
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 /** Host-side validation of a trajectory spec against the firmware limits —
@@ -818,6 +852,9 @@ export class Controller {
     number,
     Set<(frame: TrajectoryFrameOutcome) => void>
   >();
+  /** Per-id run tracking of the owning handle (a run-level ENDED/CANCELLED
+   *  clears its running view) — routed with the listener set on a replace. */
+  private readonly trajectoryRunHooks = new Map<number, (f: TrajectoryFrame) => void>();
   private trajectoryPushBound = false;
 
   /** Decode one SYN CMD_TRAJECTORY push like `frame()`'s FIN: volts, and MCU
@@ -840,6 +877,7 @@ export class Controller {
     if (this.trajectoryPushBound) return;
     this.trajectoryPushBound = true;
     this.device.onPush(Protocol.Command.TrajectoryFrame, (f) => {
+      this.trajectoryRunHooks.get(f.id)?.(f);
       const listeners = this.trajectoryListeners.get(f.id);
       if (!listeners || listeners.size === 0) return;
       const outcome = this.decodeTrajectoryFrame(f);
@@ -853,32 +891,31 @@ export class Controller {
     });
   }
 
-  /**
-   * Upload a periodic trajectory to the MCU (CMD_TRAJECTORY BEGIN → DATA
-   * chunks → MARK → COMMIT, all ACK-backed; DATA pipelined
-   * TRAJECTORY_UPLOAD_WINDOW deep). Positions are volts, converted with the
-   * same `channels()` math as streams. The returned handle STARTs/STOPs the
-   * MCU-side playback; its `onFrame` is fed by the per-marker SYN pushes.
-   * Steady state: zero host→MCU bytes, one push per marker firing. Requires
-   * firmware >= 2.2.0. A failed upload DELETEs the partial table.
-   */
-  async uploadTrajectory(spec: TrajectorySpec): Promise<TrajectoryHandle> {
-    if (!this.device.connected) throw new Error("Controller not connected");
-    if (!this.v22Capable)
-      throw new Error(
-        "uploadTrajectory requires firmware >= 2.2.0 (CMD_TRAJECTORY unavailable)",
-      );
-    validateTrajectorySpec(spec);
-    let id = -1;
+  /** Reserve the lowest FREE table id (throws at capacity). */
+  private allocTrajectoryId(): number {
     for (let candidate = 0; candidate < TRAJECTORY_MAX_TABLES; candidate++)
       if (!this.trajectoryIds.has(candidate)) {
-        id = candidate;
-        break;
+        this.trajectoryIds.add(candidate);
+        return candidate;
       }
-    if (id < 0)
-      throw new Error(`Trajectory capacity (${TRAJECTORY_MAX_TABLES} tables) exceeded`);
-    this.trajectoryIds.add(id);
-    this.bindTrajectoryPush();
+    throw new Error(`Trajectory capacity (${TRAJECTORY_MAX_TABLES} tables) exceeded`);
+  }
+
+  /** `set` with a synchronous throw (disconnected) turned into a rejection,
+   *  so two writes can be issued back to back and settled together. */
+  private sendTrajectory(arg: Record<string, unknown>): Promise<unknown> {
+    try {
+      return this.set(Protocol.Command.Trajectory, arg);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+
+  /** BEGIN → DATA chunks (pipelined) → MARK → COMMIT of `spec` into the
+   *  reserved table `id` — the one upload path (`uploadTrajectory` and
+   *  `TrajectoryHandle.replace`). A failure DELETEs the partial table
+   *  (best-effort) and rethrows; releasing the id is the caller's. */
+  private async uploadTable(id: number, spec: TrajectorySpec): Promise<void> {
     const Trajectory = Protocol.Command.Trajectory;
     try {
       await this.set(Trajectory, {
@@ -916,42 +953,201 @@ export class Controller {
       await this.set(Trajectory, { op: "COMMIT", id });
     } catch (error) {
       try {
-        await this.set(Trajectory, { op: "DELETE", id });
+        await this.sendTrajectory({ op: "DELETE", id });
       } catch {
         // best-effort cleanup on a dead/REJecting device
       }
-      this.trajectoryIds.delete(id);
+      throw error;
+    }
+  }
+
+  /**
+   * Upload a periodic trajectory to the MCU (CMD_TRAJECTORY BEGIN → DATA
+   * chunks → MARK → COMMIT, all ACK-backed; DATA pipelined
+   * TRAJECTORY_UPLOAD_WINDOW deep). Positions are volts, converted with the
+   * same `channels()` math as streams. The returned handle STARTs/STOPs the
+   * MCU-side playback; its `onFrame` is fed by the per-marker SYN pushes.
+   * Steady state: zero host→MCU bytes, one push per marker firing. Requires
+   * firmware >= 2.2.0. A failed upload DELETEs the partial table.
+   */
+  async uploadTrajectory(spec: TrajectorySpec): Promise<TrajectoryHandle> {
+    if (!this.device.connected) throw new Error("Controller not connected");
+    if (!this.v22Capable)
+      throw new Error(
+        "uploadTrajectory requires firmware >= 2.2.0 (CMD_TRAJECTORY unavailable)",
+      );
+    validateTrajectorySpec(spec);
+    const firstId = this.allocTrajectoryId();
+    this.bindTrajectoryPush();
+    try {
+      await this.uploadTable(firstId, spec);
+    } catch (error) {
+      this.trajectoryIds.delete(firstId);
       throw error;
     }
 
+    // The handle's CURRENT table — `replace` swaps it (and moves the
+    // listener set + run hook to the new id); `id` reads it live.
+    let id = firstId;
+    let periodUs = spec.periodUs;
     const listeners = new Set<(frame: TrajectoryFrameOutcome) => void>();
-    this.trajectoryListeners.set(id, listeners);
+    // The host's view of the run: set on a START ack, cleared on a STOP ack,
+    // dispose, or a run-level ENDED / CANCELLED push. `tStartMcuUs` is the
+    // MCU instant the run is anchored at — the exact value sent for an
+    // explicit start, the converted send-time host clock for a "now" start
+    // (t_start = 0 on the wire; the carried phase is then approximate to the
+    // serial latency). `replace` re-STARTs the new table at it.
+    let run: { tStartMcuUs: bigint; cycles: number } | null = null;
+    const runHook = (f: TrajectoryFrame) => {
+      if (f.marker === null && (f.status === "ENDED" || f.status === "CANCELLED")) run = null;
+    };
+    /** Route `to`'s pushes to this handle (listeners + run hook). */
+    const route = (to: number) => {
+      this.trajectoryListeners.set(to, listeners);
+      this.trajectoryRunHooks.set(to, runHook);
+    };
+    /** Forget `from`'s routing iff it is still this handle's. */
+    const unroute = (from: number) => {
+      if (this.trajectoryListeners.get(from) === listeners) this.trajectoryListeners.delete(from);
+      if (this.trajectoryRunHooks.get(from) === runHook) this.trajectoryRunHooks.delete(from);
+    };
+    route(id);
     let disposed = false;
+    // One replace at a time; start/stop/dispose wait for an in-flight one.
+    let inflight: Promise<void> | null = null;
+    const settle = async () => {
+      while (inflight) await inflight.catch(() => {});
+    };
     const live = (what: string) => {
       if (disposed) throw new Error(`Trajectory ${id} is disposed (${what})`);
     };
+    /** DELETE `table` best-effort and release its id. */
+    const drop = async (table: number) => {
+      try {
+        if (this.device.connected) await this.sendTrajectory({ op: "DELETE", id: table });
+      } catch {
+        // best-effort — a dead/REJecting device
+      } finally {
+        this.trajectoryIds.delete(table);
+      }
+    };
+
+    const doReplace = async (next: TrajectorySpec): Promise<void> => {
+      validateTrajectorySpec(next);
+      if (run && next.periodUs !== periodUs)
+        throw new Error(
+          `Trajectory ${id}: replace while running needs the same period (${periodUs} µs, got ${next.periodUs} µs) — stop, replace, then start`,
+        );
+      if (!this.device.connected) throw new Error("Controller not connected");
+      const oldId = id;
+      const newId = this.allocTrajectoryId();
+      try {
+        await this.uploadTable(newId, next);
+      } catch (error) {
+        this.trajectoryIds.delete(newId); // uploadTable DELETEd the partial table
+        throw error;
+      }
+      if (disposed) {
+        // dispose() came in during the upload (it waits for us): never START
+        // the new table — retire it; dispose then DELETEs the old one.
+        await drop(newId);
+        throw new Error(`Trajectory ${oldId} is disposed (replace)`);
+      }
+      const carried = run;
+      if (!carried) {
+        // Not running: a plain re-upload — swap, then retire the old table.
+        route(newId);
+        unroute(oldId);
+        id = newId;
+        periodUs = next.periodUs;
+        await drop(oldId);
+        return;
+      }
+      // Running: STOP(old) + START(new, original t_start) back to back — the
+      // firmware joins a past t_start in progress, so the phase carries over.
+      // The new id's pushes reach the same listeners from START on.
+      route(newId);
+      const [stopped, started] = await Promise.allSettled([
+        this.sendTrajectory({ op: "STOP", id: oldId }),
+        this.sendTrajectory({
+          op: "START",
+          id: newId,
+          t_start: carried.tStartMcuUs,
+          cycles: carried.cycles,
+        }),
+      ]);
+      if (started.status === "fulfilled") {
+        unroute(oldId);
+        id = newId;
+        await drop(oldId);
+        return;
+      }
+      // START(new) failed: the new table never ran. Retire it; if STOP(old)
+      // went through, re-START the old table at the same t_start (phase-
+      // continuous again) so the scan keeps running on the old spec.
+      unroute(newId);
+      await drop(newId);
+      let running = true;
+      if (stopped.status === "fulfilled") {
+        try {
+          await this.sendTrajectory({
+            op: "START",
+            id: oldId,
+            t_start: carried.tStartMcuUs,
+            cycles: carried.cycles,
+          });
+        } catch {
+          running = false;
+          if (run === carried) run = null;
+        }
+      }
+      throw new TrajectoryReplaceError(
+        `Trajectory ${oldId}: START of the replacement table failed (${errorMessage(started.reason)})` +
+          (running ? " — still running the previous spec" : " and the old table could not be restarted"),
+        running,
+        started.reason,
+      );
+    };
+
     return {
-      id,
+      get id() {
+        return id;
+      },
       start: async (atHostNs?: bigint, cycles = 0) => {
         live("start");
-        await this.set(Trajectory, {
+        await settle();
+        live("start");
+        const tStart =
+          atHostNs === undefined ? 0n : hostNsToMcuUs(atHostNs, this.clockOffsetNs);
+        // A "now" start has no exact MCU instant: estimate it from the host
+        // clock at send time (off by the serial latency).
+        const anchor =
+          atHostNs === undefined ? hostNsToMcuUs(hostNowNs(), this.clockOffsetNs) : tStart;
+        await this.set(Protocol.Command.Trajectory, {
           op: "START",
           id,
-          t_start: atHostNs === undefined ? 0n : hostNsToMcuUs(atHostNs, this.clockOffsetNs),
+          t_start: tStart,
           cycles,
         });
+        run = { tStartMcuUs: anchor, cycles };
       },
       stop: async () => {
         live("stop");
-        await this.set(Trajectory, { op: "STOP", id });
+        await settle();
+        live("stop");
+        await this.set(Protocol.Command.Trajectory, { op: "STOP", id });
+        run = null;
       },
       dispose: async () => {
         if (disposed) return;
         disposed = true;
+        await settle();
+        run = null;
         listeners.clear();
-        this.trajectoryListeners.delete(id);
+        unroute(id);
         try {
-          if (this.device.connected) await this.set(Trajectory, { op: "DELETE", id });
+          if (this.device.connected)
+            await this.set(Protocol.Command.Trajectory, { op: "DELETE", id });
         } finally {
           this.trajectoryIds.delete(id);
         }
@@ -963,11 +1159,16 @@ export class Controller {
           listeners.delete(cb);
         };
       },
-      replace: async () => {
+      replace: async (next: TrajectorySpec) => {
         live("replace");
-        // Implemented by the trajectory-replace workstream (see
-        // docs/spec/mirror-link-scan-patterns.md §replace).
-        throw new Error("TrajectoryHandle.replace is not implemented yet");
+        if (inflight) throw new Error(`Trajectory ${id}: a replace is already in flight`);
+        const p = doReplace(next);
+        inflight = p;
+        try {
+          await p;
+        } finally {
+          inflight = null;
+        }
       },
     };
   }

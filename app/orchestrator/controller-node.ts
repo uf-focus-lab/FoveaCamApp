@@ -153,7 +153,12 @@ export interface NodeTrajectory {
    *  `TrajectoryHandle.replace`: the mirror keeps sweeping, position inputs
    *  stay held, pushes keep flowing on this handle. From `ready` it is a plain
    *  re-upload. Throws when detached/closed/uploading, or on a period change
-   *  while running (stop first). */
+   *  while running (stop first). The new spec is what `reupload()` sends;
+   *  `reuploads` in the stats row counts successful swaps. Calls made while
+   *  a swap is in flight COALESCE (latest spec wins, sent once the in-flight
+   *  swap lands; every coalesced caller settles with it). `stop()` waits for
+   *  in-flight + pending swaps; `close()` rejects the pending one and waits
+   *  for the in-flight one. */
   replace(spec: TrajectorySpec): Promise<void>;
 }
 
@@ -1023,6 +1028,20 @@ class NodeTrajectoryImpl implements NodeTrajectory {
   private lastLatenessUs: number | null = null;
   private readonly statusCounts: Record<string, number> = {};
   private heldPushes = 0;
+  private reuploads = 0;
+  // replace(): ONE swap in flight; further calls COALESCE into a single
+  // pending batch whose spec is the latest one (every coalesced caller
+  // resolves/rejects with that batch). `replacingSpec` is the in-flight
+  // spec — pushes from the new table id are scored against it until the
+  // swap lands.
+  private replaceInflight: Promise<void> | null = null;
+  private replacePending: {
+    spec: TrajectorySpec;
+    promise: Promise<void>;
+    resolve: () => void;
+    reject: (error: unknown) => void;
+  } | null = null;
+  private replacingSpec: TrajectorySpec | null = null;
 
   readonly wiringNode: WiredNode = {
     id: trajectoryNodeId(),
@@ -1034,7 +1053,7 @@ class NodeTrajectoryImpl implements NodeTrajectory {
   constructor(
     private readonly node: ControllerNode,
     readonly name: string,
-    private readonly spec: TrajectorySpec,
+    private spec: TrajectorySpec,
   ) {}
 
   get id(): number | null {
@@ -1131,6 +1150,8 @@ class NodeTrajectoryImpl implements NodeTrajectory {
   }
 
   async stop(): Promise<void> {
+    // A replace in flight (and a coalesced pending one) lands first.
+    if (this.replaceInflight) await this.drainReplace();
     if (this._state !== "running") return;
     await this.handle!.stop();
     this.endRun();
@@ -1145,6 +1166,15 @@ class NodeTrajectoryImpl implements NodeTrajectory {
 
   async close(): Promise<void> {
     if (this._state === "closed") return;
+    // A pending (coalesced, not yet sent) replace is moot; an in-flight one
+    // lands first so its tables are known before STOP/DELETE.
+    const pending = this.replacePending;
+    this.replacePending = null;
+    pending?.reject(new Error(`Trajectory "${this.name}" closed before the replace was sent`));
+    if (this.replaceInflight) {
+      await this.drainReplace();
+      if (this.isState("closed")) return; // a concurrent close won
+    }
     const wasRunning = this._state === "running";
     const h = this.handle;
     this.unsubscribe?.();
@@ -1186,10 +1216,85 @@ class NodeTrajectoryImpl implements NodeTrajectory {
     };
   }
 
-  async replace(_spec: TrajectorySpec): Promise<void> {
-    // Implemented by the trajectory-replace workstream (see
-    // docs/spec/mirror-link-scan-patterns.md §replace).
-    throw new Error("NodeTrajectory.replace is not implemented yet");
+  /** See {@link NodeTrajectory.replace}. Concurrency: one swap at a time;
+   *  calls made while one is in flight COALESCE — the latest spec wins and
+   *  is sent once the in-flight swap lands (intermediate specs are never
+   *  uploaded; every coalesced caller settles with that one swap). */
+  replace(spec: TrajectorySpec): Promise<void> {
+    try {
+      this.assertReplaceable(spec);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    if (!this.replaceInflight) return this.launchReplace(spec);
+    if (this.replacePending) {
+      this.replacePending.spec = spec;
+      return this.replacePending.promise;
+    }
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<void>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    this.replacePending = { spec, promise, resolve, reject };
+    return promise;
+  }
+
+  private assertReplaceable(spec: TrajectorySpec): void {
+    if (this._state === "detached")
+      throw new Error(
+        `Trajectory "${this.name}" is detached (controller unbound or swapped) — reupload() or close() it`,
+      );
+    if (this._state === "closed") throw new Error(`Trajectory "${this.name}" is closed`);
+    if (this._state === "uploading")
+      throw new Error(`Trajectory "${this.name}" is still uploading`);
+    const current = this.replacingSpec ?? this.spec;
+    if (this._state === "running" && spec.periodUs !== current.periodUs)
+      throw new Error(
+        `Trajectory "${this.name}": replace while running needs the same period (${current.periodUs} µs, got ${spec.periodUs} µs) — stop() first`,
+      );
+  }
+
+  /** Start one swap; when it settles, launch the coalesced pending batch (if
+   *  any) BEFORE any awaiter of this one resumes, so `drainReplace` sees it. */
+  private launchReplace(spec: TrajectorySpec): Promise<void> {
+    const p = this.runReplace(spec);
+    this.replaceInflight = p;
+    const after = () => {
+      if (this.replaceInflight === p) this.replaceInflight = null;
+      const next = this.replacePending;
+      this.replacePending = null;
+      if (next) this.launchReplace(next.spec).then(next.resolve, next.reject);
+    };
+    void p.then(after, after);
+    return p;
+  }
+
+  private async runReplace(spec: TrajectorySpec): Promise<void> {
+    this.assertReplaceable(spec); // re-checked: a coalesced batch runs later
+    const h = this.handle!;
+    this.replacingSpec = spec;
+    try {
+      await h.replace(spec);
+    } catch (error) {
+      // The swap failed after STOP(old) and the old table could not be
+      // re-STARTed: the run is over — inputs re-take the DAC.
+      if ((error as { running?: boolean } | null)?.running === false && this.handle === h)
+        this.endRun();
+      throw error;
+    } finally {
+      this.replacingSpec = null;
+    }
+    // Running stays running (inputs stay held, no resume); the new spec is
+    // what reupload() sends and what lateness is scored against.
+    this.spec = spec;
+    this.reuploads++;
+  }
+
+  /** Wait until no replace is in flight or pending (errors are the callers'). */
+  private async drainReplace(): Promise<void> {
+    while (this.replaceInflight) await this.replaceInflight.catch(() => {});
   }
 
   async reupload(): Promise<void> {
@@ -1237,12 +1342,15 @@ class NodeTrajectoryImpl implements NodeTrajectory {
       if (f.cycle + 1 > this.cyclesSeen) this.cyclesSeen = f.cycle + 1;
     }
     if (f.status === "OK" && f.marker !== null) {
-      const marker = this.spec.markers?.[f.marker];
+      // Mid-swap, pushes from the NEW table belong to the in-flight spec.
+      const spec =
+        this.replacingSpec && f.trajectoryId !== this.handle?.id ? this.replacingSpec : this.spec;
+      const marker = spec.markers?.[f.marker];
       if (marker && this.startHostNs !== null)
         this.lastLatenessUs =
           Number(
             f.tTrigger -
-              expectedTriggerNs(this.startHostNs, f.cycle, this.spec.periodUs, marker.tOffsetUs),
+              expectedTriggerNs(this.startHostNs, f.cycle, spec.periodUs, marker.tOffsetUs),
           ) / 1000;
       this.node.forwardTrajectoryFrame(f);
     } else {
@@ -1280,6 +1388,7 @@ class NodeTrajectoryImpl implements NodeTrajectory {
       lastLatenessUs: this.lastLatenessUs,
       latenessExact: this.startExact,
       heldPushes: this.heldPushes,
+      reuploads: this.reuploads,
     };
   }
 }
