@@ -490,3 +490,24 @@ Four reviews on ec68dc7. No blockers. Fixed in round 7:
   windows end at the same point of their sweep"; the spec's ring row drops
   `off` (the row is mounted only while the reader is on); the brief's
   round-6 section records the harness rework's extra changes (h)-(l).
+- **Simulator harness classification (firmware clean; mutation-tested):**
+  a fixture-miss classification never makes a check pass (it re-runs), but
+  it pointed the wrong way in both directions. Decisions — (a) C5's "a's
+  capture did not start before the swap" is a STRICT check (the rises were
+  observed before the send, so `t_trigger < t_exposure < tSwap` always holds
+  on correct firmware; the branch only ever fired on a timestamp fault);
+  (b) the stall excuse is classified by mismatch KIND: a repeated or
+  backward (cycle, marker) or a wrong table id is always strict; a skipped
+  cycle needs a stall ≥ ~P; a BUSY needs the inter-marker idle gap; an ENDED
+  overtaking the last OK needs the end gap; a STROBE_TIMEOUT keeps
+  TIMEOUT_SLACK; (c) three strict checks that fail on correct firmware under
+  starvation become stall-aware: C5's latch check is a fixture miss when a
+  strobe fall line precedes b's first CH1_B word on stdout (deterministic
+  order), `discardPushes` keeps draining pushes with cycle ≤ `last` (a
+  BUSY(c) legitimately precedes OK(c−1)), and C4's `ran.size() > 10` is tied
+  to elapsed MCU time; (d) `checkTimed` does a GET round trip before pumping
+  so a stall inside one loop pass is reported before the check reads, and
+  the comments say so; (e) `checkRamp`'s "keeps advancing across the swap"
+  uses the window `[tSwap, tSwap + P]` and compares b's first CH1_B word
+  against the last word before the swap; (f) C4's post-START loop expects
+  exactly OK(cycle 0) then ENDED.
