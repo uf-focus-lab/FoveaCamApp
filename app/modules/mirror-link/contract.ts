@@ -5,9 +5,10 @@
 // -------------------------------------------------------
 //
 // Typed boundary for the mirror-link session — a calibrated L/C/R triple whose
-// two fovea mirrors trace a fast CIRCULAR scan around a hand-aimed center while
-// each fovea's exposure spans exactly one revolution. Behavior spec:
-// docs/spec/mirror-link.md.
+// two fovea mirrors trace a fast periodic SCAN PATTERN (ellipse / line /
+// triangle) around a hand-aimed center, run on the MCU as an uploaded
+// trajectory whose markers trigger the fovea exposures at exact phases.
+// Behavior spec: docs/spec/mirror-link.md (patterns: §scan-patterns).
 
 import { cmd, defineContract } from "@lib/orchestrator/protocol";
 import {
@@ -29,12 +30,53 @@ import type { RingReadout } from "@lib/ring-code";
  *  constrained to `Serializable` (an index-signature type), which an interface
  *  does not satisfy implicitly. */
 export type ScanTelemetry = {
+  /** The pattern the trajectory was built from (spec §scan-patterns). */
+  mode: ScanMode;
+  /** Base scan frequency (`state.scan_hz`). The trajectory period is `1/hz`
+   *  for the ellipse and `2/hz` for the triangle (one rising + one falling
+   *  sweep per cycle). */
   hz: number;
   amp_deg: number;
+  /** The TRAJECTORY period on the MCU (µs): T, or 2T for the triangle. */
   period_us: number;
+  /** Trigger markers per period: 1 (ellipse) or 2 (triangle), in marker
+   *  order. Each window is `{ t_offset_us, pulse_us }` — the exposure starts
+   *  at the offset and lasts the pulse (TriggerWidth exposure). */
+  windows: { t_offset_us: number; pulse_us: number }[];
+  /** How the cameras take the window: `TriggerWidth` (the trigger pulse IS
+   *  the exposure, the primary mode) or `Timed` (fallback on a model without
+   *  TriggerWidth: exposure = the first window's pulse; unequal triangle
+   *  windows then mismatch). */
+  exposure_mode: "TriggerWidth" | "Timed";
+  /** Per-eye applied values (post-clamp): the Timed exposure (0 in
+   *  TriggerWidth mode) and the camera's readback frame rate limit. */
   exposure_us: { L: number; R: number };
   frame_rate: { L: number; R: number };
+  /** Set when the cameras cannot take the requested window (Timed clamp, or
+   *  unequal triangle windows in Timed mode). */
   mismatch: boolean;
+};
+
+/** Scan pattern family (spec §scan-patterns). */
+export type ScanMode = "ellipse" | "triangle";
+
+/** A fraction-of-slope exposure window `[start, end]`, 0..1, start < end. */
+export type ScanWindow = [number, number];
+
+/** Trajectory + flip bookkeeping while the scan runs (spec §actuation). */
+export type TrajectoryTelemetry = {
+  /** True while the MCU trajectory is RUNNING (the node owns the DAC). */
+  running: boolean;
+  /** Pushes seen this run by status. */
+  pushes: { ok: number; timeout: number; busy: number; other: number };
+  /** Last marker lateness vs its phase (µs; exact only for an explicit start). */
+  lateness_us: number;
+  /** Phase-continuous re-uploads this run (steer / slider moves while active). */
+  reuploads: number;
+  /** Triangle mode: frames the flip bricks flipped / could not match to a
+   *  marker, per eye (0 in ellipse mode). */
+  flipped: { L: number; R: number };
+  unmatched: { L: number; R: number };
 };
 
 /** Matched fovea footprint + confidence, lifted into wide-frame pixels — the
@@ -76,15 +118,41 @@ export const mirrorLink = defineContract({
      *  same. Written as a WHOLE object (the session client only emits
      *  `setState` from a top-level key's ref). */
     tuning: DEFAULT_VERGENCE_TUNING,
-    // Scan parameters (spec §scan) — LIVE while active.
-    scan_hz: 10, // 100 ms revolution
-
-    scan_amp: 0.5, // scan radius (deg)
-    /** The native generator's tick rate (Hz, clamped 200–1000 by the brick).
-     *  No slider — a config/rig knob for a serial link that cannot carry
-     *  1 kHz; the geometry is unaffected, only the poses per revolution
-     *  (spec §actuation). */
-    orbit_pace_hz: 1000,
+    // Scan parameters (spec §scan, §scan-patterns) — LIVE while active (a
+    // change re-uploads the trajectory phase-continuously).
+    /** Base frequency (Hz): one ellipse revolution, or one triangle SWEEP
+     *  (the triangle period is 2/hz). Also the camera trigger rate per
+     *  marker. */
+    scan_hz: 10,
+    /** Pattern family: elliptical (ratio 1 = the circle, 0 = a line) or
+     *  triangular (a linear sweep out and back). */
+    scan_mode: "ellipse" as ScanMode,
+    /** Main-axis direction, degrees counter-clockwise from +x of the wide
+     *  angular frame, (-180, 180]. Set by dragging the axis handle on the
+     *  center view (`setAxis`) or the pane slider. */
+    scan_axis_deg: 0,
+    /** Semi-major half-length along the main axis (deg): the ellipse's major
+     *  radius, the triangle's half sweep. */
+    scan_amp: 0.5,
+    /** Ellipse minor/major ratio, 0..1. 0 collapses the ellipse to a linear
+     *  sinusoidal scan along the main axis. Ignored by the triangle. */
+    scan_ratio: 1,
+    /** Ellipse: the exposure window as fractions of the period. One trigger
+     *  per period at `start`, exposing for `end - start` of it. */
+    scan_window: [0, 0.95] as ScanWindow,
+    /** Triangle: exposure window on the RISING sweep (−amp → +amp), as
+     *  fractions of that sweep (T). */
+    tri_window_rise: [0.05, 0.95] as ScanWindow,
+    /** Triangle: exposure window on the FALLING sweep (+amp → −amp). Follows
+     *  `tri_window_rise` while `tri_window_sync` is on. */
+    tri_window_fall: [0.05, 0.95] as ScanWindow,
+    /** Keep the falling window identical to the rising one. */
+    tri_window_sync: true as boolean,
+    /** Triangle mode: the per-eye FLIP pipe ids the views and the ring reader
+     *  must bind instead of the raw convert pipes while the scan runs — the
+     *  falling-sweep frame arrives vertically flipped from them (spec
+     *  §triangle-flip). Null = bind the raw convert pipe. */
+    flipPipes: { L: null, R: null } as { L: string | null; R: string | null },
   },
   telemetry: {
     ready: false as boolean, // calibrated triple leased + conversions loaded
@@ -94,18 +162,25 @@ export const mirrorLink = defineContract({
      *  ring's CENTER — the PosView crosshair stays put instead of flickering at
      *  the telemetry throttle (spec §views). */
     volt: { L: { x: 0, y: 0 }, R: { x: 0, y: 0 } } as { L: Pos; R: Pos },
-    /** The commanded scan circle in VOLT space, one closed loop per eye
-     *  (`SCAN_PATH_SAMPLES` points) — the PosViews draw the path itself.
+    /** The commanded scan PATH in VOLT space, one polyline per eye
+     *  (`SCAN_PATH_SAMPLES` points; the renderer closes the ellipse, draws the
+     *  triangle/line as an open segment) — the PosViews draw the path itself.
      *  Empty uncalibrated; republished on every geometry change, never per
      *  tick (spec §views). */
     scan_path: { L: [], R: [] } as { L: Pos[]; R: Pos[] },
+    /** The same path projected into WIDE px for the center view overlay
+     *  (ellipse closed, line/triangle open); empty uncalibrated. */
+    scan_path_px: [] as Point2d[],
+    /** The EXPOSED portions of the path in wide px, one polyline per marker
+     *  window (drawn emphasized; the rest of the path dim). */
+    scan_window_px: [] as Point2d[][],
+    /** The draggable main-axis handle: the +amp end of the axis in wide px
+     *  ({0,0} uncalibrated — hidden). */
+    axis_handle_px: { x: 0, y: 0 } as Point2d,
     // Per-eye wide-px projection of the offset-free CENTER pose (shift
     // included) — where each fovea is aimed; {0,0} uncalibrated (spec §views).
     L_PX: { x: 0, y: 0 } as Point2d,
     R_PX: { x: 0, y: 0 } as Point2d,
-    /** Scan ring radius in wide px at the current center/amplitude; 0
-     *  uncalibrated (spec §views). */
-    scan_px: 0,
     /** The gain range BOTH foveas honor — the intersection of their
      *  `gain_range`s (spec §gain). `min === max === 0` until leased (or on a
      *  disjoint pair): the slider stays disabled. */
@@ -141,24 +216,15 @@ export const mirrorLink = defineContract({
     perf: {
       actuateMs: { mean: 0, max: 0 } as Stat,
       tickGapMs: { mean: 0, max: 0 } as Stat,
-      // The native scan generator. `emitHz` is the brick's own thread (a rate
-      // that holds while `tickGapMs.max` spikes is the whole point of the
-      // brick); `sinkHz` is what reaches the WIRE after the mirror sink's gate
-      // and AIMD governor. `sinkHz / scan_hz` is the poses per revolution —
-      // too few and the ring is drawn as a polygon, so the governor block says
-      // which signal caused the backoff (spec §actuation).
-      orbit: {
-        native: false as boolean,
-        emitHz: 0,
-        sinkHz: 0,
-        governor: {
-          state: "off" as "off" | "steady" | "seeking" | "backoff",
-          effectiveRateHz: 0,
-          backoffs: 0,
-          softFails: 0,
-          outq: 0,
-        },
-      },
+      // The MCU trajectory run + the triangle flip bricks (spec §actuation).
+      trajectory: {
+        running: false,
+        pushes: { ok: 0, timeout: 0, busy: 0, other: 0 },
+        lateness_us: 0,
+        reuploads: 0,
+        flipped: { L: 0, R: 0 },
+        unmatched: { L: 0, R: 0 },
+      } as TrajectoryTelemetry,
     },
     // Capture manifest telemetry (spec §capture); image data pulled via
     // `getCapturePreview`.
@@ -176,6 +242,10 @@ export const mirrorLink = defineContract({
   commands: {
     /** Move the scan CENTER to a wide-view pixel (spec §targeting). */
     steer: cmd<Point2d>(),
+    /** Point the scan's MAIN AXIS at a wide-view pixel: the direction from the
+     *  center to it (through the pixel→angle map) becomes `scan_axis_deg`
+     *  (spec §scan-patterns). The pane slider writes the state directly. */
+    setAxis: cmd<Point2d>(),
     /** Engage auto vergence — the fovea-into-wide template-match loop
      *  (spec §targeting). Resolves `false` when refused. */
     startVergence: cmd<void, boolean>(),

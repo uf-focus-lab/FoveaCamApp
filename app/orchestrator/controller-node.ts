@@ -149,6 +149,12 @@ export interface NodeTrajectory {
   /** Re-upload the same spec to the currently bound v2.2 controller (only
    *  from `detached`); back to `ready` on success, `detached` on failure. */
   reupload(): Promise<void>;
+  /** Swap in a new spec (same period) PHASE-CONTINUOUSLY while running —
+   *  `TrajectoryHandle.replace`: the mirror keeps sweeping, position inputs
+   *  stay held, pushes keep flowing on this handle. From `ready` it is a plain
+   *  re-upload. Throws when detached/closed/uploading, or on a period change
+   *  while running (stop first). */
+  replace(spec: TrajectorySpec): Promise<void>;
 }
 
 /** Native position input: a session pipes a native volts producer (compose brick
@@ -1178,6 +1184,12 @@ class NodeTrajectoryImpl implements NodeTrajectory {
     return () => {
       this.stateListeners.delete(cb);
     };
+  }
+
+  async replace(_spec: TrajectorySpec): Promise<void> {
+    // Implemented by the trajectory-replace workstream (see
+    // docs/spec/mirror-link-scan-patterns.md §replace).
+    throw new Error("NodeTrajectory.replace is not implemented yet");
   }
 
   async reupload(): Promise<void> {

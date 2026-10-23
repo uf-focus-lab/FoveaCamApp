@@ -270,6 +270,15 @@ export interface TrajectoryHandle {
   dispose(): Promise<void>;
   /** Subscribe to this table's pushes; returns the unsubscribe function. */
   onFrame(cb: (frame: TrajectoryFrameOutcome) => void): () => void;
+  /** PHASE-CONTINUOUS swap to a new spec of the SAME period while running:
+   *  upload `spec` to a second table id, STOP this one, START the new one at
+   *  this run's original `t_start` (so the MCU joins the new table at the
+   *  phase the old one was at), DELETE the old table, and carry this handle's
+   *  identity (listeners, `id` updates) over. A live steer or slider move in
+   *  MirrorLink rides this. Resolves once the new table runs; throws (and
+   *  leaves the old table running) if the upload fails. Not running → a plain
+   *  re-upload that leaves the handle `ready`. */
+  replace(spec: TrajectorySpec): Promise<void>;
 }
 
 /** Host-side validation of a trajectory spec against the firmware limits —
@@ -953,6 +962,12 @@ export class Controller {
         return () => {
           listeners.delete(cb);
         };
+      },
+      replace: async () => {
+        live("replace");
+        // Implemented by the trajectory-replace workstream (see
+        // docs/spec/mirror-link-scan-patterns.md §replace).
+        throw new Error("TrajectoryHandle.replace is not implemented yet");
       },
     };
   }
