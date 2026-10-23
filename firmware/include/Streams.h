@@ -114,7 +114,8 @@ enum class Owner : uint8_t { STREAMS, TRAJECTORY, HOLD };
 
 Owner owner();
 // Trajectory takes the DAC (pending stream writes are discarded; the next
-// drive() always writes).
+// drive() always writes — and nothing else does: a pending touch() is dropped
+// so the previous run's position is never re-driven before phase 0).
 void claim();
 // Writes `left`/`right` to the DAC if they changed (or a touch() is pending).
 // No-op unless owner() == TRAJECTORY.

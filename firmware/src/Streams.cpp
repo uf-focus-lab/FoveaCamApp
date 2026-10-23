@@ -381,16 +381,24 @@ uint32_t droppedFull() { return dropFull; }
 
 Owner owner() { return dacOwner; }
 
+// The first drive() after claim() writes unconditionally. A flag of its own,
+// NOT `refresh`: Streams::tick() runs before Trajectory::tick() in loop(), and
+// a pending refresh under TRAJECTORY ownership re-writes the LAST run's drive
+// position — a stale value that would move the mirror for one tick before
+// the new run's phase 0.
+bool firstDrive = false;
+
 void claim() {
   dacOwner = Owner::TRAJECTORY;
   dirty = false;
-  refresh = true; // the first drive() always writes
+  refresh = false; // never re-drive the previous run's position
+  firstDrive = true;
 }
 
 void drive(const MirrorPosition &left, const MirrorPosition &right) {
   if (dacOwner != Owner::TRAJECTORY)
     return;
-  if (!refresh && samePosition(left, driveLeft) &&
+  if (!firstDrive && !refresh && samePosition(left, driveLeft) &&
       samePosition(right, driveRight))
     return;
   noInterrupts();
@@ -399,6 +407,7 @@ void drive(const MirrorPosition &left, const MirrorPosition &right) {
   interrupts();
   writeDac(left, right);
   refresh = false;
+  firstDrive = false;
 }
 
 void release() {

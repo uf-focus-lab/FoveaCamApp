@@ -1162,6 +1162,29 @@ int main() {
         CHECK(x == held, "STOP holds the last position");
       CHECK(!hasValue(v, 22000), "STOP does not snap back to the stream");
 
+      // A fresh START after the mid-run STOP: the FIRST DAC word of the new
+      // run is its phase 0 (1000), never the held position — Streams::claim
+      // must not re-drive the previous run's stale drive position for a tick
+      // (Streams::tick runs before Trajectory::tick).
+      Cmd::TrajectoryStart re = st;
+      re.t_start = mcuNow(wire) + 30'000;
+      re.cycles = 1;
+      mark = sim.lines.size();
+      expectOk(trajectoryOp(wire, &re, sizeof(re)), "START after STOP");
+      std::vector<uint16_t> fresh;
+      for (int i = 0; i < 200 && fresh.empty(); i++) {
+        sleepMs(1);
+        drain(sim);
+        fresh = inBand(dacValues(sim, 'L', mark), 1000, 3400);
+      }
+      CHECK(!fresh.empty(), "START after STOP drives the DAC");
+      CHECK(fresh.empty() || fresh.front() == 1000,
+            "a fresh START's first DAC word is phase 0, not the held position");
+      for (int i = 0; i < 4; i++) // the marker's OK push, then ENDED
+        if (recvTrajectoryFrame(wire, 2000).status ==
+            Cmd::TrajectoryFrame::ENDED)
+          break;
+
       // Control returns to the streams on the next stream write.
       mark = sim.lines.size();
       uint16_t s = wire.next();
@@ -1419,12 +1442,9 @@ int main() {
         CHECK(back, stage + ": the streams drive the DAC again");
       };
       // retryOnce recovery: halt + forget every table, quiet wire, then the
-      // scenario's entry state (strobes, streams own the DAC). A run halted
-      // mid-ramp leaves Streams' trajectory drive position in band, and the
-      // next START's claim re-writes that stale position for one tick
-      // before the pre-position at phase 0 — an extra "wrap" for
-      // checkRamp. One unmarked cycle ending at phase 0 (as every normal
-      // entry does) resets it.
+      // scenario's entry state (strobes, streams own the DAC). One unmarked
+      // cycle ending at phase 0 (as every normal entry does) so a retry
+      // starts from the same mirror position as the first attempt.
       auto recover = [&] {
         recoverTrajectories(wire, {TA, TB, TC});
         upload(TA, P, CH1_A, {});
