@@ -183,7 +183,8 @@ const trajectoryDetail = computed(() => {
   const n = p.pushes;
   let s =
     `Marker pushes: ${n.ok} ok · ${n.timeout} timeout · ${n.busy} busy · ${n.other} other; ` +
-    `last lateness ${p.lateness_us.toFixed(0)} µs; ${p.reuploads} live re-uploads`;
+    `last lateness ${p.lateness_us.toFixed(0)} µs; ${p.reuploads} live re-uploads` +
+    (p.last_swap ? ` (last swap ${p.last_swap === "atomic" ? "atomic" : "stop + start"})` : "");
   if (telemetry.scan?.mode === "triangle")
     s +=
       `; flipped L ${p.flipped.L} · R ${p.flipped.R}, ` +
