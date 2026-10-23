@@ -85,7 +85,8 @@ export function polylinePath(
  *  from the scan center (`scanCenterOf`) the handle is DRAWN at. The handle only sets the axis
  *  DIRECTION, so at a small amplitude it is pushed out along the axis to
  *  `AXIS_HANDLE_MIN_DIST` strokes — far enough that its grab zone never covers
- *  the crosshair and its dot never hides the target dot. */
+ *  the scan center (a press there always aims; under a vergence pan the
+ *  target crosshair sits off that center and CAN meet the handle). */
 export const AXIS_HANDLE_DOT = 3;
 export const AXIS_HANDLE_HIT = 6;
 export const AXIS_HANDLE_MIN_DIST = 15;

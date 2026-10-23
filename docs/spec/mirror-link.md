@@ -541,13 +541,13 @@ it, joined by `+`; a trailing `· timed` on the `Timed` exposure fallback), `idl
 `idle — refused` otherwise. Warn-toned on `mismatch`, on a run whose
 `perf.trajectory.pushes` show failures and no OK push, on `perf.trajectory.stalled` (no
 OK push for two periods — a trigger that stops answering mid-run, after good exposures;
-the `title` then says no exposure has completed for two scan periods), or on a refusal. The `title`
+the `title` then says no exposure has completed for two scan periods — or, for a run with no OK push at all, that none has completed this run), or on a refusal. The `title`
 carries, on a mismatch, the NEUTRAL lead-in "Exposure mismatch — " (not every reason is a
 camera limit: the flip-spacing one is the windows' own geometry) followed by
 `ScanTelemetry.mismatch_reason` with no second colon — or, with no reason, "the cameras
 cannot take the requested window" (ellipse) / "windows" (triangle) — then the `Timed`
-fallback note and the applied per-eye exposure / frame rate; then the `perf.trajectory`
-bookkeeping (pushes ok / timeout / busy / other, last lateness, live re-uploads, and in
+fallback note and the applied per-eye exposure / frame rate; then, while stalled, the stall
+sentence; then the `perf.trajectory` bookkeeping (pushes ok / timeout / busy / other, last lateness, live re-uploads, and in
 triangle mode flipped / unmatched / `skew_us` per eye — "—" for an eye whose `flipped`
 count is 0, so a never-matched eye does not read as a perfect 0 µs — and
 `flip_tolerance_us`) — or, idle, what Start would run (its period computed

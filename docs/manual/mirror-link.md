@@ -42,15 +42,16 @@ mirror controls (**Verge Distance**, **Vertical Shift**); the **Auto Vergence**
 loop with its PID sliders; the **Scan Pattern** pane (the shape of the scan and
 where along it the cameras expose); and the **Gain** slider, **Scan Frequency**,
 the **Ring Reader** switch and a **Status** row repeating the scan readout.
-Click the tab at the bottom edge to open it — `Ctrl-\`` toggles it from the
+Click the tab at the bottom edge to open it — `` Ctrl-` `` toggles it from the
 keyboard — then drag the grips between the columns to resize them.
 
 ### To aim
 
 Press and drag anywhere on the **Center Wide** view — anywhere except the axis
 handle's dot, which turns the scan instead (see *To scan*). The dot always sits
-a little way out from the crosshair, so a press on the crosshair itself always
-aims. Both foveas follow
+a little way out from the scan center, so a press there always aims (with
+**Auto Vergence** holding a pan, the crosshair sits off that center — press
+beside the dot, not on it). Both foveas follow
 the cursor; a crosshair with a degree readout marks the scan center and the
 dashed path previews what the mirrors will trace. Release to leave the mirrors
 parked there. The depth the two eyes converge on comes from the **Verge
@@ -137,7 +138,7 @@ cameras actually expose.
    the button, and the drag does *not* move the scan center. The handle only
    sets the direction: at a small amplitude its dot is drawn further out than
    the end of the path, so it never sits on the crosshair. Press anywhere else
-   on the view — the crosshair included — and you steer as usual. Over the dot
+   on the view — the scan center included — and you steer as usual. Over the dot
    the pointer turns into a hand and the handle brightens; while you drag it
    the dot grows. While **Auto Vergence** holds a pan the scan center sits a
    little off the crosshair, and the spoke starts from the scan center, where
@@ -214,7 +215,7 @@ current settings would run.
 | Amber reason | What it means, what to do |
 |---|---|
 | trigger rate above the camera's maximum frame rate | The cameras cannot take frames that fast — lower **Scan Frequency**. |
-| exposures closer than the sensor readout | One exposure starts before the sensor has finished reading out the previous frame — in triangle mode move the two windows' ends apart (more time from one window's end to the next one's start), or lower **Scan Frequency**. |
+| exposures closer than the sensor readout | Two exposures END closer together than the sensor needs to read out a frame — in triangle mode move the two windows' ENDS further apart, or lower **Scan Frequency**. |
 | exposure windows too close for reliable flipping at this frequency | The two triangle frames are too close together in time to tell apart which one to flip — widen the spacing between the windows, or lower **Scan Frequency**. |
 | unequal windows: Timed exposure gives both the rising window's length | On a timed-fallback camera with **Sync Windows** off, the camera takes the rising window's length for both frames; set the windows equal (or turn Sync on) if that is not what you want. |
 | Timed exposure would run into the next trigger | On a timed-fallback camera the exposure the camera can take is longer than a whole sweep (its minimum exposure is above one sweep — the **Scan Frequency** period; a triangle's full period is two sweeps), so a frame would still be exposing when the next trigger arrives — lower **Scan Frequency**. Shortening the windows does not help: the app already keeps a shorter exposure inside its sweep. |
@@ -257,7 +258,7 @@ on screen:
 
 | Reason | What to do |
 |---|---|
-| `no ring` | No circular track was found — the emitter is out of frame, too dim (raise **Gain**), the scan is not running, or the pattern is not a closed loop (a line or the triangle). |
+| `no ring` | No circular track was found — the emitter is out of frame, too dim (raise **Gain**), or the pattern is not a closed loop (a line or the triangle). |
 | `no leader` | A ring, but no start marker: usually too dim or the emitter is not sending this format. |
 | `below resolution` | The message is too long for the ring you are drawing. Raise **Amplitude** (Scan Pattern pane), or shorten the emitter's message. |
 | `low contrast @ bit N` | The chips have blurred together at that point in the message — the dot is too big for the chip arc. Raise **Amplitude** (Scan Pattern pane), shorten the message, or improve focus. The hover shows the measured contrast. |
