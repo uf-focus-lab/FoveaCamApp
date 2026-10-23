@@ -410,15 +410,18 @@ uint32_t droppedFull() { return dropFull; }
 Owner owner() { return dacOwner; }
 
 void claim() {
-  dacOwner = Owner::TRAJECTORY;
-  dirty = false;
-  refresh = false; // never re-drive the previous run's position
-  firstDrive = true;
+  // Seed first, then flip the owner and the drive position TOGETHER: a strobe
+  // edge latching snapshot() between the two must never pair TRAJECTORY
+  // ownership with the previous run's drive position.
   MirrorPosition left = dacLeft, right = dacRight;
   if (!dacKnown)
     for (uint8_t i = 0; i < 4; i++)
       left.ch[i] = right.ch[i] = Global::bias_voltage;
+  dirty = false;
+  refresh = false; // never re-drive the previous run's position
+  firstDrive = true;
   noInterrupts();
+  dacOwner = Owner::TRAJECTORY;
   driveLeft = left;
   driveRight = right;
   interrupts();
