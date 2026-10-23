@@ -22,13 +22,18 @@ vi.mock("core/Controller", () => ({
 vi.mock("serialport", () => ({ SerialPort: { list: async () => [] } }));
 import {
   activeWindows,
+  AXIS_HANDLE_MIN_DEG,
+
   axisDegFromPixelRay,
   axisHandleOffset,
   clampWindow,
   ELLIPSE_SAMPLES,
   FLIP_TOLERANCE_FLOOR_US,
+  flipEdges,
   flipToleranceUs,
   minExposureEndSpacingUs,
+  minFlipEdgeGapUs,
+  timedWindowMarkers,
   normalizeAxisDeg,
   patternOffset,
   patternPath,
@@ -235,24 +240,102 @@ describe("windowMarkers", () => {
 });
 
 describe("flip tolerance + exposure spacing", () => {
-  it("0.4 × min(T, closest circular marker spacing)", () => {
+  /** The triangle's markers at `hz` for the two windows, as flip edges. */
+  const edges = (hz: number, rise: [number, number], fall: [number, number]) =>
+    flipEdges(windowMarkers("triangle", hz, [rise, fall]));
+
+  it("the gap is between EDGES of markers of different flip, circularly", () => {
     const T = sweepUs(10);
-    // Synced default windows: markers T apart → 0.4 T.
-    expect(flipToleranceUs(2 * T, T, [5_000, T + 5_000])).toEqual({ toleranceUs: 0.4 * T, tooClose: false });
-    // Rising at 0.9 T, falling at T: 0.1 T apart (the wrap is 1.9 T).
-    expect(flipToleranceUs(2 * T, T, [0.9 * T, T]).toleranceUs).toBeCloseTo(0.04 * T, 9);
+    // Default windows [0.05, 0.95]: the rising end (0.95 T) → the falling
+    // start (1.05 T), and the falling end (1.95 T) → the next rising start
+    // (2.05 T): 0.1 T either way — not the T between the marker starts.
+    expect(minFlipEdgeGapUs(edges(10, [0.05, 0.95], [0.05, 0.95]), 2 * T)).toBe(0.1 * T);
+    // The wrap alone can be the closest: falling [0, 0.95] ends at 1.95 T,
+    // rising [0.01, 0.5] starts 0.01 T into the next period → 0.06 T.
+    expect(minFlipEdgeGapUs(edges(10, [0.01, 0.5], [0, 0.95]), 2 * T)).toBeCloseTo(0.06 * T, 9);
+    // Same flip never counts; one marker (the ellipse) → the period.
+    expect(
+      minFlipEdgeGapUs(
+        [
+          { startUs: 0, endUs: 10, flip: false },
+          { startUs: 11, endUs: 20, flip: false },
+        ],
+        100,
+      ),
+    ).toBe(100);
+    expect(minFlipEdgeGapUs(flipEdges(windowMarkers("ellipse", 10, [[0, 0.95]])), T)).toBe(T);
+    // Overlapping exposures → 0.
+    expect(
+      minFlipEdgeGapUs(
+        [
+          { startUs: 0, endUs: 60, flip: false },
+          { startUs: 50, endUs: 90, flip: true },
+        ],
+        100,
+      ),
+    ).toBe(0);
   });
 
-  it("floors at 1 ms, capped at 0.45 × spacing; floor > cap → tooClose", () => {
-    // 100 Hz sweep (T = 10 ms), markers 2 ms apart: the cap 0.45 × 2 ms =
-    // 0.9 ms is below the 1 ms floor → too close, tolerance = the cap.
-    expect(flipToleranceUs(20_000, 10_000, [0, 2_000])).toEqual({ toleranceUs: 900, tooClose: true });
-    // 3 ms apart: 0.4·3 = 1.2 ms (above the floor, below the 1.35 ms cap).
-    expect(flipToleranceUs(20_000, 10_000, [0, 3_000])).toEqual({ toleranceUs: 1_200, tooClose: false });
-    // 2.4 ms apart: 0.96 ms → floored to 1 ms (cap 1.08 ms).
-    const r = flipToleranceUs(20_000, 10_000, [0, 2_400]);
+  it("defaults at 10 Hz: 0.4 × the 0.1 T edge gap", () => {
+    const T = sweepUs(10);
+    expect(flipToleranceUs(2 * T, T, edges(10, [0.05, 0.95], [0.05, 0.95]))).toEqual({
+      toleranceUs: 0.04 * T, // 4 ms (cap 4.5 ms)
+      tooClose: false,
+    });
+  });
+
+  it("defaults at 100 Hz: cap 0.45 ms < the 1 ms floor → tooClose, tolerance = the cap", () => {
+    const T = sweepUs(100); // 10 ms; edge gap 0.1 T = 1 ms
+    const r = flipToleranceUs(2 * T, T, edges(100, [0.05, 0.95], [0.05, 0.95]));
+    expect(r.tooClose).toBe(true);
+    expect(r.toleranceUs).toBeCloseTo(450, 9);
+  });
+
+  it("the round-1 'OK' case at 50 Hz is too close by its edges", () => {
+    // T = 20 ms. Rising [0.88, 0.95] ends at 19 ms, falling [0, 0.5] starts
+    // at 20 ms: the STARTS are 2.4 ms apart (round 1 floored it to 1 ms and
+    // called it fine), the EDGES 1 ms → cap 0.45 ms < floor.
+    const T = sweepUs(50);
+    const r = flipToleranceUs(2 * T, T, edges(50, [0.88, 0.95], [0, 0.5]));
+    expect(r).toEqual({ toleranceUs: 450, tooClose: true });
+  });
+
+  it("floors at 1 ms, capped at 0.45 × the edge gap", () => {
+    const e = (gap: number) => [
+      { startUs: 0, endUs: 1_000, flip: false },
+      { startUs: 1_000 + gap, endUs: 2_000 + gap, flip: true },
+    ];
+    // 3 ms gap: 0.4·3 = 1.2 ms (above the floor, below the 1.35 ms cap).
+    expect(flipToleranceUs(20_000, 10_000, e(3_000))).toEqual({ toleranceUs: 1_200, tooClose: false });
+    // 2.4 ms gap: 0.96 ms → floored to 1 ms (cap 1.08 ms).
+    const r = flipToleranceUs(20_000, 10_000, e(2_400));
     expect(r.toleranceUs).toBe(FLIP_TOLERANCE_FLOOR_US);
     expect(r.tooClose).toBe(false);
+    // 2 ms gap: cap 0.9 ms < floor → too close.
+    expect(flipToleranceUs(20_000, 10_000, e(2_000))).toEqual({ toleranceUs: 900, tooClose: true });
+    // min(T, gap): a wide gap is bounded by the sweep.
+    expect(flipToleranceUs(20_000, 5_000, e(8_000)).toleranceUs).toBe(2_000);
+  });
+
+  it("a frame within the tolerance of its own edge is out of reach of every other-flip edge", () => {
+    for (const [hz, rise, fall] of [
+      [10, [0.05, 0.95], [0.05, 0.95]],
+      [10, [0.9, 0.95], [0, 0.5]],
+      [37, [0.2, 0.7], [0.1, 0.95]],
+    ] as const) {
+      const T = sweepUs(hz);
+      const m = edges(hz, [...rise], [...fall]);
+      const { toleranceUs: tol } = flipToleranceUs(2 * T, T, m);
+      const dist = (a: number, b: number) => {
+        const d = Math.abs(a - b) % (2 * T);
+        return Math.min(d, 2 * T - d);
+      };
+      for (const own of m)
+        for (const stamp of [own.startUs - tol, own.startUs + tol, own.endUs - tol, own.endUs + tol])
+          for (const other of m.filter((o) => o.flip !== own.flip))
+            for (const edge of [other.startUs, other.endUs])
+              expect(dist(stamp, edge)).toBeGreaterThan(tol);
+    }
   });
 
   it("end-to-end spacing is T(1 + w1f − w1r) / T(1 + w1r − w1f), the smaller", () => {
@@ -264,6 +347,55 @@ describe("flip tolerance + exposure spacing", () => {
     // ends at 0.9 T and 1.5 T: 0.6 T = T(1 + 0.5 − 0.9) and 1.4 T across the wrap.
     expect(minExposureEndSpacingUs(2 * T, m)).toBe(Math.round(0.6 * T));
     expect(minExposureEndSpacingUs(T, windowMarkers("ellipse", 10, [[0, 0.5]]))).toBe(T);
+  });
+});
+
+describe("timedWindowMarkers (the Timed fallback)", () => {
+  it("gives every marker the one pulse, each kept inside its own slope", () => {
+    const T = sweepUs(10);
+    // Unequal, unsynced: rising [0.1, 0.9] (80 ms), falling [0.8, 0.95]
+    // (15 ms). The falling marker takes the rising length: starting at 0.8 T
+    // it would run to 1.6 T past its slope (into the next rising trigger), so
+    // it moves to 0.95 T − 0.8 T = 0.15 T into its slope.
+    const raw = windowMarkers("triangle", 10, [
+      [0.1, 0.9],
+      [0.8, 0.95],
+    ]);
+    const r = timedWindowMarkers("triangle", 10, raw, 80_000);
+    expect(r.overrun).toBe(false);
+    expect(r.markers).toEqual([
+      { tOffsetUs: 10_000, pulseUs: 80_000 },
+      { tOffsetUs: T + 15_000, pulseUs: 80_000 },
+    ]);
+    for (const [k, m] of r.markers.entries()) {
+      expect(m.tOffsetUs).toBeGreaterThanOrEqual(k * T);
+      expect(m.tOffsetUs + m.pulseUs).toBeLessThanOrEqual(k * T + WINDOW_MAX * T);
+    }
+  });
+
+  it("keeps a start that already fits, and never moves before the slope start", () => {
+    const raw = windowMarkers("ellipse", 10, [[0.2, 0.4]]);
+    expect(timedWindowMarkers("ellipse", 10, raw, 20_000).markers).toEqual([
+      { tOffsetUs: 20_000, pulseUs: 20_000 },
+    ]);
+    // A clamp-lengthened exposure (97 ms > 0.95 T) starts AT the slope and
+    // still fits before the next trigger (T) — no overrun.
+    const r = timedWindowMarkers("ellipse", 10, raw, 97_000);
+    expect(r).toEqual({ markers: [{ tOffsetUs: 0, pulseUs: 97_000 }], overrun: false });
+  });
+
+  it("a pulse that still runs into the next trigger is clamped there and flagged", () => {
+    const T = sweepUs(10);
+    const raw = windowMarkers("triangle", 10, [
+      [0.1, 0.9],
+      [0.1, 0.9],
+    ]);
+    const r = timedWindowMarkers("triangle", 10, raw, 120_000);
+    expect(r.overrun).toBe(true);
+    expect(r.markers).toEqual([
+      { tOffsetUs: 0, pulseUs: T }, // up to the falling trigger at T
+      { tOffsetUs: T, pulseUs: T }, // up to the next rising trigger at 2T
+    ]);
   });
 });
 
@@ -397,6 +529,10 @@ describe("main axis", () => {
   it("puts the handle on the +amp end of the axis", () => {
     close(axisHandleOffset(0, 1), { x: DEG, y: 0 });
     close(axisHandleOffset(90, 2), { x: 0, y: 2 * DEG });
+    // The session's floor keeps a direction at amplitude 0.
+    const h = axisHandleOffset(90, Math.max(0, AXIS_HANDLE_MIN_DEG));
+    expect(Math.hypot(h.x, h.y)).toBeGreaterThan(0);
+    expect(axisDegFromPixelRay({ x: 0, y: 0 }, h)).toBeCloseTo(90, 9);
   });
 
   it("recovers the axis from a center→point ray (the handle drag)", () => {

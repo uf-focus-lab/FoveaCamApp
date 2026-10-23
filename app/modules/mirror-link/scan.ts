@@ -258,6 +258,41 @@ export function windowMarkers(
   return [one(0, first), one(T, windows[1] ?? first)];
 }
 
+/**
+ * The Timed fallback's markers (spec §exposure-windows): the camera takes ONE
+ * exposure for every trigger, so every marker pulses `pulseUs` (marker 0's
+ * APPLIED exposure), and each is kept inside its own slope — `tOffset =
+ * max(slopeStart, min(raw tOffset, slopeStart + WINDOW_MAX·T − pulse))` — so a
+ * longer pulse moves the start earlier instead of running past the slope's
+ * cap. Should the pulse STILL overrun the next marker's start (circularly —
+ * a pulse beyond `WINDOW_MAX·T`), it is clamped to end there and `overrun` is
+ * set (the session names it in `mismatch_reason`).
+ */
+export function timedWindowMarkers(
+  mode: ScanMode,
+  hz: number,
+  raw: readonly WindowMarker[],
+  pulseUs: number,
+): { markers: WindowMarker[]; overrun: boolean } {
+  const T = sweepUs(hz);
+  const P = patternPeriodUs(mode, hz);
+  const cap = Math.round(WINDOW_MAX * T);
+  const pulse = Math.max(1, Math.round(pulseUs));
+  const placed = raw.map((m, k) => {
+    const slopeStart = mode === "triangle" ? k * T : 0;
+    const t = Math.max(slopeStart, Math.min(m.tOffsetUs, slopeStart + cap - pulse));
+    return { tOffsetUs: t, pulseUs: pulse };
+  });
+  let overrun = false;
+  const markers = placed.map((m, k) => {
+    const next = placed[k + 1]?.tOffsetUs ?? placed[0]!.tOffsetUs + P;
+    if (m.tOffsetUs + m.pulseUs <= next) return m;
+    overrun = true;
+    return { tOffsetUs: m.tOffsetUs, pulseUs: Math.max(1, next - m.tOffsetUs) };
+  });
+  return { markers, overrun };
+}
+
 /** Smallest CIRCULAR distance between consecutive values of `ts` (µs) over a
  *  period `P` — the wrap from the last back to the first included. One value
  *  (or none) → `P`. */
@@ -272,30 +307,75 @@ function minCircularGapUs(ts: readonly number[], P: number): number {
   return gap;
 }
 
+/** One marker's exposure as the flip brick sees it: both EDGES (µs into the
+ *  period — the anchor carries `tStart` and `tEnd`, and the brick matches a
+ *  frame to whichever is nearer) and whether its frames are flipped. */
+export type FlipMarkerEdges = { startUs: number; endUs: number; flip: boolean };
+
+/** The flip markers of a trajectory's markers: marker k's start and end
+ *  edges, flipped iff it is the triangle's falling marker (index 1) — the
+ *  anchor rule of the session (spec §triangle-flip). */
+export function flipEdges(
+  markers: ReadonlyArray<{ tOffsetUs: number; pulseUs: number }>,
+): FlipMarkerEdges[] {
+  return markers.map((m, k) => ({
+    startUs: m.tOffsetUs,
+    endUs: m.tOffsetUs + m.pulseUs,
+    flip: k === 1,
+  }));
+}
+
+/**
+ * The smallest CIRCULAR gap (µs) between the edges of two markers whose flip
+ * differs: for every such ordered pair, `next marker's start − previous
+ * marker's end`, the wrap from the end of the period back to its start
+ * included. Overlapping exposures give 0. No pair of different flip (the
+ * ellipse, or one marker) → `P`.
+ */
+export function minFlipEdgeGapUs(markers: readonly FlipMarkerEdges[], P: number): number {
+  let gap = P;
+  for (const a of markers)
+    for (const b of markers) {
+      if (a === b || a.flip === b.flip) continue;
+      // `b` FOLLOWS `a` in the period: its start, unwrapped past `a`'s start.
+      const next = b.startUs >= a.startUs ? b.startUs : b.startUs + P;
+      gap = Math.min(gap, Math.max(0, next - a.endUs));
+    }
+  return gap;
+}
+
 /** Flip-brick tolerance rule (spec §triangle-flip): this fraction of
- *  `min(T, closest marker spacing)`... */
+ *  `min(T, closest edge gap between markers of different flip)`... */
 export const FLIP_TOLERANCE_FRACTION = 0.4;
 /** ...never below this (µs) — the host↔camera clock alignment needs room... */
 export const FLIP_TOLERANCE_FLOOR_US = 1000;
-/** ...and never above this fraction of the closest marker spacing, so a frame
- *  can never be nearer the neighbouring marker's edge by construction. */
+/** ...and never above this fraction of that edge gap. Below one half, the
+ *  two markers' match bands (tolerance around each edge) never meet: a frame
+ *  stamped within the tolerance of ITS marker's edge is more than the
+ *  tolerance away from every edge of a marker of the other flip, so it can
+ *  never match that neighbour — when its own anchor is late it is unmatched
+ *  (passes unflipped), never mis-flipped. A frame stamped farther than the
+ *  tolerance from its own edge has no such guarantee. */
 export const FLIP_TOLERANCE_CAP_FRACTION = 0.45;
 
 /**
- * The flip bricks' match tolerance for a run (µs): `0.4 × min(T, closest
- * circular marker spacing)`, floored at {@link FLIP_TOLERANCE_FLOOR_US} and
- * capped at `0.45 × spacing`. When the floor exceeds the cap the windows are
- * too close for reliable flipping at this frequency: `tooClose` is set (the
- * session flags `mismatch`; the scan still runs) and the tolerance is the cap.
+ * The flip bricks' match tolerance for a run (µs). The brick matches a frame
+ * to the NEAREST anchor EDGE (start or end), so the ambiguity that matters is
+ * the edge gap between markers of different flip ({@link minFlipEdgeGapUs}),
+ * not the marker spacing: `0.4 × min(T, gap)`, floored at
+ * {@link FLIP_TOLERANCE_FLOOR_US} and capped at `0.45 × gap`. When the floor
+ * exceeds the cap the windows are too close for reliable flipping at this
+ * frequency: `tooClose` is set (the session flags `mismatch`; the scan still
+ * runs) and the tolerance is the cap.
  */
 export function flipToleranceUs(
   periodUs: number,
   sweepUs: number,
-  markerOffsetsUs: readonly number[],
+  markers: readonly FlipMarkerEdges[],
 ): { toleranceUs: number; tooClose: boolean } {
-  const spacing = minCircularGapUs(markerOffsetsUs, periodUs);
-  const cap = FLIP_TOLERANCE_CAP_FRACTION * spacing;
-  const want = Math.max(FLIP_TOLERANCE_FRACTION * Math.min(sweepUs, spacing), FLIP_TOLERANCE_FLOOR_US);
+  const gap = minFlipEdgeGapUs(markers, periodUs);
+  const cap = FLIP_TOLERANCE_CAP_FRACTION * gap;
+  const want = Math.max(FLIP_TOLERANCE_FRACTION * Math.min(sweepUs, gap), FLIP_TOLERANCE_FLOOR_US);
   if (FLIP_TOLERANCE_FLOOR_US > cap) return { toleranceUs: cap, tooClose: true };
   return { toleranceUs: Math.min(want, cap), tooClose: false };
 }
@@ -376,7 +456,13 @@ export function windowPaths(
   });
 }
 
-/** The main axis's +amp end — the draggable handle (`axis_handle_px`). */
+/** Smallest distance (degrees) the axis handle sits from the center — the
+ *  session places it at `max(amp, this)` so the handle encodes the axis
+ *  direction even at amplitude 0 (spec §views). */
+export const AXIS_HANDLE_MIN_DEG = 0.01;
+
+/** The main axis's +amp end — the draggable handle (`axis_handle_px`, at
+ *  `max(amp, AXIS_HANDLE_MIN_DEG)`). */
 export function axisHandleOffset(axisDeg: number, ampDeg: number): Point2d {
   return rotate({ x: ampDeg * DEG, y: 0 }, axisDeg);
 }
