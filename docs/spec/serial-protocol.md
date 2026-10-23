@@ -337,10 +337,10 @@ supersede rule: `docs/spec/controller.md#scheduled-inputs`).
 
 ## uploaded trajectories — CMD_TRAJECTORY {#trajectory}
 
-**v2.2.0**, property nibble `0x0E`. The MirrorLink case: the mirror runs a
-pre-computed periodic pattern and cameras trigger at exact phases of it. Upload
-once, run on the MCU: steady state is zero bytes host→MCU and one small push
-MCU→host per trigger.
+**v2.2.0** (atomic table swap: **v2.2.1**), property nibble `0x0E`. The MirrorLink
+case: the mirror runs a pre-computed periodic pattern and cameras trigger at exact
+phases of it. Upload once, run on the MCU: steady state is zero bytes host→MCU and
+one small push MCU→host per trigger.
 
 ### Wire layout
 
@@ -389,7 +389,9 @@ Teensy DMAMEM, 80 KB, first-fit), `MAX_MARKERS = 8` per table.
   period boundary), or step/hold with `STEP`. `t_start` in the past joins the run
   in progress (only future marker phases fire).
 - A marker fires when `φ` crosses its `t_offset_us`, once per cycle (only the
-  latest crossing per marker counts — a stalled loop never bursts a backlog),
+  latest crossing per marker counts — a stalled loop never bursts a backlog; the
+  run also records, per marker INDEX, the next cycle that may fire, which only
+  binds across an atomic swap below),
   through the Capture engine: the same strobe tracking, exposure-averaged
   positions (start/finish latches see the trajectory-driven DAC) and
   `pulse + STROBE_MARGIN_US` timeout as CMD_FRAME. It needs an idle engine; a
@@ -406,8 +408,29 @@ Teensy DMAMEM, 80 KB, first-fit), `MAX_MARKERS = 8` per table.
   running table first; deleting a free id is a
   no-op ACK. `System::Enable(false)` halts the run (`CANCELLED` push) and cancels
   an in-flight marker capture (`CANCELLED`); uploaded tables survive.
-- A phase-continuous swap is `STOP(a)` + `START(b, original t_start)`, written back to
-  back, with table `b` uploaded and committed beforehand (`TrajectoryHandle.replace`).
+- **Atomic swap (v2.2.1).** `START {id = b, t_start, cycles}` while table `a` runs
+  (armed or playing) is ACCEPTED iff `b ≠ a`, `b` is committed, `b.period ==
+  a.period` and `t_start == a`'s recorded `t_start` exactly (µs; `t_start = 0`,
+  "now", never matches). The firmware then switches the playing table to `b` IN
+  PLACE: the phase clock (`t_start`, the marker crossing window) and every marker's
+  crossing state carry over BY MARKER INDEX — no HOLD, no pre-position, no DAC
+  re-claim, no push; the next tick drives `b` at the same phase (a run still armed
+  keeps pre-positioning, now at `b`'s phase 0). Marker `m` of `b`
+  fires from the first cycle in which marker `m` has not fired yet (a `b` marker
+  later in the cycle than `a`'s already-fired one waits for the next cycle — never
+  twice per cycle; one earlier than the current phase first fires next cycle —
+  never late at a wrong phase); markers `b` lacks are simply gone. The new `cycles`
+  replaces the budget, still counted from the original `t_start` (a budget already
+  spent ends the run on the next tick: phase-0 hold + `ENDED`). `a` stays committed
+  (the host `DELETE`s it); a capture `a`'s marker already started completes and
+  pushes with `a`'s id after the swap's ACK, so the host keeps `a`'s id routed for a
+  grace period (max pulse + strobe margin + slack) and does not reuse it meanwhile.
+  Any other START while running REJs `A trajectory is already running (STOP it
+  first)` and leaves `a` running — the same text as before 2.2.1, so a host that
+  gets it (older firmware) falls back to `STOP(a)` + `START(b, original t_start)`
+  back to back, which joins in progress (markers due between the two are lost).
+  Host: `TrajectoryHandle.replace` (`app/orchestrator/controller.ts`). Guarded by
+  `test/fw-sim-check.cpp` stage C5.
 
 REJ reasons: `Trajectory id out of range (max 4 tables)`, `Trajectory is running
 (STOP it first)`, `Trajectory needs at least one sample`, `Trajectory too long (max

@@ -64,6 +64,11 @@ struct Playback {
   // prev < m <= elapsed (first: 0 <= m <= elapsed).
   bool first = true;
   uint64_t prev = 0;
+  // Per marker INDEX: the first cycle not yet fired (or BUSY-pushed). Only
+  // ever binding across an atomic swap (v2.2.1), where table b's marker m may
+  // sit later in the cycle than table a's marker m that already fired: the
+  // window alone would fire it a second time in the same cycle.
+  uint64_t nextCycle[MAX_MARKERS] = {};
 };
 
 Playback play;
@@ -184,8 +189,10 @@ void fireMarkers(const Table &t, uint64_t elapsed) {
     if (play.cycles && k >= play.cycles)
       k = play.cycles - 1;
     const uint64_t at = k * t.period + mk.offset;
-    if (at > elapsed || (!play.first && at <= play.prev))
+    if (at > elapsed || (!play.first && at <= play.prev) ||
+        k < play.nextCycle[m])
       continue;
+    play.nextCycle[m] = k + 1; // consumed whether it fires or pushes BUSY
     // Insertion sort by time (n <= MAX_MARKERS).
     uint8_t pos = n++;
     while (pos > 0 && due[pos - 1].at > at) {
@@ -302,8 +309,26 @@ const char *start(uint8_t id, Timestamp tStart, uint32_t cycles) {
     return "Unknown trajectory id (BEGIN first)";
   if (tables[id].state != State::SEALED)
     return "Trajectory not committed (COMMIT first)";
-  if (play.active)
+  if (play.active) {
+    // v2.2.1 ATOMIC SWAP: START {b, t_start, cycles} while table a plays is
+    // accepted iff b != a is committed (checked above), b.period == a.period
+    // and t_start == a's recorded t_start (exact µs; 0 = "now" never
+    // matches). The playing table becomes b IN PLACE: the phase clock
+    // (tStart / first / prev) and every marker's crossing state (by index)
+    // carry over — no HOLD, no pre-position, no Streams::claim, no push. The
+    // next tick drives b's position at the same phase (an ARMED run keeps
+    // pre-positioning, now at b's phase 0). `cycles` replaces the
+    // budget (still counted from t_start). Table a stays committed (the host
+    // DELETEs it); a capture a's marker already started completes and pushes
+    // with a's id. Any other START while running keeps the REJ below.
+    if (id != play.id && tables[id].period == tables[play.id].period &&
+        tStart == play.tStart) {
+      play.id = id;
+      play.cycles = cycles;
+      return nullptr;
+    }
     return "A trajectory is already running (STOP it first)";
+  }
   const Timestamp now = Global::time.now();
   play = Playback{};
   play.active = true;
