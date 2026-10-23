@@ -154,16 +154,16 @@ reflection across the axis; that is a later refinement, not this change.
 
 ### `replace` {#replace}
 
-`TrajectoryHandle.replace(spec)` (`app/orchestrator/controller.ts`) and
-`NodeTrajectory.replace(spec)` (`controller-node.ts`), both stubbed to throw
-until implemented: upload `spec` to a FREE table id (BEGIN/DATA/MARK/COMMIT
-while the old one runs — the firmware allows uploading while running), STOP
-the old table, START the new one at the old run's `t_start` (the firmware
-joins a past `t_start` in progress, so the phase carries over), DELETE the
-old table, swap the id under the same handle so listeners, the node's hold
-state and stats continue. Period must match while running (throw otherwise).
-From `ready`, a plain re-upload. Gap on the wire: the STOP/START pair, sent
-back to back.
+Implemented on both handles: `TrajectoryHandle.replace(spec)`
+(`app/orchestrator/controller.ts`) and `NodeTrajectory.replace(spec)`
+(`controller-node.ts`). The contract lives in `docs/spec/controller.md`
+(Replace): upload `spec` to a FREE table id while the old one runs, then swap
+ATOMIC FIRST — one `START(new)` at the run's `t_start` (protocol 2.2.1, no
+HOLD) — with the STOP(old) + START(new) pair, sent back to back, as the
+fallback (older firmware, or a REJ "already running"). The id swaps under the
+same handle, so listeners, the node's hold state and stats continue; the old
+id stays routed for its grace. Period must match while running (throw
+otherwise). From `ready`, a plain re-upload.
 
 ## Workstreams (parallel, one worktree each)
 

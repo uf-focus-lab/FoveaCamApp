@@ -33,7 +33,9 @@ export interface FlipAnchor {
 export interface FlipPipeOptions {
   /** Match tolerance: a frame matches an anchor iff one of that anchor's
    *  edges lies within this of its timestamp (nearest edge wins). The session
-   *  derives it from the marker spacing, floored for clock alignment. */
+   *  derives it from the edge gap between markers of different flip (next
+   *  marker's start − previous marker's end), floored at 1 ms for clock
+   *  alignment and capped at 0.45 × that gap. */
   toleranceNs: bigint;
   /** Bounded anchor pool (drop-oldest); default 16, max 1024. */
   anchorCap?: number;

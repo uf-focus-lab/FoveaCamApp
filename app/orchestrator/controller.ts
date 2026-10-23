@@ -57,8 +57,9 @@ export const SCHEDULE_MIN_VERSION = { major: 2, minor: 2, patch: 0 } as const;
 // Minimum firmware/protocol version for the ATOMIC trajectory swap (protocol
 // 2.2.1): `START {id = b, t_start, cycles}` while table `a` runs is accepted
 // iff `b` is committed, has `a`'s period and `t_start` equals `a`'s recorded
-// start (exact µs) — the firmware switches tables in place (no HOLD, no missed
-// marker). Older firmware REJs it "already running".
+// start (exact µs) — the firmware switches tables in place (no HOLD; a marker
+// is never doubled, and one moved before the swap phase first fires next
+// cycle). Older firmware REJs it "already running".
 export const ATOMIC_SWAP_MIN_VERSION = { major: 2, minor: 2, patch: 1 } as const;
 
 // Firmware limits (lib/Protocol/Packet.h Trajectory::CHUNK_SAMPLES,

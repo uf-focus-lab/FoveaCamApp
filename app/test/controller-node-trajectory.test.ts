@@ -12,7 +12,8 @@
 //       superseded by an immediate update; v2.1 / no-stream fallback counted.
 //   (7) graph wiring + stats snapshot (lateness from t_trigger vs phase).
 //   (8) replace — running stays running (inputs held), spec + stats carry,
-//       concurrent calls coalesce (latest wins), stop/close wait for it.
+//       concurrent calls coalesce (latest wins), stop/close wait for it and
+//       refuse replaces issued after them.
 //
 // No serial hardware / addon: fake controllers + fake trajectory handles; the
 // host clock is pinned through `setHostClock`.
@@ -1050,6 +1051,68 @@ describe("NodeTrajectory.replace", () => {
     expect(h.stop).toHaveBeenCalledTimes(1);
     expect(h.dispose).toHaveBeenCalledTimes(1);
     expect(t.state).toBe("closed");
+  });
+
+  it("close() refuses a replace issued while it waits; STOP/DELETE proceed after the one in-flight swap", async () => {
+    node = new ControllerNode();
+    const c = makeController();
+    node.bindController(c as never);
+    const t = await node.openTrajectory(SPEC, { name: "ml" });
+    await t.start();
+    const h = c.trajectories[0]!;
+    const g = gate();
+    h.replace.mockImplementationOnce(async () => g.promise);
+    const p1 = t.replace(RESHAPED);
+    const closed = t.close();
+    await expect(t.replace(SPEC)).rejects.toThrow(/closing — replace refused/);
+    await tick();
+    expect(h.dispose).not.toHaveBeenCalled();
+    g.release();
+    await expect(p1).resolves.toBeUndefined();
+    await closed;
+    expect(h.replace).toHaveBeenCalledTimes(1);
+    expect(h.stop).toHaveBeenCalledTimes(1);
+    expect(h.dispose).toHaveBeenCalledTimes(1);
+    expect(t.state).toBe("closed");
+    await expect(t.replace(SPEC)).rejects.toThrow(/is closed/);
+  });
+
+  it("stop() is not starved: replaces issued after it are refused; it STOPs after the in-flight swap", async () => {
+    node = new ControllerNode();
+    const c = makeController();
+    node.bindController(c as never);
+    const t = await node.openTrajectory(SPEC, { name: "ml" });
+    await t.start();
+    const h = c.trajectories[0]!;
+    const g = gate();
+    const log: string[] = [];
+    h.replace.mockImplementation(async () => {
+      log.push("replace");
+      if (log.length === 1) await g.promise;
+    });
+    h.stop.mockImplementation(async () => {
+      log.push("stop");
+    });
+    const p1 = t.replace(RESHAPED);
+    const stopped = t.stop();
+    const late = [t.replace(SPEC), t.replace(RESHAPED)].map((p) =>
+      p.catch((e: unknown) => e),
+    );
+    for (const r of await Promise.all(late))
+      expect(r).toMatchObject({
+        message: expect.stringMatching(/stopping — replace refused/),
+      });
+    await tick();
+    expect(log).toEqual(["replace"]);
+    g.release();
+    await Promise.all([p1, stopped]);
+    expect(log).toEqual(["replace", "stop"]);
+    expect(t.state).toBe("ready");
+    // Once stop() resolved, a replace is a plain re-upload from ready.
+    await t.replace(SPEC);
+    expect(h.replace).toHaveBeenCalledTimes(2);
+    expect(t.state).toBe("ready");
+    await t.close();
   });
 
   it("throws when detached / closed / uploading, and on a period change while running", async () => {

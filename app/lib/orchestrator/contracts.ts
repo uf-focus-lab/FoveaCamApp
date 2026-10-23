@@ -255,8 +255,10 @@ export type TrajectoryStat = {
    *  while running, plain re-uploads from `ready`). */
   reuploads: number;
   /** How the last RUNNING swap went: `atomic` = the firmware 2.2.1 in-place
-   *  START (no HOLD, no missed marker), `stop-start` = the STOP + START pair
-   *  (older firmware, or the atomic START was REJected); null before one. */
+   *  START (no HOLD; a marker is never doubled, and one moved before the swap
+   *  phase first fires next cycle), `stop-start` = the STOP + START pair
+   *  (older firmware, or the atomic START REJected "already running" — any
+   *  other REJ swaps nothing); null before one. */
   lastSwap: "atomic" | "stop-start" | null;
 };
 

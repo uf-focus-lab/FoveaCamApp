@@ -167,8 +167,9 @@ export interface NodeTrajectory {
    *  table still in grace after a second swap). Calls made while
    *  a swap is in flight COALESCE (latest spec wins, sent once the in-flight
    *  swap lands; every coalesced caller settles with it). `stop()` waits for
-   *  in-flight + pending swaps; `close()` rejects the pending one and waits
-   *  for the in-flight one. */
+   *  the in-flight swap and the batch pending on entry; `close()` rejects the
+   *  pending one and waits for the in-flight one. A call made after `stop()`
+   *  (until it settles) or `close()` was requested is refused. */
   replace(spec: TrajectorySpec): Promise<void>;
 }
 
@@ -1103,6 +1104,11 @@ class NodeTrajectoryImpl implements NodeTrajectory {
     reject: (error: unknown) => void;
   } | null = null;
   private replacingSpec: TrajectorySpec | null = null;
+  /** `close()` was requested / `stop()` calls not yet settled: `replace()`
+   *  refuses (set synchronously on entry, so no replace issued while they
+   *  wait can become a new batch they would have to wait for). */
+  private closing = false;
+  private stopping = 0;
 
   readonly wiringNode: WiredNode = {
     id: trajectoryNodeId(),
@@ -1232,11 +1238,21 @@ class NodeTrajectoryImpl implements NodeTrajectory {
   }
 
   async stop(): Promise<void> {
-    // A replace in flight (and a coalesced pending one) lands first.
-    if (this.replaceInflight) await this.drainReplace();
-    if (this._state !== "running") return;
-    await this.handle!.stop();
-    this.endRun();
+    // The replace in flight and the batch pending ON ENTRY land first; a
+    // replace issued from here until this settles is refused, so a steady
+    // stream of them cannot starve the STOP.
+    this.stopping++;
+    try {
+      const inflight = this.replaceInflight;
+      const pending = this.replacePending?.promise;
+      if (inflight) await inflight.catch(() => {});
+      if (pending) await pending.catch(() => {});
+      if (this._state !== "running") return;
+      await this.handle!.stop();
+      this.endRun();
+    } finally {
+      this.stopping--;
+    }
   }
 
   /** Run over (STOP ack / ENDED / run-level CANCELLED): inputs re-take the DAC. */
@@ -1253,8 +1269,10 @@ class NodeTrajectoryImpl implements NodeTrajectory {
 
   async close(): Promise<void> {
     if (this._state === "closed") return;
-    // A pending (coalesced, not yet sent) replace is moot; an in-flight one
-    // lands first so its tables are known before STOP/DELETE.
+    // From here on replace() refuses. A pending (coalesced, not yet sent)
+    // replace is moot; an in-flight one lands first so its tables are known
+    // before STOP/DELETE.
+    this.closing = true;
     const pending = this.replacePending;
     this.replacePending = null;
     pending?.reject(
@@ -1315,6 +1333,14 @@ class NodeTrajectoryImpl implements NodeTrajectory {
    *  uploaded; every coalesced caller settles with that one swap). */
   replace(spec: TrajectorySpec): Promise<void> {
     try {
+      if (this.closing && this._state !== "closed")
+        throw new Error(
+          `Trajectory "${this.name}" is closing — replace refused`,
+        );
+      if (this.stopping > 0)
+        throw new Error(
+          `Trajectory "${this.name}" is stopping — replace refused (replace after stop() resolves)`,
+        );
       this.assertReplaceable(spec);
     } catch (error) {
       return Promise.reject(error);
@@ -1449,7 +1475,8 @@ class NodeTrajectoryImpl implements NodeTrajectory {
     return this.replacingSpec ?? this.spec;
   }
 
-  /** Wait until no replace is in flight or pending (errors are the callers'). */
+  /** Wait until no replace is in flight or pending (errors are the callers').
+   *  Bounded: only `close()` drains, after refusing further replaces. */
   private async drainReplace(): Promise<void> {
     while (this.replaceInflight) await this.replaceInflight.catch(() => {});
   }
