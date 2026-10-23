@@ -141,7 +141,7 @@ a bench fallback only.
   programmed, through `enableHardwareTrigger`
   (`app/orchestrator/camera-trigger.ts`): `TriggerSource=Line3`;
   `LineSelector=Line2`, `LineMode=Output`, `LineSource=ExposureActive`,
-  `LineInverter=false`.
+  `LineInverter=true`.
   `disableHardwareTrigger` returns it to free-run and leaves the line
   config in place. Never put a camera in the mask before its trigger is
   enabled. A camera that is not in trigger mode does not expose on the

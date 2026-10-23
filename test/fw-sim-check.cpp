@@ -34,12 +34,12 @@
 //      flight answered in seq order at ~one round trip; seq=0 UPDATEs
 //      interleaved silently (latest wins); requests behind a pending
 //      two-phase FRAME are not gated by its FIN.
-//   8. Center camera (V0.1 board): cameras = C|L|R drives all three Line2
+//   8. Center camera (V0.1 board): cameras = C|L|R drives all three Line3
 //      triggers and FINs; the default mask (0) is still L|R (C untouched) and
 //      FINs right after a C|L|R frame; an out-of-range mask REJs.
 //   9. Strobe polarity contract: lines idle at the released level (HIGH, the
 //      pull-up, for the default active-LOW Board::STROBE_ACTIVE_LEVEL); an
-//      inverted (active-HIGH, LineInverter-shaped) injected waveform times
+//      inverted (active-HIGH, LineInverter=false) injected waveform times
 //      out against it with the "stuck at active level" hint; back to the
 //      open-drain active-LOW shape, it FINs again.
 //  10. quit -> exit 0.
@@ -1361,7 +1361,7 @@ int main() {
               std::string("strobe ") + cam +
                   " idles at the released level (HIGH = pull-up, active-LOW line)");
 
-      // Inverted waveform (LineInverter=true): idles LOW, exposure drives
+      // Inverted waveform (LineInverter=false): idles LOW, exposure drives
       // HIGH. Against the active-LOW firmware the idle reads as "asserted", so
       // the request can never see a release after its rise and must time out —
       // the contract that polarity is a board constant, not something the

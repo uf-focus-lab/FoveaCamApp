@@ -135,7 +135,7 @@ constexpr Pin<OUTPUT> fclk{10};
 //   trigger: Teensy OUTPUT -> camera Line3 (host sets TriggerSource=Line3).
 //            3.3 V sits inside Line3's 2.6..3.6 V input window.
 //   strobe:  Teensy INPUT_PULLUP <- camera Line2 (host sets Line2 =
-//            ExposureActive output, LineInverter off). Open drain: the camera
+//            ExposureActive output, LineInverter=true). Open drain: the camera
 //            pulls the line LOW while exposing; the Teensy pull-up idles it
 //            HIGH. An unplugged cable therefore reads "idle", never "exposing".
 // Line3 cannot be the strobe: it has no output mode on the BFS. Driving it
@@ -145,10 +145,10 @@ constexpr Pin<OUTPUT> fclk{10};
 // reachable for a bench fallback but Capture does not use them.
 //
 // STROBE_ACTIVE_LEVEL: the level read on `strobe` while the camera exposes.
-// Open-drain Line2 (and the opto Line1 alike) asserts LOW against the
-// pull-up. A host that sets LineInverter=true would flip this to HIGH; the
-// host keeps it off so that an idle or disconnected line reads released.
-// Verify on the bench with a scope before the first synced capture.
+// Open-drain Line2 with LineInverter=true asserts LOW against the pull-up
+// and idles released (bench 2026-10-22). LineInverter=false holds the BFS
+// output ON (LOW) while idle, which reads as a permanent exposure. The opto
+// Line1 polarity is unmeasured.
 constexpr uint8_t STROBE_ACTIVE_LEVEL = LOW;
 constexpr uint8_t OPTO_STROBE_ACTIVE_LEVEL = LOW;
 

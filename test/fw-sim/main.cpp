@@ -26,7 +26,7 @@
 //       waveform asserts. Default = Board::STROBE_ACTIVE_LEVEL (LOW: the
 //       V0.1 open-drain Line2 ExposureActive output, idles at the pull-up,
 //       exposure pulls it LOW — the opto Line1 has the same shape). `high`
-//       models an inverted line (LineInverter=true: idles LOW, exposure HIGH).
+//       models an inverted line (LineInverter=false: idles LOW, exposure HIGH).
 //       Sticky across re-arming; re-drives the idle (released) level at once.
 //   read <cam>                                     emit `level <cam> <level>`
 //       — that camera's strobe pin as the firmware would read it right now

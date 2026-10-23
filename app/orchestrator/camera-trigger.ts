@@ -22,19 +22,21 @@ import type { CameraLease } from "./registry.js";
  *    (`Board::camera[n].trigger`). Line3 is also the camera's 8-24 V VAUX
  *    power input; never power a camera through its GPIO cable on this rig.
  *  - `lineSelector` = **Line2** (non-isolated bidirectional, pin 3): set as
- *    an ExposureActive output. The BFS Line2 output is OPEN DRAIN, so it
- *    pulls the Teensy's INPUT_PULLUP pin (`Board::camera[n].strobe`) LOW
- *    while exposing and releases it otherwise.
- *  - `lineInverter` = **false**: the firmware reads ExposureActive as
- *    active-LOW (`Board::STROBE_ACTIVE_LEVEL = LOW`), so an idle, unplugged
- *    or unprogrammed line reads released. `true` would make the line idle LOW
- *    and read as a permanent exposure ("line stuck at active level").
+ *    an ExposureActive output. The BFS Line2 output is OPEN DRAIN and, with
+ *    `LineInverter=false`, is ON (pulls LOW) while idle and releases during
+ *    exposure (bench 2026-10-22).
+ *  - `lineInverter` = **true**: the line idles released (HIGH on the Teensy's
+ *    INPUT_PULLUP pin, `Board::camera[n].strobe`) and pulls LOW while
+ *    exposing, matching `Board::STROBE_ACTIVE_LEVEL = LOW`; an unplugged or
+ *    unprogrammed line reads released and fails as a clean strobe timeout.
+ *    `false` makes an idle line read as a permanent exposure ("line stuck at
+ *    active level"). Bench 2026-10-22: 20/20 FINs, trigger→exposure 14–16 µs.
  *
  *  Bench fallback, the opto pair: `{ triggerSource: "Line0", lineSelector:
- *  "Line1" }`. Line1 is an open-collector opto output with the same
- *  active-LOW shape, so `lineInverter` stays false; the firmware would still
- *  have to pulse the Line0 pins (`Board::camera[n].opto_trigger`), which the
- *  V0.1 build does not. Verify the names against
+ *  "Line1" }`. Its `lineInverter` polarity is unmeasured; check it with
+ *  `playground/trigger-bench.ts --lines Line0,Line1 --inverter <x>`. The
+ *  firmware would also have to pulse the Line0 pins
+ *  (`Board::camera[n].opto_trigger`), which the V0.1 build does not. Verify the names against
  *  `lease.camera.trigger_source_options` on a new camera model
  *  ({@link enableHardwareTrigger} checks it). */
 export interface TriggerLines {
@@ -92,8 +94,8 @@ const firstLine = (e: unknown): string =>
  * A source missing from `trigger_source_options` is refused up front with
  * the offered list. `LineInverter` is written through the binding's boolean
  * setter `setFeatureBool` (see {@link setBooleanFeature}); a failure of that
- * one write is still returned, not thrown, since the camera default (`false`)
- * is what the firmware's active-LOW open-drain read expects. Runs through
+ * one write is still returned, not thrown (the engage diagnostics surface it;
+ * the firmware then reports "line stuck at active level"). Runs through
  * `lease.reconfigure()` so shared-handle mutation stays on the lease's safe
  * path — pipe consumers ride the transient.
  */
@@ -102,7 +104,7 @@ export async function enableHardwareTrigger(
   {
     triggerSource = "Line3",
     lineSelector = "Line2",
-    lineInverter = false,
+    lineInverter = true,
   }: TriggerLines = {},
 ): Promise<HardwareTriggerResult> {
   if (triggerSource === lineSelector)

@@ -255,20 +255,21 @@ MEMS_EN last.
   **Line2**, whose open-drain output the host programs as `ExposureActive`.
   The opto pair (`opto_trigger` → Line0, `opto_strobe` ←
   Line1) stays cabled but is never driven or read by Capture.
-- **Polarity.** `Board::STROBE_ACTIVE_LEVEL` (LOW: the open-drain Line2
-  output pulls the pulled-up line low while exposing, host
-  `LineInverter=false`) is the level `strobe` reads while the camera exposes. Capture keys every edge on it: exposure
+- **Polarity.** `Board::STROBE_ACTIVE_LEVEL` (LOW: with host
+  `LineInverter=true` the open-drain Line2 output idles released and pulls
+  the pulled-up line low while exposing; bench 2026-10-22) is the level
+  `strobe` reads while the camera exposes. Capture keys every edge on it: exposure
   start = line becomes asserted (latches `t_exposure` + the start position),
   exposure finish = line becomes released (latches the finish position). A
   request FINs once every requested camera has been asserted and released
-  again. Changing the polarity means changing that one constant
-  (`OPTO_STROBE_ACTIVE_LEVEL = LOW` records that the opto Line1 has the same
-  open-collector shape); nothing on the wire changes.
+  again. The host matches this constant through `LineInverter`
+  (`OPTO_STROBE_ACTIVE_LEVEL = LOW` assumes the opto Line1 has the same
+  shape; unmeasured); nothing on the wire changes.
 - **Timeout.** No complete assert/release within `pulse + 5 ms` → REJ with a
   reason starting `Strobe timeout`. If a requested line still reads asserted
   at that point the reason says `line stuck at active level` — the signature
-  of a polarity mismatch (`LineInverter=true` idles the line LOW) or a camera
-  holding Line2 low for another reason. An unplugged or unprogrammed line
+  of a polarity mismatch (`LineInverter=false` holds the BFS output ON, LOW,
+  while idle) or a camera holding Line2 low for another reason. An unplugged or unprogrammed line
   idles at the pull-up (released) and fails as a plain `Strobe timeout`.
 - **Camera mask.** `cameras` may be any non-empty subset of `CAM_C | CAM_L |
   CAM_R`; `0` means `CAM_L | CAM_R` (pre-V0.1 behavior: C is captured only

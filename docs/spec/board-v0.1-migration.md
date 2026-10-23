@@ -49,15 +49,17 @@
   firmware notes in `pcb/board/pins.h` still describe the opto pair as the
   trigger/strobe lines; the board wiring is the same either way, and
   `Board.h` is the authority for which lines the firmware uses.
-- `Board::STROBE_ACTIVE_LEVEL = LOW`: the open-drain Line2 output pulls the
-  pulled-up line LOW while exposing (host `LineInverter=false`). An unplugged
-  or unprogrammed line therefore reads released, so it fails as a clean strobe
-  timeout rather than a permanent exposure. Capture keys every edge decision
+- `Board::STROBE_ACTIVE_LEVEL = LOW`: with host `LineInverter=true` the
+  open-drain Line2 output idles released and pulls the pulled-up line LOW
+  while exposing (bench 2026-10-22; with `false` the BFS output is ON while
+  idle, so the line reads as a permanent exposure). An unplugged or
+  unprogrammed line reads released, so it fails as a clean strobe timeout. Capture keys every edge decision
   on this constant, never on a literal.
 - Host (`app/orchestrator/camera-trigger.ts`) programs `TriggerSource=Line3`,
   `LineSelector=Line2, LineMode=Output, LineSource=ExposureActive`,
-  `LineInverter=false` (through the binding's boolean setter). The opto pair
-  (Line0/Line1) remains selectable for a bench fallback, not the default.
+  `LineInverter=true` (through the binding's boolean setter). The opto pair
+  (Line0/Line1) remains selectable for a bench fallback, not the default; its
+  inverter polarity is unmeasured.
 - All three cameras are triggerable: `CAM_C` is a valid mask bit; a mask of 0
   still means `CAM_L | CAM_R`, so sessions that do not ask for C never
   trigger it.
@@ -175,7 +177,7 @@ while the MCU owns the DAC.
 | Area | Verification |
 |---|---|
 | Board pin map, dual-bus DAC driver, enable order, pad control | Host simulator compiles the real firmware sources and decodes the bit-banged DAC waveform; `fw-sim-check` 16 stages pass |
-| Non-isolated camera lines, polarity constant, center camera | `fw-sim-check` stages 8 and 9; `core/test/50` rewritten and un-quarantined |
+| Non-isolated camera lines, polarity constant, center camera | `fw-sim-check` stages 8 and 9; `core/test/50` rewritten and un-quarantined; bench-verified 2026-10-22: LineInverter=true |
 | Protocol 2.2.0 schedule + trajectory, firmware engines | `fw-sim-check` stages C1 to C4 (keyframe timing, interpolation, 10-cycle trajectory with marker pushes, hold/stop) |
 | Serial pipelining and rate limits | `fw-sim-check` stage D; `core/test/52` |
 | Core packet factories, `onPush`, boolean/integer camera feature setters | Written against the Aravis 0.8 / NAPI patterns; validated only on stub-linked builds |
@@ -194,10 +196,10 @@ while the MCU owns the DAC.
    `Controller.cpp` (packet factories, `onPush`, TX tail queue) and
    `Camera.cpp` (boolean/integer setters) code is unbuilt there. Then run
    `core/test/47`, `49`, `50`, `51`, `52` against the simulator.
-3. **Camera lines.** Confirm in SpinView that Line3's `LineMode` offers only
-   Input on your units, then scope `J_CAMn` pin 3 during a triggered exposure:
-   idle HIGH, low while exposing. If it reads inverted, flip
-   `Board::STROBE_ACTIVE_LEVEL` and nothing else.
+3. **Camera lines.** Line3 trigger at 3.3 V and Line2 strobe polarity
+   bench-verified 2026-10-22 on one BFS-U3-16S2C (L port): host
+   `LineInverter=true`, 20/20 FINs, trigger→exposure 14–16 µs. Still owed:
+   the R and C ports, and the opto pair's polarity.
 4. **DAC bus.** Scope SCLK on both buses at the 10 MHz default: rate, duty,
    bus-to-bus skew, ringing versus the pad drive setting. Confirm whether the
    Mirrorcle board ties the AD5664R LDAC pin low (then outputs update per

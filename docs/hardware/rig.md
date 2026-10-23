@@ -43,7 +43,7 @@ per-process exclusive — `architecture/processes.md`).
   `TriggerSource=Line3` (Aravis also sets `TriggerMode=On`,
   `TriggerSelector=FrameStart`, `TriggerActivation=RisingEdge`; Line3 is
   input-only, so nothing to force); then `LineSelector=Line2`,
-  `LineMode=Output`, `LineSource=ExposureActive`, `LineInverter=false`. The
+  `LineMode=Output`, `LineSource=ExposureActive`, `LineInverter=true`. The
   cameras do this themselves when a session engages, so a camera's saved
   config does not need to be set up by hand. A trigger source that the
   camera does not list in `trigger_source_options` is refused with the list
@@ -53,16 +53,18 @@ per-process exclusive — `architecture/processes.md`).
   `getFeatureBool`, `setFeatureInt` and `getFeatureInt` cover the other
   non-string nodes); a failure of that write is reported, not thrown. The
   engage diagnostics span records the live line state.
-- **Polarity:** the Line2 ExposureActive output is open drain, so at the
-  Teensy's pull-up it reads **active LOW**: idle HIGH, pulled low while the
-  camera exposes (`LineInverter=false`, firmware
-  `Board::STROBE_ACTIVE_LEVEL = LOW`). An unplugged cable or a camera whose
-  Line2 was never programmed therefore reads idle and fails as a plain
-  `Strobe timeout`. A REJ reading `Strobe timeout: line stuck at active
-  level` means the line never returned to idle: `LineInverter` left on, or
-  Line2 held low for another reason. Not yet scope-verified: scope one
-  camera's `J_CAMn` pin 3 during a triggered exposure before the first synced
-  capture.
+- **Polarity:** the Line2 ExposureActive output is open drain. With
+  `LineInverter=true` it idles released and pulls low while the camera
+  exposes, so at the Teensy's pull-up it reads **active LOW** (firmware
+  `Board::STROBE_ACTIVE_LEVEL = LOW`); with `false` the output is ON (LOW)
+  while idle. An unplugged cable or a camera whose Line2 was never programmed
+  reads idle and fails as a plain `Strobe timeout`. A REJ reading `Strobe
+  timeout: line stuck at active level` means the line never returned to idle:
+  `LineInverter` left off, or Line2 held low for another reason.
+  Bench-verified 2026-10-22 on one BFS-U3-16S2C (L port): 20/20 FINs,
+  trigger→exposure 14–16 µs. The opto pair's (Line0/Line1) polarity is
+  unmeasured (`playground/trigger-bench.ts --lines Line0,Line1 --inverter
+  <x>`).
 - **Line3 / VAUX safety:** Line3 is also the camera's 8–24 V auxiliary
   power input (VAUX), and on this board it is wired straight to a Teensy
   pin with a 3.6 V absolute maximum and no protection. The Teensy's own

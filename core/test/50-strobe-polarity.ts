@@ -8,11 +8,12 @@
 // NON-isolated lines: `Board::camera[].trigger` drives camera Line3 (the
 // BFS's input-only non-isolated line) and `Board::camera[].strobe` reads
 // camera Line2, which the host programs as an ExposureActive output
-// (LineInverter off). The BFS Line2 output is OPEN DRAIN: it pulls the
-// Teensy-pulled-up line LOW while the camera exposes and releases it (HIGH)
-// otherwise — `Board::STROBE_ACTIVE_LEVEL = LOW`, the single constant
-// Capture.cpp keys every edge decision on. (The opto-isolated Line1 the old
-// board used has the same open-collector shape, `OPTO_STROBE_ACTIVE_LEVEL`.)
+// (LineInverter=true, bench 2026-10-22). The BFS Line2 output is OPEN DRAIN:
+// it pulls the Teensy-pulled-up line LOW while the camera exposes and
+// releases it (HIGH) otherwise — `Board::STROBE_ACTIVE_LEVEL = LOW`, the
+// single constant Capture.cpp keys every edge decision on.
+// (`OPTO_STROBE_ACTIVE_LEVEL` assumes the same shape for the opto-isolated
+// Line1; unmeasured.)
 //
 // Proves:
 //   1. All three strobe lines (C, L, R) idle at the RELEASED level (HIGH, the
@@ -21,7 +22,7 @@
 //      timing, both for the L|R pair and for C|L|R — the center camera is
 //      triggerable (no "no strobe cable" REJ).
 //   3. Polarity is a board constant, not something the line negotiates: an
-//      inverted active-HIGH waveform (LineInverter=true) against the
+//      inverted active-HIGH waveform (LineInverter=false) against the
 //      active-LOW firmware times out ("Strobe timeout: line stuck at active
 //      level ..."). If it FINs instead, Capture.cpp is not honouring
 //      STROBE_ACTIVE_LEVEL.

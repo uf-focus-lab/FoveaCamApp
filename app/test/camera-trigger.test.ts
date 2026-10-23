@@ -86,14 +86,14 @@ describe("enableHardwareTrigger", () => {
     expect(camera.setTrigger).toHaveBeenCalledWith("Line3");
     // The full GenICam sequence: the source (Line3 is input-only, so no
     // LineMode=Input write), then the strobe line LineSelector → LineMode →
-    // LineSource → LineInverter=false (open-drain, the firmware's active-LOW
-    // read).
+    // LineSource → LineInverter=true (open-drain idles released, pulls LOW
+    // while exposing: the firmware's active-LOW read).
     expect(writes).toEqual([
       "setTrigger=Line3",
       "LineSelector=Line2",
       "LineMode=Output",
       "LineSource=ExposureActive",
-      "LineInverter:bool=false",
+      "LineInverter:bool=true",
     ]);
     expect(result).toEqual({ lineInverter: null });
     expect(camera.clearTriggers).not.toHaveBeenCalled();
@@ -106,7 +106,7 @@ describe("enableHardwareTrigger", () => {
       "LineSelector=Line2",
       "LineMode=Output",
       "LineSource=ExposureActive",
-      "LineInverter:bool=false",
+      "LineInverter:bool=true",
     ]);
   });
 
@@ -124,21 +124,21 @@ describe("enableHardwareTrigger", () => {
     const { lease, camera } = makeFakeLease();
     await enableHardwareTrigger(lease);
     expect(camera.setFeatureBool).toHaveBeenCalledTimes(1);
-    expect(camera.setFeatureBool).toHaveBeenCalledWith("LineInverter", false);
+    expect(camera.setFeatureBool).toHaveBeenCalledWith("LineInverter", true);
     expect(camera.setFeature).not.toHaveBeenCalledWith("LineInverter", expect.anything());
   });
 
-  it("writes LineInverter=true through the boolean setter when asked", async () => {
+  it("writes LineInverter=false through the boolean setter when asked", async () => {
     const { lease, camera } = makeFakeLease();
-    await enableHardwareTrigger(lease, { lineInverter: true });
-    expect(camera.setFeatureBool).toHaveBeenCalledWith("LineInverter", true);
+    await enableHardwareTrigger(lease, { lineInverter: false });
+    expect(camera.setFeatureBool).toHaveBeenCalledWith("LineInverter", false);
     expect(camera.setFeature).not.toHaveBeenCalledWith("LineInverter", expect.anything());
   });
 
   it("falls back to the string setter on a binding without setFeatureBool", async () => {
     const { lease, writes } = makeFakeLease({ boolWriter: false });
     const result = await enableHardwareTrigger(lease);
-    expect(writes.at(-1)).toBe("LineInverter=false");
+    expect(writes.at(-1)).toBe("LineInverter=true");
     expect(result).toEqual({ lineInverter: null });
   });
 
@@ -170,7 +170,7 @@ describe("enableHardwareTrigger", () => {
     await enableHardwareTrigger(lease, {
       triggerSource: "Line0",
       lineSelector: "Line1",
-      lineInverter: true,
+      lineInverter: false,
     });
     expect(camera.setTrigger).toHaveBeenCalledWith("Line0");
     // Line0/Line1 are fixed-direction opto lines: no LineMode=Input write on
@@ -180,7 +180,7 @@ describe("enableHardwareTrigger", () => {
       "LineSelector=Line1",
       "LineMode=Output",
       "LineSource=ExposureActive",
-      "LineInverter:bool=true",
+      "LineInverter:bool=false",
     ]);
   });
 
@@ -233,7 +233,7 @@ describe("enableSoftwareTrigger", () => {
       "LineSelector=Line2",
       "LineMode=Output",
       "LineSource=ExposureActive",
-      "LineInverter:bool=false",
+      "LineInverter:bool=true",
     ]);
   });
 });
@@ -255,7 +255,7 @@ describe("readTriggerConfig", () => {
     const snap = readTriggerConfig(lease);
     expect(snap.LineSelector).toBe("Line2");
     expect(snap.LineSource).toBe("ExposureActive");
-    expect(snap.LineInverter).toBe("false"); // via getFeatureBool, stringified
+    expect(snap.LineInverter).toBe("true"); // via getFeatureBool, stringified
     // A node the fake never wrote reads as an error string, not a throw.
     expect(snap.TriggerActivation).toMatch(/^<error: /);
   });

@@ -321,7 +321,7 @@ static void finishActive(const char *rejectReason) {
 
 // REJ reason for a strobe timeout. A requested strobe still reading ASSERTED
 // at timeout means the line never returned to idle — the signature of a
-// polarity mismatch (LineInverter=true makes the open-drain line idle LOW =
+// polarity mismatch (LineInverter=false makes the open-drain line idle LOW =
 // "asserted" to this active-LOW firmware) or a camera holding Line2 low for
 // another reason (LineSource not ExposureActive, or Line2 left as a 3.3 V
 // output sink). Both strings start with "Strobe timeout" (host-matched).
