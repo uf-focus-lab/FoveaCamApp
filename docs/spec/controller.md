@@ -107,6 +107,12 @@ onStateChange(cb), reupload(), replace(spec) }`.
 - **Teardown.** `close()` STOPs a running trajectory and DELETEs the table. Both are
   best-effort: a dead device never throws out of `close()`. It then resumes the inputs,
   retires the graph input, and applies the disable-iff-we-enabled rule.
+  - **Order matters for the idle pose.** The resume after STOP re-asserts each position
+    input that is still OPEN. A session that closes its idle position input first and
+    then stops (or closes) the trajectory leaves nothing to resume: the firmware HOLDs
+    the trajectory's last position. A session that wants the mirror back at its idle
+    input's pose (MirrorLink: the center) must stop the trajectory BEFORE closing that
+    input. The node does not reorder this for the session.
 
 **Replace (phase-continuous swap).** `replace(spec)` re-shapes the table without
 stopping the scan. MirrorLink calls it on every steer drag or slider move, at most 10 Hz.
@@ -120,10 +126,46 @@ stopping the scan. MirrorLink calls it on every steer drag or slider move, at mo
   stats row counts successful swaps since open.
 - **Wire (`TrajectoryHandle.replace`, `controller.ts`).** The new spec is uploaded
   (BEGIN/DATA/MARK/COMMIT) to a FREE table id while the old one keeps running. Then
-  `STOP(old)` and `START(new, t_start, cycles)` are written back to back, with no
-  await between them, and both are awaited afterwards. `DELETE(old)` follows,
-  best-effort. The handle's `id` getter then reads the new id. The listener set moves
-  to the new id, and the new id's pushes reach it from START on.
+  the swap, ATOMIC FIRST:
+  - **Atomic (firmware ≥ 2.2.1, `Controller.v221Capable`).** A single
+    `START(new, t_start, cycles)` while the old table runs. The firmware accepts it iff
+    the new table is committed, has the same period, and `t_start` equals the running
+    table's recorded start to the µs; it then switches tables in place, keeping the
+    phase clock and the marker crossing state (no HOLD, no missed marker, no push).
+    It is attempted only when the run's anchor is exact (`start(atHostNs)`); a "now"
+    start's estimated anchor can never match, so it goes straight to the pair.
+  - **Fallback: the STOP/START pair.** On a REJ whose reason contains "already
+    running" (the firmware did not take the atomic START: older semantics or a
+    mismatch), and always below 2.2.1: `STOP(old)` and `START(new, t_start, cycles)`
+    are written back to back, with no await between them, and both are awaited
+    afterwards.
+  - Any other REJ of the atomic START stopped nothing: the new table is DELETEd and
+    `TrajectoryReplaceError` is thrown with `running: true`.
+  - `DELETE(old)` follows either way, best-effort. The handle's `id` getter then reads
+    the new id, and `lastSwap` (`"atomic"` | `"stop-start"`, null before the first
+    running swap; a plain re-upload leaves it) says which path landed. The listener
+    set moves to the new id, and the new id's pushes reach it from START on.
+- **Grace for the retired id.** Firmware STOP (and the atomic swap) only stops
+  PLAYBACK. A marker capture already in flight finishes later and pushes with the OLD
+  id, at the latest `pulse + STROBE_MARGIN_US` (5 ms, `firmware/src/Capture.cpp`)
+  after its trigger. So after every swap the old id stays routed to the SAME listener
+  set for `trajectoryGraceUs(old spec) = max(marker pulseUs) + 5 000 µs + 50 000 µs`
+  (`app/orchestrator/trajectory-grace.ts`; 0 for a spec without markers, and no grace
+  for a table that was never STARTed), measured on the host clock from the swap.
+  - Inside the grace the id is not allocated to a new table: the next replace or
+    upload takes the next free id. When every id is held or in grace, the allocation
+    waits for the earliest grace to run out instead of failing at capacity.
+  - Past the deadline a straggler for that id is dropped and the id is free again.
+  - Only the listeners are kept: the run hook is not, so a retired id's run-level
+    push never ends the current run.
+  - `DELETE(old)` still goes out at once. The firmware's push for an in-flight
+    capture carries the id copied into the capture request
+    (`Capture.cpp finishActive` → `Trajectory::push`) and never looks the table up.
+  - `dispose()` honors the grace too. The disposed handle's (now empty) listener set
+    keeps the id for the grace, so a straggler reaches nobody, and in particular not
+    the id's next owner.
+  - The node scores a retired table's straggler (OK pushes from the old id inside
+    its grace) against the retired spec, not the new one.
 - **Phase carry.** `t_start` and `cycles` are the run's original values. The firmware
   joins a past `t_start` in progress, so the mirror continues at the phase the old
   table was at. For `start(atHostNs)` that is the exact MCU value sent. A "now" start
@@ -131,9 +173,9 @@ stopping the scan. MirrorLink calls it on every steer drag or slider move, at mo
   clock at send time, converted to MCU µs. The carried phase is then approximate to
   the serial latency, and it relies on the calibrated clock offset.
 - **Failures.** If the upload fails, the partial new table is DELETEd and its id
-  freed. The old table keeps running and the error is rethrown. If `START(new)` is
-  REJected after `STOP(old)` succeeded, the handle re-STARTs the old table at the same
-  `t_start` and throws `TrajectoryReplaceError`. When that restart fails too, the
+  freed. The old table keeps running and the error is rethrown. If `START(new)` of
+  the pair is REJected after `STOP(old)` succeeded, the handle re-STARTs the old table
+  at the same `t_start` and throws `TrajectoryReplaceError`. When that restart fails too, the
   error has `running: false`, and the node ends the run: inputs re-take the DAC.
 - **Concurrency.** The controller handle allows one replace at a time; `start`,
   `stop` and `dispose` wait for an in-flight one. The node COALESCES: calls made while
@@ -166,6 +208,8 @@ stopping the scan. MirrorLink calls it on every steer drag or slider move, at mo
   - id, state, running, period, marker count;
   - cycles seen, per-status push counts, last marker / cycle;
   - held pushes;
+  - `reuploads` and `lastSwap` (`"atomic"` | `"stop-start"` | null), the kind of the
+    last running swap;
   - `lastLatenessUs`, the lateness of the last OK push: `t_trigger` −
     (`t_start` + cycle·period + marker offset). It is exact only when `start(atHostNs)`
     named the instant (`latenessExact`). A "now" start uses the host's send-time
@@ -319,6 +363,34 @@ the SAME `["config"]` document, so the session subscribes here and live-applies 
 imported by a session, so it must not pull `@lib/config` (Vue). The doc path, default, and
 clamp bounds are the shared Vue-free `@lib/config-schema` constants (same ones `@lib/config`'s
 AppConfig defaults consume), so the renderer and this reader can never drift.
+
+## Controller clock sync {#clock-sync}
+
+Source: `app/orchestrator/sessions/controller.ts` (`startControllerClockSync`),
+`Controller.setClockOffsetNs` / `noteClockPingMissed` / `clockCalibrated`.
+
+The MCU↔host offset is calibrated by the JS-driven `System.Timestamp` ping
+(`pingControllerOffset`, 10 bracketed reads, min-filter). The controller session starts
+the sync on connect and stops it on disconnect:
+
+- One round at once, then one every `CLOCK_REPING_INTERVAL_MS` = 30 s, the cameras'
+  re-latch cadence. Rounds never overlap.
+- Each round is RACED against `CLOCK_PING_TIMEOUT_MS` = 3 s. Pre-v1.1 firmware REJects
+  the unknown property with seq 0, which is dropped, so the read would otherwise hang
+  until Device teardown.
+- A landed round writes the `controller` calibration row (drift ppm vs the previous
+  one) and swaps the offset in with `setClockOffsetNs`. The swap is atomic for outcomes
+  decoded after it; FIN and push timestamps already surfaced keep the offset they were
+  decoded with. A run anchor already sent to the MCU (`t_start`, MCU µs) is unaffected.
+- **`Controller.clockCalibrated`** is true once a round landed. It turns false again
+  after TWO consecutive missed rounds (timed out or failed; `noteClockPingMissed`).
+  The last offset stays installed but is no longer vouched for. The next landed round
+  restores it. A miss streak is reported once (`report("time-align", …)`), not every
+  30 s.
+- The session publishes it as `clockCalibrated` in the controller telemetry (false
+  while disconnected) and republishes whenever it flips. MirrorLink refuses to scan
+  while `activeController()?.clockCalibrated` is false: the scan's start instant and
+  every marker timestamp ride this offset.
 
 ## Clock-metrics bridge {#clock-calibration}
 
