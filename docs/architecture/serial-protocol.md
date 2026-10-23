@@ -73,8 +73,10 @@ wedge into a ≤1 s glitch.
   phase crosses it. Results come back as pushes (`SYN CMD_TRAJECTORY` →
   `Device.onPush` → `handle.onFrame`, decoded like `FrameOutcome`), so the
   steady state is zero bytes host→MCU and one small push per trigger. A running
-  trajectory owns the DAC (stream UPDATE / SCHEDULE are refused); `stop()`
-  holds the last position until the next stream write. Spec:
+  trajectory owns the DAC and the trigger lines (stream UPDATE / SCHEDULE,
+  Actuate and the legacy Trigger are refused; v2.2.1 also refuses a START while
+  a legacy Trigger is pending); `stop()` holds the last position (an Actuate
+  then moves the hold) until the next stream write. Spec:
   `docs/spec/serial-protocol.md#trajectory`.
 - Both v2.2.0 surfaces are gated on firmware `>= 2.2.0`
   (`Controller.v22Capable`); older firmware REJects the unknown properties.

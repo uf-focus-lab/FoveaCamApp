@@ -1223,6 +1223,7 @@ describe("classifyTrajectoryStartError / Controller.clockOffsetNs", () => {
       "Trajectory not committed (COMMIT first)",
       "Cannot perform action: system is not enabled",
       "Bad START length",
+      "A trigger is pending (legacy Trigger) — wait for its FIN",
       "Unknown trajectory operation",
       "Trajectory packet too short for its operation",
     ])

@@ -31,7 +31,10 @@
 //      mid-ramp frame reports them); stale/UPDATE-clears semantics;
 //      CMD_TRAJECTORY upload/commit/start -> periodic DAC playback + marker
 //      SYN pushes with sane timestamps; Actuate / legacy Trigger REJ while
-//      a run plays (Actuate works in HOLD); STOP holds position, DAC
+//      a run plays, START REJ while a legacy Trigger is pending; an Actuate
+//      in HOLD moves the hold position (past the 1 Hz refresh); STOP holds
+//      position; a START + MEMS reset burst still starts at phase 0; START +
+//      STOP in one loop iteration holds the DAC's actual position; DAC
 //      returns to the streams.
 //   C5 (v2.2.1): CMD_TRAJECTORY atomic swap — START b at a's t_start while a
 //      runs (same period) switches tables in place: mismatched period /
@@ -552,6 +555,40 @@ static Cmd::TrajectoryRef trajectoryRef(Cmd::Trajectory::Op op, uint8_t id) {
   r.op = op;
   r.id = id;
   return r;
+}
+
+// One COBS frame appended to a burst; sendBurst() writes the whole burst at
+// once, so the sim's loop reads it in one Serial.available() batch and handles
+// every packet in it within ONE loop iteration (no tick() in between).
+static void appendFrame(Wire &wire, Protocol::RawPacket &&packet,
+                        std::vector<uint8_t> &out) {
+  CHECK(wire.tx.encode(packet.finalize()), "COBS encode (burst)");
+  out.insert(out.end(), wire.tx.data(), wire.tx.data() + wire.tx.size());
+}
+
+static void sendBurst(Wire &wire, const std::vector<uint8_t> &bytes) {
+  size_t off = 0;
+  while (off < bytes.size()) {
+    const ssize_t n = ::write(wire.fd, bytes.data() + off, bytes.size() - off);
+    if (n > 0) {
+      off += size_t(n);
+      continue;
+    }
+    CHECK(n < 0 && (errno == EAGAIN || errno == EINTR), "burst write");
+    pollfd p{wire.fd, POLLOUT, 0};
+    ::poll(&p, 1, 100);
+  }
+}
+
+// The next response, which must answer `seq` with an ACK on `p`.
+static void expectAckOf(Wire &wire, Protocol::Property p, uint16_t seq,
+                        const char *what) {
+  const auto resp = wire.recv();
+  CHECK(resp.header().sequence == seq && Protocol::property(resp.validate()) == p,
+        what);
+  if (Protocol::method(resp.validate()) != Protocol::Method::ACK)
+    throw std::runtime_error(std::string("CHECK failed: ") + what +
+                             " (got: " + payloadStr(resp) + ")");
 }
 
 // Host-load tolerance for the stages whose assertions ride on the sim's loop
@@ -1146,8 +1183,11 @@ int main() {
                   static_cast<unsigned long long>(worstLate));
     }, [&] { recoverTrajectories(wire, {TID}); });
 
-    // C4 — HOLD after the run (survives the 1 Hz refresh), STOP mid-run holds
-    //      the last position, control returns to the streams, DELETE
+    // C4 — HOLD after the run (survives the 1 Hz refresh), START refused
+    //      while a legacy Trigger is pending, STOP mid-run holds the last
+    //      position, START + MEMS reset burst starts at phase 0, an Actuate
+    //      moves the hold, START + STOP burst holds the DAC's position,
+    //      control returns to the streams, DELETE
     {
       // After ENDED the mirror holds phase 0 across a MEMS refresh: stream 1's
       // target (L ch1 = 22000) is NOT re-committed.
@@ -1159,13 +1199,29 @@ int main() {
         CHECK(x == 1000, "HOLD keeps the final trajectory position");
       CHECK(!hasValue(v, 22000), "HOLD: the stream target is not re-committed");
 
-      // Endless run from now, then STOP mid-run.
+      // A pending legacy Trigger holds every Line3 HIGH until its FIN: a
+      // START meanwhile is refused (a marker's pulse would be cut by that
+      // FIN), and works once the FIN is out.
       uint16_t s = 0;
       Cmd::TrajectoryStart st{};
       st.op = Cmd::Trajectory::START;
       st.id = TID;
       st.t_start = 0;
       st.cycles = 0;
+      Cmd::Trigger trig{};
+      trig.duration = 150'000;
+      s = wire.next();
+      wire.send(setPacket(Protocol::Property::CMD_TRIGGER, s, &trig,
+                          sizeof(trig)));
+      expectAck(wire, Protocol::Property::CMD_TRIGGER, s, "legacy Trigger");
+      CHECK(expectRejected(trajectoryOp(wire, &st, sizeof(st)),
+                           "START while a Trigger is pending") ==
+                "A trigger is pending (legacy Trigger) — wait for its FIN",
+            "START refused while a legacy Trigger is pending");
+      expectHeader(wire.recv(), Protocol::Method::FIN,
+                   Protocol::Property::CMD_TRIGGER, s, "legacy Trigger FIN");
+
+      // Endless run from now, then STOP mid-run.
       const size_t runMark = sim.lines.size();
       expectOk(trajectoryOp(wire, &st, sizeof(st)), "START (now, forever)");
       // The running trajectory owns the DAC and the trigger lines: a direct
@@ -1180,7 +1236,6 @@ int main() {
       CHECK(expectRej(wire, Protocol::Property::CMD_ACTUATE, s, "Actuate REJ")
                     .find("trajectory owns the DAC") != std::string::npos,
             "Actuate refused while a trajectory runs");
-      Cmd::Trigger trig{};
       trig.duration = 1000;
       s = wire.next();
       wire.send(setPacket(Protocol::Property::CMD_TRIGGER, s, &trig,
@@ -1205,14 +1260,35 @@ int main() {
       CHECK(!hasValue(v, 22000), "STOP does not snap back to the stream");
 
       // A fresh START after the mid-run STOP: the FIRST DAC word of the new
-      // run is its phase 0 (1000), never the held position — Streams::claim
-      // must not re-drive the previous run's stale drive position for a tick
-      // (Streams::tick runs before Trajectory::tick).
+      // run is its phase 0 (1000), never the held position. A MEMS recovery
+      // (SYS_RESET MEMS -> Streams::touch) in the SAME loop iteration as the
+      // START leaves a refresh pending when the next Streams::tick runs —
+      // before Trajectory::tick's first drive — so this exercises the
+      // `firstDrive` guard: without it that tick re-commits the held position.
       Cmd::TrajectoryStart re = st;
       re.t_start = mcuNow(wire) + 30'000;
       re.cycles = 1;
       mark = sim.lines.size();
-      expectOk(trajectoryOp(wire, &re, sizeof(re)), "START after STOP");
+      {
+        std::vector<uint8_t> burst;
+        const uint16_t sStart = wire.next();
+        appendFrame(wire,
+                    setPacket(Protocol::Property::CMD_TRAJECTORY, sStart, &re,
+                              sizeof(re)),
+                    burst);
+        System::Reset rst{};
+        rst.type = System::Reset::MEMS;
+        const uint16_t sReset = wire.next();
+        appendFrame(wire,
+                    setPacket(Protocol::Property::SYS_RESET, sReset, &rst,
+                              sizeof(rst)),
+                    burst);
+        sendBurst(wire, burst);
+        expectAckOf(wire, Protocol::Property::CMD_TRAJECTORY, sStart,
+                    "START after STOP (burst with a MEMS reset)");
+        expectAckOf(wire, Protocol::Property::SYS_RESET, sReset,
+                    "MEMS reset in the START burst");
+      }
       std::vector<uint16_t> fresh;
       for (int i = 0; i < 200 && fresh.empty(); i++) {
         sleepMs(1);
@@ -1228,7 +1304,8 @@ int main() {
           break;
 
       // HOLD is not running: Actuate works again (ACK, then FIN after the
-      // settle time) — the host may re-aim after a scan.
+      // settle time) — the host may re-aim after a scan — and becomes the
+      // hold position (Streams::noteActuate).
       mark = sim.lines.size();
       s = wire.next();
       wire.send(setPacket(Protocol::Property::CMD_ACTUATE, s, &act,
@@ -1239,6 +1316,15 @@ int main() {
       drain(sim);
       CHECK(hasValue(dacValues(sim, 'L', mark), 30000),
             "Actuate in HOLD writes the DAC");
+      // ... and moves the hold position: the 1 Hz refresh re-commits it,
+      // never the trajectory's phase-0 hold.
+      mark = sim.lines.size();
+      sleepMs(1200);
+      drain(sim);
+      v = dacValues(sim, 'L', mark);
+      CHECK(hasValue(v, 30000), "the refresh re-commits the Actuate position");
+      CHECK(inBand(v, 1000, 3400).empty(),
+            "Actuate in HOLD survives the 1 Hz refresh (no snap-back)");
 
       // Control returns to the streams on the next stream write.
       mark = sim.lines.size();
@@ -1252,6 +1338,45 @@ int main() {
         back = hasValue(dacValues(sim, 'L', mark), 4321);
       }
       CHECK(back, "stream UPDATE drives the DAC again after STOP");
+
+      // START (future t_start) and STOP in ONE loop iteration: the run never
+      // drives, and the HOLD keeps what the DAC holds — the stream's 4321 —
+      // across the 1 Hz refresh, not a stale drive position (the Actuate's
+      // 30000, or zeros after boot).
+      mark = sim.lines.size();
+      {
+        Cmd::TrajectoryStart fut = st;
+        fut.t_start = mcuNow(wire) + 500'000;
+        fut.cycles = 1;
+        std::vector<uint8_t> burst;
+        const uint16_t sStart = wire.next();
+        appendFrame(wire,
+                    setPacket(Protocol::Property::CMD_TRAJECTORY, sStart, &fut,
+                              sizeof(fut)),
+                    burst);
+        const uint16_t sStop = wire.next();
+        appendFrame(wire,
+                    setPacket(Protocol::Property::CMD_TRAJECTORY, sStop, &stop,
+                              sizeof(stop)),
+                    burst);
+        sendBurst(wire, burst);
+        expectAckOf(wire, Protocol::Property::CMD_TRAJECTORY, sStart,
+                    "START (burst with STOP)");
+        expectAckOf(wire, Protocol::Property::CMD_TRAJECTORY, sStop,
+                    "STOP in the START burst");
+      }
+      sleepMs(1200);
+      drain(sim);
+      v = dacValues(sim, 'L', mark);
+      CHECK(hasValue(v, 4321), "the refresh re-commits the held position");
+      CHECK(!hasValue(v, 30000) && !hasValue(v, 0) &&
+                inBand(v, 1000, 3400).empty(),
+            "START+STOP in one iteration holds the DAC's actual position");
+      // Hand the DAC back to stream 1 (same target) for the later stages.
+      s = wire.next();
+      streamOp(wire, Cmd::MirrorStream::UPDATE, 1,
+               pos(4321, 22000, 32000, 42000), R0, s);
+      expectAck(wire, Protocol::Property::CMD_STREAM, s, "UPDATE after HOLD");
 
       const auto del = trajectoryRef(Cmd::Trajectory::DELETE, TID);
       expectOk(trajectoryOp(wire, &del, sizeof(del)), "DELETE");
