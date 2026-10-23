@@ -40,12 +40,13 @@ namespace Version {
 // while table a runs is ACCEPTED iff b != a is committed, b.period ==
 // a.period and t_start == a's recorded t_start (exact µs; 0 never matches):
 // the firmware switches the playing table to b in place — phase clock and
-// per-marker-index crossing state carry over, no HOLD, no pre-position, no
-// push; `cycles` replaces the budget; a stays committed (the host DELETEs
-// it) and a capture a's marker already started still pushes with a's id. Any
-// other START while running still REJs "A trajectory is already running
-// (STOP it first)". Wire layout unchanged; a host that sees that REJ (older
-// firmware) falls back to STOP(a) + START(b).
+// per-marker-index crossing state carry over, no HOLD, no re-claim (an ARMED
+// run keeps pre-positioning at b's phase 0), no push; `cycles` replaces the
+// budget; a stays committed (the host DELETEs it) and a capture a's marker
+// already started still pushes with a's id. Any other START while running
+// still REJs "A trajectory is already running (STOP it first)". Wire layout
+// unchanged; a host that sees that REJ (older firmware) falls back to
+// STOP(a) + START(b).
 constexpr uint8_t Major = 2;
 constexpr uint8_t Minor = 2;
 constexpr uint8_t Patch = 1;

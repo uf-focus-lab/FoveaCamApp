@@ -295,7 +295,8 @@ void appendFlipReports(Napi::Env env, Napi::Array &rows,
     // The anchor edge (attach option `anchorFrom`): the native row REPLACES a
     // session-registered row for this id (graph-topology.ts
     // mergeReportLayers), so the edge must come from here. Typed as the
-    // trajectory node's record stream (session.ts TRAJECTORY_STREAM).
+    // trajectory node's record stream (app/orchestrator/controller-node.ts
+    // TRAJECTORY_STREAM).
     if (!b.stream->anchorFrom().empty()) {
       auto anchorType = Napi::Object::New(env);
       anchorType.Set("kind", Napi::String::New(env, "analysis"));
