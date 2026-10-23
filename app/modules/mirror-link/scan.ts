@@ -161,6 +161,12 @@ export function patternSamples(
  * Clamp a window to `0 ≤ w0 < w1 ≤ WINDOW_MAX` with `w1 − w0 ≥ WINDOW_MIN`.
  * An inverted pair is swapped; a too-short one grows its END (or, at the cap,
  * its start). Non-finite ends fall back to the full window.
+ *
+ * Float-safe: `(a + WINDOW_MIN) − a` can land a hair BELOW `WINDOW_MIN` (most
+ * 0.005-grid starts do), so the moved end is nudged outward by one ULP at a
+ * time until `w1 − w0 >= WINDOW_MIN` holds exactly — the pane's `gapEdge`
+ * rule (`app/src/inputs/dual-range.ts`), so the result passes its own check.
+ * Compare windows with {@link sameWindowValue} (a tolerance), not `===`.
  */
 export function clampWindow(w: readonly [number, number]): ScanWindow {
   let a = Number.isFinite(w[0]) ? w[0] : 0;
@@ -170,12 +176,40 @@ export function clampWindow(w: readonly [number, number]): ScanWindow {
   b = Math.min(Math.max(b, 0), WINDOW_MAX);
   if (b - a < WINDOW_MIN) {
     b = a + WINDOW_MIN;
+    while (b - a < WINDOW_MIN) b += ulp(b);
     if (b > WINDOW_MAX) {
       b = WINDOW_MAX;
       a = WINDOW_MAX - WINDOW_MIN;
+      while (b - a < WINDOW_MIN) a -= ulp(a);
     }
   }
   return [a, b];
+}
+
+/** One unit in the last place of `v` (an upper bound — nudges may skip one
+ *  representable value, never fall short). */
+const ulp = (v: number): number => Math.max(Math.abs(v) * Number.EPSILON, Number.MIN_VALUE);
+
+/** Tolerance for comparing window ends: far below any pane step (0.005) and
+ *  any µs of a marker, far above float noise. */
+export const WINDOW_EPS = 1e-9;
+
+/** Two windows are the same up to {@link WINDOW_EPS} per end (a clamp's ULP
+ *  nudge or a client's float round-trip is not a change). False for anything
+ *  that is not a 2-number array. */
+export function sameWindowValue(a: unknown, b: unknown): boolean {
+  return (
+    Array.isArray(a) &&
+    Array.isArray(b) &&
+    a.length === 2 &&
+    b.length === 2 &&
+    typeof a[0] === "number" &&
+    typeof a[1] === "number" &&
+    typeof b[0] === "number" &&
+    typeof b[1] === "number" &&
+    Math.abs(a[0] - b[0]) <= WINDOW_EPS &&
+    Math.abs(a[1] - b[1]) <= WINDOW_EPS
+  );
 }
 
 /** The scan's window state, as the contract carries it. */
@@ -222,6 +256,67 @@ export function windowMarkers(
   const first = windows[0] ?? [0, WINDOW_MAX];
   if (mode === "ellipse") return [one(0, first)];
   return [one(0, first), one(T, windows[1] ?? first)];
+}
+
+/** Smallest CIRCULAR distance between consecutive values of `ts` (µs) over a
+ *  period `P` — the wrap from the last back to the first included. One value
+ *  (or none) → `P`. */
+function minCircularGapUs(ts: readonly number[], P: number): number {
+  const s = [...ts].sort((a, b) => a - b);
+  if (s.length < 2) return P;
+  let gap = P;
+  for (let i = 0; i < s.length; i++) {
+    const next = i + 1 < s.length ? s[i + 1]! : s[0]! + P;
+    gap = Math.min(gap, next - s[i]!);
+  }
+  return gap;
+}
+
+/** Flip-brick tolerance rule (spec §triangle-flip): this fraction of
+ *  `min(T, closest marker spacing)`... */
+export const FLIP_TOLERANCE_FRACTION = 0.4;
+/** ...never below this (µs) — the host↔camera clock alignment needs room... */
+export const FLIP_TOLERANCE_FLOOR_US = 1000;
+/** ...and never above this fraction of the closest marker spacing, so a frame
+ *  can never be nearer the neighbouring marker's edge by construction. */
+export const FLIP_TOLERANCE_CAP_FRACTION = 0.45;
+
+/**
+ * The flip bricks' match tolerance for a run (µs): `0.4 × min(T, closest
+ * circular marker spacing)`, floored at {@link FLIP_TOLERANCE_FLOOR_US} and
+ * capped at `0.45 × spacing`. When the floor exceeds the cap the windows are
+ * too close for reliable flipping at this frequency: `tooClose` is set (the
+ * session flags `mismatch`; the scan still runs) and the tolerance is the cap.
+ */
+export function flipToleranceUs(
+  periodUs: number,
+  sweepUs: number,
+  markerOffsetsUs: readonly number[],
+): { toleranceUs: number; tooClose: boolean } {
+  const spacing = minCircularGapUs(markerOffsetsUs, periodUs);
+  const cap = FLIP_TOLERANCE_CAP_FRACTION * spacing;
+  const want = Math.max(FLIP_TOLERANCE_FRACTION * Math.min(sweepUs, spacing), FLIP_TOLERANCE_FLOOR_US);
+  if (FLIP_TOLERANCE_FLOOR_US > cap) return { toleranceUs: cap, tooClose: true };
+  return { toleranceUs: Math.min(want, cap), tooClose: false };
+}
+
+/**
+ * The smallest END-TO-END spacing between consecutive exposures (µs, circular
+ * over the period): with `TriggerOverlap = ReadOut` the next exposure may
+ * start during the previous readout, but it may not END before that readout
+ * is done — so this must reach the sensor's readout time (spec
+ * §exposure-windows). For the triangle's two markers it is
+ * `T·(1 + w1f − w1r)` or `T·(1 + w1r − w1f)`, whichever is smaller; for one
+ * marker per period it is the period.
+ */
+export function minExposureEndSpacingUs(
+  periodUs: number,
+  markers: readonly WindowMarker[],
+): number {
+  return minCircularGapUs(
+    markers.map((m) => m.tOffsetUs + m.pulseUs),
+    periodUs,
+  );
 }
 
 /** A drawable path: offsets plus whether the renderer closes the loop. */

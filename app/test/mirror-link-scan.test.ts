@@ -26,11 +26,15 @@ import {
   axisHandleOffset,
   clampWindow,
   ELLIPSE_SAMPLES,
+  FLIP_TOLERANCE_FLOOR_US,
+  flipToleranceUs,
+  minExposureEndSpacingUs,
   normalizeAxisDeg,
   patternOffset,
   patternPath,
   patternPeriodUs,
   patternSamples,
+  sameWindowValue,
   scanAngles,
   SCAN_AMP_RANGE,
   SCAN_AXIS_RANGE,
@@ -230,6 +234,39 @@ describe("windowMarkers", () => {
   });
 });
 
+describe("flip tolerance + exposure spacing", () => {
+  it("0.4 × min(T, closest circular marker spacing)", () => {
+    const T = sweepUs(10);
+    // Synced default windows: markers T apart → 0.4 T.
+    expect(flipToleranceUs(2 * T, T, [5_000, T + 5_000])).toEqual({ toleranceUs: 0.4 * T, tooClose: false });
+    // Rising at 0.9 T, falling at T: 0.1 T apart (the wrap is 1.9 T).
+    expect(flipToleranceUs(2 * T, T, [0.9 * T, T]).toleranceUs).toBeCloseTo(0.04 * T, 9);
+  });
+
+  it("floors at 1 ms, capped at 0.45 × spacing; floor > cap → tooClose", () => {
+    // 100 Hz sweep (T = 10 ms), markers 2 ms apart: the cap 0.45 × 2 ms =
+    // 0.9 ms is below the 1 ms floor → too close, tolerance = the cap.
+    expect(flipToleranceUs(20_000, 10_000, [0, 2_000])).toEqual({ toleranceUs: 900, tooClose: true });
+    // 3 ms apart: 0.4·3 = 1.2 ms (above the floor, below the 1.35 ms cap).
+    expect(flipToleranceUs(20_000, 10_000, [0, 3_000])).toEqual({ toleranceUs: 1_200, tooClose: false });
+    // 2.4 ms apart: 0.96 ms → floored to 1 ms (cap 1.08 ms).
+    const r = flipToleranceUs(20_000, 10_000, [0, 2_400]);
+    expect(r.toleranceUs).toBe(FLIP_TOLERANCE_FLOOR_US);
+    expect(r.tooClose).toBe(false);
+  });
+
+  it("end-to-end spacing is T(1 + w1f − w1r) / T(1 + w1r − w1f), the smaller", () => {
+    const T = sweepUs(10);
+    const m = windowMarkers("triangle", 10, [
+      [0.1, 0.9],
+      [0.2, 0.5],
+    ]);
+    // ends at 0.9 T and 1.5 T: 0.6 T = T(1 + 0.5 − 0.9) and 1.4 T across the wrap.
+    expect(minExposureEndSpacingUs(2 * T, m)).toBe(Math.round(0.6 * T));
+    expect(minExposureEndSpacingUs(T, windowMarkers("ellipse", 10, [[0, 0.5]]))).toBe(T);
+  });
+});
+
 describe("clampWindow", () => {
   it("keeps a valid window untouched", () => {
     expect(clampWindow([0.1, 0.8])).toEqual([0.1, 0.8]);
@@ -256,6 +293,35 @@ describe("clampWindow", () => {
 
   it("falls back on non-finite ends", () => {
     expect(clampWindow([NaN, NaN])).toEqual([0, WINDOW_MAX]);
+  });
+
+  it("is float-safe on every 0.005-grid position: passes its own check, idempotent", () => {
+    const n = Math.round(WINDOW_MAX / WINDOW_MIN);
+    for (let k = 0; k <= n; k++) {
+      const a = Number((k * WINDOW_MIN).toPrecision(12));
+      // A zero-length window, and the grid neighbour the pane would produce.
+      for (const w of [
+        [a, a],
+        [a, Number((a + WINDOW_MIN).toPrecision(12))],
+      ] as [number, number][]) {
+        const c = clampWindow(w);
+        expect(c[1] - c[0]).toBeGreaterThanOrEqual(WINDOW_MIN);
+        expect(c[0]).toBeGreaterThanOrEqual(0);
+        expect(c[1]).toBeLessThanOrEqual(WINDOW_MAX);
+        // Clamping the clamp changes nothing, and the result is the input up
+        // to float noise wherever the input was already a valid grid window.
+        expect(clampWindow(c)).toEqual(c);
+        if (w[1] - w[0] > WINDOW_MIN / 2 && w[1] <= WINDOW_MAX)
+          expect(sameWindowValue(c, w)).toBe(true);
+      }
+    }
+  });
+
+  it("sameWindowValue tolerates float noise, not a step", () => {
+    expect(sameWindowValue([0.1, 0.105], [0.1, 0.1 + 0.005])).toBe(true);
+    expect(sameWindowValue([0.1, 0.105], [0.1, 0.11])).toBe(false);
+    expect(sameWindowValue([0.1, 0.105], [0.1])).toBe(false);
+    expect(sameWindowValue(null, [0.1, 0.105])).toBe(false);
   });
 });
 
