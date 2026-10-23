@@ -1413,6 +1413,100 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
         expect(trajectoryOps()).not.toContain("START");
       });
 
+      it("a re-START failing otherwise also STOPs every sibling (one may be the table playing)", async () => {
+        const handle = await running(FW_221);
+        const got: number[] = [];
+        handle.onFrame((f) => got.push(f.trajectoryId));
+        // An earlier ambiguous outcome left sibling 1 (possibly live).
+        mockOps.reject.push(
+          { op: "START", id: 1, message: TIMEOUT },
+          {
+            op: "START",
+            id: 0,
+            message: "A trajectory is already running (STOP it first)",
+          },
+        );
+        await handle.replace(reshaped(4)).catch(() => {});
+        mockCalls.length = 0;
+        mockOps.reject.push(
+          { op: "START", id: 2, message: TIMEOUT },
+          {
+            op: "START",
+            id: 0,
+            message: "Request timeout (no device response)",
+          },
+        );
+        const error = (await handle
+          .replace(spec(4))
+          .catch((e: unknown) => e)) as TrajectoryReplaceError;
+        expect(error.running).toBe(false);
+        expect(
+          wireOps().filter((a) => ["START", "STOP", "DELETE"].includes(a.op)),
+        ).toEqual([
+          { op: "START", id: 2, t_start: 2_000_000n, cycles: 0 },
+          { op: "START", id: 0, t_start: 2_000_000n, cycles: 0 },
+          { op: "STOP", id: 0 },
+          { op: "STOP", id: 1 },
+          { op: "DELETE", id: 1 },
+          { op: "DELETE", id: 2 },
+        ]);
+        // Both graced (stragglers still reach the handle)…
+        push(1);
+        push(2);
+        expect(got).toEqual([1, 2]);
+        // …then unrouted.
+        elapse(trajectoryGraceUs(reshaped(4)) + trajectoryGraceUs(spec(4)) + 1);
+        push(1);
+        push(2);
+        expect(got).toEqual([1, 2]);
+      });
+
+      it("a sibling whose STOP failed stays reserved; a later stop() STOPs and DELETEs it", async () => {
+        const handle = await running(FW_221);
+        const got: number[] = [];
+        handle.onFrame((f) => got.push(f.trajectoryId));
+        mockOps.reject.push(
+          { op: "START", id: 1, message: TIMEOUT },
+          {
+            op: "START",
+            id: 0,
+            message: "A trajectory is already running (STOP it first)",
+          },
+        );
+        await handle.replace(reshaped(4)).catch(() => {});
+        mockCalls.length = 0;
+        mockOps.reject.push(
+          { op: "START", id: 2, message: TIMEOUT },
+          {
+            op: "START",
+            id: 0,
+            message: "Request timeout (no device response)",
+          },
+          { op: "STOP", id: 1, message: TIMEOUT },
+        );
+        const error = (await handle
+          .replace(spec(4))
+          .catch((e: unknown) => e)) as TrajectoryReplaceError;
+        expect(error.running).toBe(false);
+        const ops = wireOps().filter((a) => ["STOP", "DELETE"].includes(a.op));
+        expect(ops).toEqual([
+          { op: "STOP", id: 0 },
+          { op: "STOP", id: 1 },
+          { op: "DELETE", id: 2 },
+        ]);
+        // Still reserved + routed, with no deadline.
+        elapse(10 * trajectoryGraceUs(reshaped(4)));
+        push(1);
+        expect(got).toEqual([1]);
+        mockCalls.length = 0;
+        await handle.stop();
+        expect(wireOps()).toEqual([
+          { op: "STOP", id: 0 },
+          { op: "STOP", id: 1 },
+          { op: "DELETE", id: 1 },
+        ]);
+      });
+
       it("a definitive REJ is NOT retried (no re-START), whatever its reason", async () => {
         const handle = await running(FW_221);
         mockOps.reject.push({

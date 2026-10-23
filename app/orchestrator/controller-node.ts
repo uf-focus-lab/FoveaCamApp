@@ -1258,8 +1258,10 @@ class NodeTrajectoryImpl implements NodeTrajectory {
   /** Run over (STOP ack / ENDED / run-level CANCELLED): inputs re-take the DAC. */
   private endRun(): void {
     if (this._state !== "running") return;
-    // A possibly-live replacement is done with once the run ends (the
-    // controller's stop() STOPs it and graces its id).
+    // A possibly-live replacement is done with once the run ends: the node's
+    // scoring entry gets its grace now (the controller STOPs + graces the
+    // table on stop(), the next swap, a failed swap's "run is over" branch,
+    // or dispose — a sibling whose STOP failed stays reserved there).
     for (const [id, r] of this.retired)
       if (r.untilNs === null)
         this.graceRetired(id, r.spec, trajectoryGraceUs(r.spec));
