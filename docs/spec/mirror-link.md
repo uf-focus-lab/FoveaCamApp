@@ -1,12 +1,15 @@
 # MirrorLink — developer behavior spec
 
 Developer-facing behavior spec for the `mirror-link` app: a calibrated L/C/R triple
-whose two fovea mirrors trace a fast CIRCULAR scan around a hand-aimed center while
-each fovea's exposure spans exactly one revolution. A free-running blinking source
-(known blink frequency) then renders as a dashed ring in every fovea frame — the
-on/off pattern along the ring IS the decoded signal. Manual-control's steering bench
-minus set-points, raster capture, split fovea, and the center-tile views. Distinct from
-the user manual. Code carries tight one-line pointers to these anchors.
+whose two fovea mirrors trace a fast periodic SCAN PATTERN — an ellipse (a circle at
+ratio 1, a sinusoidal line at ratio 0) or a triangular out-and-back sweep — around a
+hand-aimed center. The pattern runs on the MCU as an uploaded trajectory whose markers
+trigger both fovea exposures at exact phases, the trigger pulse being the exposure
+window. A free-running blinking source (known blink frequency) then renders as a dashed
+stroke along the exposed stretch of the path in every fovea frame — the on/off pattern
+along it IS the decoded signal. Manual-control's steering bench minus set-points, raster
+capture, split fovea, and the center-tile views. Distinct from the user manual. Code
+carries tight one-line pointers to these anchors.
 
 ## Targeting {#targeting}
 
@@ -22,17 +25,18 @@ and no programmatic angle mode.
 
 `A2V` per eye turns them into volts. At `offset = 0` this IS `followTarget`'s forward map
 (`@lib/vergence`) — the auto-vergence loop's output and the scan ride the SAME chain, which
-is why `scan_path` stays the exact commanded ring and why the orbit brick's Jacobian is a
-finite difference of this one function (§actuation). `mirror-link-vergence.test.ts` pins
-both facts.
+is why `scan_path` and every trajectory sample are the exact commanded path, never a
+linearization (§actuation). `mirror-link-vergence.test.ts` pins both facts. The pattern's
+center ray is `A0 + pan` — the same point the overlay geometry and the axis handle are
+projected from (§scan-patterns).
 
 **Where the DOF live.** `{pan, verge, v_shift}` come from the loop's integrators while
 auto vergence is ENGAGED and from the drawer sliders while it is off (`pan` is 0 there).
 Verge Distance sets the depth both eyes converge on (∞ at `verge = 0`); Vertical Shift is
 the toe that raises L and lowers R. Both slider ranges ARE the corresponding controller's
 saturation limits (`VERGE_MIN_DISTANCE_MM`, `VSHIFT_LIMIT_DEG` from `@lib/vergence/tuning`)
-so the two authorities can never disagree. They move the ring's centre, never its shape,
-scanning or not.
+so the two authorities can never disagree. They move the pattern's centre, never its
+shape, scanning or not.
 
 ### Auto vergence {#auto-vergence}
 
@@ -113,75 +117,167 @@ renderer needs no other agreement. Each strip is a FRESH buffer (the worker tran
 emitted frames). Frames flow only while the ring node exists AND the scan runs; otherwise
 the canvas is empty and the caption says why.
 
-## Circular scan {#scan}
+## Scan patterns {#scan-patterns}
 
-Source: `scan.ts` (pure, Vue-free, unit-tested).
+Source: `scan.ts` (pure, Vue-free, unit-tested — `mirror-link-scan.test.ts`).
 
-At time `t` (ms since scan start) the scan OFFSET is
-`o(t) = amp · (cos φ, sin φ)`, `φ = 2π · hz · t / 1000`, `amp = radians(scan_amp)`. The
-offset is added to `A0` in the WIDE angular frame BEFORE `inverseTriangulate`, so both
-eyes trace the same circle around the same scene point (the L/R convergence solution
-follows the moving center; the vertical shift rides `inverseTriangulate` itself).
-`scanOffset(tMs, hz, ampDeg)` is the one geometry function;
-`scanAngles(A0, offset, baseline, distance, shiftRad)` composes the
-per-eye angles (the same function serves the idle pose with a zero offset).
+Every offset is radians in the WIDE angular frame, added to the center ray `A0 + pan`
+BEFORE `inverseTriangulate` (§targeting), so both eyes trace the same pattern around the
+same scene point. `θ = scan_axis_deg` (normalized into (−180, 180]), `a =
+radians(scan_amp)`, `R(θ)` the counter-clockwise rotation (+x → +y), `T = 1/scan_hz` the
+BASE period — one ellipse revolution, one triangle sweep.
 
-Phase is derived from the pacer's WALL CLOCK (`performance.now() − t0`), never from a
-tick counter — a late or coalesced tick lands at the correct phase instead of
-accumulating drift. Zero amplitude degenerates to the idle pose.
+- **Ellipse** (`scan_mode = "ellipse"`): period `T`; at phase `φ ∈ [0,1)`
+  `o = R(θ) · (a cos 2πφ, r · a sin 2πφ)`, `r = scan_ratio` ∈ [0, 1]. Ratio 1 is the old
+  circle (pinned by test), ratio 0 a sinusoidal line along the axis.
+- **Triangle** (`scan_mode = "triangle"`): period `2T`; `o = R(θ) · (s(φ), 0)` with `s` the
+  −a → +a → −a triangle (−a at `t = 0`, +a at `t = T`). The ratio is ignored.
 
-Parameters (`scan_hz` 1–100 Hz, default 10 — a 100 ms revolution; `scan_amp` 0–2°) are
-LIVE: a change while active is pushed straight to the native generator (its phase
-ACCUMULATES across the change, so the ring never steps) and, for frequency, re-applies the
-exposure override (§exposure). The mirror's own low-pass response attenuates the realized
-radius at higher frequencies — the commanded circle is exact, the physical one is a rig
-measurement.
+`patternOffset(mode, φ, θ, amp, ratio)` is the one geometry function; `patternPeriodUs`
+gives the MCU period in WHOLE µs (`sweepUs(hz) = round(1e6/hz)`, the triangle exactly twice
+it, so its second marker sits on the same grid). `patternSamples` turns a pattern into
+trajectory samples: the ellipse as 128 samples at `tOffsetUs = round(k·P/128)`, each offset
+at the phase of its OWN rounded time (the MCU clock and the geometry agree exactly); the
+triangle as exactly TWO — `t = 0: −a`, `t = T: +a` — because the MCU's linear interpolation,
+wrapping last → first across the period boundary, IS the triangle (`step` stays false).
+`scanAngles(A0, offset, baseline, distance, shiftRad)` composes the per-eye angles (zero
+offset = the idle pose). Zero amplitude degenerates to the idle pose in both modes.
 
-The commanded circle above is what `scan_path` draws and what the JS fallback pacer pushes.
-The native generator emits the same circle LINEARIZED — `center + J · o` with `J` the
-finite difference of this chain around offset 0 (§actuation) — exact to first order in the
-offset.
+**Drawn geometry.** `patternPath` gives `SCAN_PATH_SAMPLES` (48) points for drawing: the
+ellipse as a closed loop, a ratio-0 ellipse and the triangle as the OPEN segment −a → +a
+along the axis. Through the exact chain they become `scan_path` (volts per eye, clamped to
+the controller envelope like every commanded pose) and, projected with `A2P.C` of the
+center ray, `scan_path_px`. `windowPaths` gives the EXPOSED stretch per marker
+(`scan_window_px`, one polyline each, sampled at the path's density), and
+`axis_handle_px = A2P.C(A0 + pan + R(θ)·(a, 0))` is the draggable +amp end of the axis.
+Uncalibrated (no wide undistort) the three px fields are empty / `{0,0}` (the overlay hides
+the handle on it); `scan_path` is still published. All four are republished on EVERY input
+that moves or reshapes the pattern — `steer`, `setAxis`, `verge`, `shift`, `baseline`, a
+vergence write-back, `scan_amp`, `scan_ratio`, `scan_axis_deg`, every window key,
+`tri_window_sync`, `scan_mode`, `scan_hz`, activation — and never per tick.
+
+**Axis drag.** `setAxis(px)` maps the pixel through `undistort.angular` and sets
+`scan_axis_deg = axisDegFromPixelRay(A0 + pan, point)` — the direction from the center ray
+to it. A pointer ON the center (a zero-length ray) or an uncalibrated triple keeps the
+previous axis. The pane slider writes the state directly.
+
+**Sanitizing.** Every pattern key is clamped by its watch and the clamped value written
+back (`scan_ratio` to [0, 1], `scan_axis_deg` normalized, every window through
+`clampWindow`, an unknown `scan_mode` → `ellipse`), so the drawer never shows a value the
+scan does not run.
 
 ## Scan lifecycle {#lifecycle}
 
 `startScan`/`stopScan` are COMMANDS, not state — a scan is session-local intent that must
-never auto-resume on re-entry (it overrides camera exposure). `telemetry.scan` is non-null
-exactly while active and carries the applied timing (`hz`, `amp_deg`, `period_us`, per-eye
-`exposure_us` + `frame_rate`). `startScan` resolves `false` when refused (no leased triple)
-with the reason on `telemetry.scan_blocked`; `true` once BOTH foveas carry the exposure
-override. Start/stop and the live frequency re-apply serialize on one FIFO op chain so a
-fast toggle can't interleave an apply with an in-flight restore. Idle drains a `stopScan`
-AFTER the pacer stops and BEFORE `triple` clears + `releaseLeases` — the restore rides
-`lease.reconfigure` and needs the live lease (the manual-control trigger-sync ordering).
+never auto-resume on re-entry (it reprograms the cameras). `telemetry.scan` is non-null
+exactly while active (§exposure-windows has its shape). Every transition below
+serializes on ONE FIFO op chain (`queueScanOp`) — start, stop, the period restart, every
+live re-upload and the gain writes — so a fast toggle can never interleave a camera apply
+with an in-flight restore, nor a re-upload with a restart.
 
-## Exposure override {#exposure}
+**Start** — refused, with the reason on `telemetry.scan_blocked` and `false` returned:
+without a leased triple (`no camera triple leased`), without a bound controller (`no
+controller connected`), or on firmware below 2.2.0 (`controller firmware >= 2.2.0
+required` — there is no JS fallback any more; it could not trigger anyway). Otherwise, in
+order: build the spec (§actuation); ARM both foveas, L then R (snapshot the timing →
+`enableHardwareTrigger(lease)` → `applyTriggeredTiming`, §exposure-windows); open the
+trajectory (`controllerNode().openTrajectory(spec, { name: "mirror-link" })`); subscribe
+its pushes and state; build the flip pipes in triangle mode (§triangle-flip) BEFORE the
+first trigger; START at an EXPLICIT host instant `hostNowNs() + 20 ms` (so lateness is
+exact and `replace` carries the phase). A failure at any step undoes what was done
+(close the table, retire the flips, disarm the cameras) and refuses with
+`exposure override failed: …` or `trajectory start failed: …`. An idle / re-lease while
+awaiting undoes silently. Only then `scanActive` turns true and `scan` publishes.
 
-Source: `exposure.ts` (pure over a `Camera`-shaped seam, unit-tested with a fake).
+**Stop** — `scanActive` off (the pacer resumes the idle slew), the pending re-upload
+dropped, the table STOPped and closed (the node re-takes the DAC for the position input),
+the flip pipes retired (`flipPipes` → null), then per eye `disableHardwareTrigger` and the
+verbatim timing restore, `scan` → null. A run that ENDS UNDER the session — the node
+reports the table `detached` (controller unbound/swapped) or back to `ready` (the MCU
+ended or cancelled it), or a `replace` throws a `TrajectoryReplaceError` with
+`running: false` — runs the same stop and publishes the reason on `scan_blocked` plus a
+tray warning.
 
-While active each fovea camera's timing is OVERRIDDEN so one frame integrates one
-revolution: `exposure = 1e6 / hz` µs and `frame_rate = hz` (frame-rate enable forced on,
-exposure-auto forced Off). The per-camera config docs are NOT touched — the override is
-applied to the live handle only and the pre-scan values (`frame_rate_enable`,
-`frame_rate`, `exposure_auto`, `exposure`) are snapshotted at start and restored on stop /
-idle / re-apply, so Manage Cameras' persisted settings survive untouched.
+**Period change** — `scan_hz` or `scan_mode` while active changes the trajectory period,
+which `replace` cannot swap: the op chain stops + closes the table, rebuilds, opens and
+starts a new one (new explicit instant), keeping the camera config (the trigger mode is
+not re-armed; only a Timed exposure is re-written, and only for a new marker-0 pulse) and
+rebuilding the flip pipes when the mode or their tolerance changes.
 
-Write-order invariant: every write stays inside the camera's LIVE range at the moment of
-the write. A camera's exposure ceiling depends on its frame rate, so both apply and
-restore write exposure TWICE — `exposure = clamp(target, exposure_range)` before the
-frame-rate write (fits the old ceiling) and again after (fits the new one); `exposure_auto`
-is written first on apply (Off) and last on restore. Frame rate clamps to
-`frame_rate_range` — a camera slower than `hz` keeps its max rate with `exposure = period`
-(dead time between frames, still one revolution per frame). If the applied exposure misses
-the period by more than 2 % the `scan` telemetry flags `mismatch` and the reason lands in
-the title-bar tray as a warning (`report("mirror-link", …, "warning")`). Apply L then R;
-a failure on either restores whatever was applied and refuses the start.
+Idle drains a `stopScan` AFTER the pacer stops and BEFORE `triple` clears +
+`releaseLeases` — the restore rides `lease.reconfigure` and needs the live lease (the
+manual-control trigger-sync ordering; §teardown).
+
+## Exposure windows {#exposure-windows}
+
+Source: `scan.ts` (windows → markers) + `exposure.ts` (camera timing; pure over a
+`Camera`-shaped seam, unit-tested with a fake — `mirror-link-exposure.test.ts`).
+
+**Windows.** Each window `[w0, w1]` is a fraction of its SLOPE (`T`), clamped by
+`clampWindow` to `0 ≤ w0 < w1 ≤ WINDOW_MAX = 0.95` with `w1 − w0 ≥ WINDOW_MIN = 0.005`
+(the pane's step; an inverted pair is swapped, a too-short one grows its end — or its start
+at the cap). The cap keeps the trigger line released and the capture engine idle before
+the next marker (the firmware fires a marker only on an idle engine, else pushes BUSY) and
+leaves the camera its readout gap. `activeWindows(mode, state)` picks them in marker order:
+the ellipse's `scan_window`; the triangle's `tri_window_rise` and — while
+`tri_window_sync` is on, whatever the state holds — the rising window again for the fall.
+
+**Markers.** `windowMarkers` turns window `k` into one trajectory marker,
+`t_offset_us = slopeStart_k + round(w0·T)`, `pulse_us = round(w1·T) − round(w0·T)`, cameras
+L|R: the ellipse's ONE marker at slope start 0; the triangle's marker 0 (rising) at
+`w0_rise·T` and marker 1 (falling) at `T + w0_fall·T`. Every window ends before the next
+marker by construction.
+
+**Sync.** The session ENFORCES it (the pane only disables the falling slider): while
+`tri_window_sync` is on every `tri_window_rise` write is copied into `tri_window_fall`
+(`s.setState`), a `tri_window_fall` write snaps back to the rising value, and turning sync
+on copies rise → fall once.
+
+**Camera timing.** Cameras take the window as `ExposureMode = TriggerWidth`: the trigger
+pulse IS the exposure, so the two triangle windows may differ and no exposure is written
+per frame. Per fovea, on the lease's safe path, the per-camera config docs untouched:
+
+1. `snapshotTiming` (reads only, before the trigger write — `arv_camera_set_trigger`
+   resets TriggerActivation): `frame_rate_enable`, `frame_rate`, `exposure_auto`,
+   `exposure`, and the `ExposureMode` / `TriggerActivation` nodes (null when the model
+   lacks one — the restore then skips it).
+2. `enableHardwareTrigger(lease)` (TriggerSource Line3, strobe on Line2 as ExposureActive
+   with the branch's measured `LineInverter = true`; `camera-trigger.ts`). A failed
+   `LineInverter` write is reported as a warning, not a refusal.
+3. `applyTriggeredTiming(cam, { pulseUs, preferTriggerWidth })`: `exposure_auto = Off`,
+   frame-rate enable OFF (the trigger paces the frames; with the limit off the exposure
+   ceiling only widens), then `TriggerWidth` + `TriggerActivation = LevelHigh` — or the
+   **Timed fallback** when the model refuses either: `ExposureMode = Timed`,
+   `TriggerActivation = RisingEdge`, `exposure = clamp(pulse of marker 0,
+   exposure_range)` (min and max, read at the write). Neither mode → throws (refused).
+
+ONE mode for both eyes: when one eye falls back to Timed the other is re-applied as Timed,
+so both expose the same window. A live window change in Timed mode re-writes the exposure
+when the marker-0 pulse moved (after the re-upload landed); in TriggerWidth nothing is
+written. **Restore** (`restoreTiming`, after `disableHardwareTrigger`): `ExposureMode`
+first (so a Timed exposure is writable again; the generic feature write when the typed
+setter refuses the saved entry), `TriggerActivation`, the two-sided exposure write around
+the frame rate (the ceiling moves with the rate), `exposure_auto` LAST.
+
+**Telemetry.** `ScanTelemetry` = `mode`, `hz`, `amp_deg`, `period_us` (T or 2T), `windows`
+(`{ t_offset_us, pulse_us }` per marker, as the MCU runs them — republished after every
+re-upload / restart), `exposure_mode` (`TriggerWidth`, or `Timed` when either eye fell
+back), the per-eye applied `exposure_us` (0 in TriggerWidth) and readback `frame_rate`, and
+`mismatch` — Timed only: an applied exposure more than 2 % off the marker-0 pulse, or
+triangle windows of unequal length (one exposure cannot take both). A mismatch warns once
+until it clears (`report("mirror-link", …, "warning")`).
+
+**Ground truth.** OK marker pushes ARE the exposure record. `STROBE_TIMEOUT`, `BUSY` and the
+rest count into `perf.trajectory.pushes` (§actuation); a run with NO OK push for two
+periods (measured from the start instant, or the last OK push) warns ONCE per run, naming
+the timeout/busy counts.
 
 ## Gain override {#gain}
 
 Source: `gain.ts` (pure over a `Camera`-shaped seam, unit-tested with a fake).
 
 ONE gain (dB) drives BOTH foveas, and it is SESSION-WIDE, not scan-scoped — aligning on a
-dim source needs it before the scan. Same live-handle model as §exposure: written through
+dim source needs it before the scan. Same live-handle model as §exposure-windows: written through
 `lease.reconfigure`, the per-camera config docs NEVER touched, `gain_auto` forced Off while
 overridden. `telemetry.gain_range` is the INTERSECTION of the two cameras' `gain_range`s
 (`{0,0}` until leased, and for a DISJOINT pair — no common value, so no slider rather than
@@ -201,8 +297,10 @@ slot (after the pacer stops, before `triple` clears): exposure timing FIRST, the
 
 The point of the scan: each fovea frame carries the emitter's blinking pattern as a ring,
 and the `ring` vision kernel (`ring-code.md` §reader) decodes it per frame, per eye. ONE
-worker over the two RAW convert pipes (roles `L`/`R` — the same un-warped views the
-operator reads), `meterName`/node id `win/mirror-link/ring`.
+worker over the two fovea pipes (roles `L`/`R` — the same un-warped views the operator
+reads): the RAW convert pipes, or the §triangle-flip FLIP pipes while they exist (the reader
+is rebuilt on every flip transition, both directions, so it decodes the upright frame),
+`meterName`/node id `win/mirror-link/ring`.
 
 The reader is an OPTIONAL NODE, DEFAULT OFF (`state.ring_reader`) — it costs a worker
 thread reading every fovea frame, so it exists only while asked for. `buildRingNode()`
@@ -214,15 +312,15 @@ idempotent, both no-ops without a leased triple); activation builds it iff the s
 already on. The profiler therefore shows the node exactly while it exists.
 
 Gated on the scan too: `enabled` is pushed via `sendParams` on every scan start/stop (and
-at node creation), and a disabled kernel does NO pixel work — a frame that did not
-integrate a revolution holds no ring.
+at node creation), and a disabled kernel does NO pixel work — an un-scanned frame holds no
+pattern.
 
 `telemetry.ring = { L, R }` carries the per-eye `RingReadout` (null until that eye's first
 result). A failure keeps the CURRENT reason AND the last successful read on `last`
 (`ring-code.md` §error recovery), so a decoded value stays on screen while frames drop.
-STOPPING THE SCAN clears it (as does a failed re-apply, disposing the node, and `idle()`):
-the readout describes a frame that integrated a revolution, and free-running frames do
-not.
+STOPPING THE SCAN clears it (as does a run the controller ended, disposing the node, and
+`idle()`): the readout describes a frame exposed along the scan path, and free-running
+frames are not.
 
 ## Views {#views}
 
@@ -350,80 +448,100 @@ hover tooltips only.
 
 ## Actuation {#actuation}
 
-The scan runs on a NATIVE brick, not the JS event loop. Any synchronous camera write (the
-gain slider, an exposure re-apply) or allocation on the orchestrator loop stalls a JS pacer
-for tens of ms, the mirrors hold, and the rig draws a straight chord across the ring. The
-generator therefore lives on its own paced C++ thread — the compose brick's shape, applied
-to a circle.
+The scan runs on the MCU, not on any host loop: the controller node's ONE uploaded
+trajectory (`CMD_TRAJECTORY`, protocol 2.2.0 —
+[controller §trajectory-ownership](./controller.md#trajectory-ownership)). The MCU
+interpolates the samples, fires the markers through its capture engine at exact phases, and
+pushes one 44-byte frame per trigger with trusted timestamps. A synchronous camera write or
+an allocation on the orchestrator loop can no longer bend the path. (The native
+`OrbitStream` brick that used to generate a host-paced circle stays in core,
+[core-streams §orbit-stream](./core-streams.md#orbit-stream), but MirrorLink no longer
+creates it — no orbit seam, no native position input, no sink governor, no
+`orbit_pace_hz`.)
 
-**The brick.** `orbitSeam.create(nodeId.win("mirror-link", "orbit"))` builds an
-`OrbitStream` (docs/spec/core-streams.md#orbit-stream) at activation; its `volt_out` pipes
-into the controller's native `pos_in` through `openNativePosition("mirror-link", …)`
-(`onAttach` pipes, `onDetach` releases the link — the sink comes and goes with the v2
-controller). Registered wiring carries the NODE row only; the volt link reports its own
-`→ controller` edge (the compose brick's precedent). The brick's own meter folds onto the
-node badge through `registerNativeProbe`.
+**The spec.** `buildScan()` turns the current state into a `TrajectorySpec`:
+`periodUs = patternPeriodUs(mode, hz)`; every `patternSamples` offset through the EXACT
+chain — `voltsFor(anglesAt(offset))`, clamped to the controller's envelope like every
+commanded pose, never a linearization — as `{ tOffsetUs, left, right }`; one marker per
+window from `windowMarkers`, `cameras: ["L", "R"]`; `step: false`.
 
-**What JS pushes.** Only the LINEARIZATION, never a per-tick pose:
+**Idle.** The JS `openPosition("mirror-link")` input and its 1 ms pacer remain for the IDLE
+center pose: each tick slews the commanded pose toward `centerVolts()` with the shared
+first-order smoother (`@lib/slew`). While the trajectory runs the node HOLDS every
+position push and hands the DAC back on stop; the pacer does not even push then (gated on
+`scanActive`), and on stop the slew resumes from the last idle pose. The tick keeps its
+1 ms cadence because its gap IS the loop-stall meter (`perf.tickGapMs`).
 
-- `setPose({ centerL, centerR, jL, jR })` on every input that moves or reshapes the ring
-  (steer, verge, shift, baseline, a vergence step, activation) — it rides
-  `publishScanGeometry()`, which those inputs already call. `centerL`/`centerR` are
-  `centerVolts()`; `jL`/`jR` are the row-major 2×2 finite difference of
-  `voltsFor(anglesAt(offset))` around offset 0 (±1e-3 rad), i.e. volts per radian.
-- `setOrbit({ ampRad, hz, paceHz, enabled })` on scan start/stop and on a live
-  `scan_amp`/`scan_hz`/`orbit_pace_hz` change.
+**Live geometry → `replace`.** Every input that reshapes the pattern without changing its
+period — `steer`, `verge`/`shift`/`baseline`, a vergence write-back, `scan_amp`,
+`scan_ratio`, `scan_axis_deg`, the windows, `setAxis` — rides `publishScanGeometry()`, which
+while scanning arms a throttle timer: at most ONE `NodeTrajectory.replace(spec)` per
+100 ms, the spec built when the op RUNS on the chain, so the latest geometry wins (the node
+coalesces in-flight swaps too; the throttle keeps the wire sane). An identical spec is
+skipped. `replace` swaps tables phase-continuously (the new table joins the old run's
+`t_start`), so the mirror keeps sweeping and pushes keep flowing on the same handle. A
+replace that throws with the run still going keeps the previous geometry (one warning per
+run); one that ended the run (`TrajectoryReplaceError.running === false`) stops the scan
+(§lifecycle). A period change is never a replace — §lifecycle restarts the run.
 
-**What the brick commands.** `v = slew(center) + J · amp · (cos φ, sin φ)` per eye at
-1 kHz. The emitted circle is therefore the LINEARIZED chain — exact to first order in the
-offset, which at a 2° maximum radius is well inside the mirror's own response. `scan_path`
-telemetry stays the exact chain (offset → `inverseTriangulate` + shift → `A2V` → clamp), so
-the drawn ring remains the ground truth for the geometry.
+**`perf.trajectory`** (`TrajectoryTelemetry`, published with `perf` at the
+`VOLT_TELEMETRY_INTERVAL_MS` throttle; counters reset per scan): `running` (scan active and
+the table running), `pushes` by status (`ok` / `timeout` = STROBE_TIMEOUT / `busy` / `other`
+— run-level ENDED/CANCELLED and UNKNOWN), `lateness_us` of the last OK push against the
+EXPLICIT start (`tTrigger − (t_start + cycle·period + marker offset)`, exact because the
+session always starts at an explicit instant), `reuploads` (successful replaces this
+scan), and the flip bricks' `flipped` / `unmatched` per eye (§triangle-flip; 0 in ellipse
+mode). `telemetry.volt` is the commanded pose while idle and the pattern's CENTER while
+scanning; `perf.actuateMs` / `perf.tickGapMs` keep their meaning for the idle path.
 
-**Fallback.** The JS `openPosition` input + 1 ms pacer remain for a v1 controller / no
-controller at all: idle slews the commanded pose toward `centerVolts()` with the shared
-first-order smoother (`@lib/slew` — manual-control's `slew.ts` HOISTED, same constants;
-disparity-scope's `drag-slew.ts` stays a parallel copy for now), active commands the scan
-pose DIRECTLY (no slew — a smoother would lag and shrink the circle), and on stop the slew
-resumes from the last scan pose. While the brick owns the wire (`nativeEngaged()`) this
-path pushes only the CENTER pose and only every 10 ms — the pacer itself keeps ticking at
-1 ms because its gap IS the stall meter.
+## Triangle flip {#triangle-flip}
 
-**Pose density and the sink governor.** What the mirror actually traces is
-`sinkHz / scan_hz` poses per revolution — `sinkHz` being what survives the native
-MirrorSink's 1 ms gate AND its AIMD governor, not what the brick emits. The mirror's own
-~120 Hz low-pass (τ ≈ 1.3 ms) smooths the steps between poses only while the update
-interval is well under that τ: at 1 kHz (1 ms) the steps blur into a circle; at 60 Hz
-(17 ms) each pose is a visible vertex. The compose path's governor defaults — halve on ANY
-pressure signal, floor 60 Hz, RTT inflation gate 2× — are right for a latency-sensitive
-tracker and wrong here: 60 poses/s at a 10 Hz scan is a HEXAGON, and the +25 Hz/100 ms
-climb makes it come and go. So on attach the session sets
+The triangle exposes one frame on the rising sweep (marker 0) and one on the falling sweep
+(marker 1); the falling frame is VERTICALLY flipped (rows reversed) before any consumer —
+the L/R views and the ring reader — sees it. (A flip about the horizontal axis is what was
+asked for; for an axis far from vertical the geometrically exact reversal would be a
+reflection across the scan axis — a later refinement.)
 
-```
-sink.setGovernor({ ceilingHz: state.orbit_pace_hz, floorHz: 500, rttInflation: 8,
-                   enabled: true })
-```
+**Bricks.** While the triangle scan runs on a leased triple the session builds ONE native
+`FlipStream` per eye ([core-streams §flip-stream](./core-streams.md#flip-stream)) through
+`createFlipPipe(flipSeam, nodeId.convert(serial), cameraPipeSpec(camera),
+nodeId.flip(serial), { toleranceNs })`: the pipe `camera/<serial>/convert/flip` is
+advertised with the convert pipe's own spec (`cameraPipeSpec` — the one place that shape is
+decided) BEFORE the brick attaches. The two rows are registered as graph wiring (kind
+`flip`, owner `win/mirror-link`, edges from the convert pipe and from the trajectory node
+`controller/trajectory` as the `anchor` port); their meters come from core's
+`flipProbeAll()` probe, already registered by the orchestrator. Then `state.flipPipes =
+{ L, R }` (a `s.setState`, like `undistortPipe`) and an existing ring reader is rebuilt on
+the flip pipes. In ellipse mode nothing is built and nothing is copied. Without an injected
+flip seam the triangle scans unflipped, with one warning.
 
-— genuine link overload (soft fails, outq above HIGH) still backs off, but never below
-500 Hz, which is still a 50-gon at 10 Hz and a 5-gon only past 100 Hz (the top of the
-`scan_hz` range, where the mirror's own roll-off dominates anyway). A busy MCU's inflated
-ACK RTT is not overload of the UPDATE path, so the inflation gate is widened 2× → 8×.
+**Anchors.** Every OK marker push becomes `{ tExposure, flip: marker === 1 }`, pushed to
+both bricks FIRST and synchronously in the push callback — no await, no other work before
+it. Failed pushes (timeout, busy) exposed no frame and push nothing.
 
-`state.orbit_pace_hz` (default 1000, clamped 200–1000 by the brick) is the generator's tick
-rate AND the governor's ceiling — no slider, a config/rig knob for a link that cannot carry
-1 kHz. Lowering it does not change the geometry (the phase accumulates with the measured
-`dt`), only the pose density.
+**Matching.** The brick flips a frame iff the NEAREST anchor within `toleranceNs` of its
+timestamp is marked `flip` (PairStream's rule; owner-applied trusted host-ns on both sides).
+The tolerance is `0.4 · min(T, closest circular marker spacing)` — the brief's `0.4·T` at
+the default windows, tighter when the windows bring the two markers close, so a frame whose
+own anchor is late can never match the neighbouring marker (and a rising frame never
+flips). The brick takes it at attach, so a restart with a new sweep time rebuilds the
+bricks, and a live window change that would leave the tolerance too wide rebuilds them
+tighter (a wider spacing keeps them — the nearest anchor wins anyway).
 
-`telemetry.perf.orbit` reports `{ native, emitHz, sinkHz, governor: { state,
-effectiveRateHz, backoffs, softFails, outq } }` — both rates differenced across 1 s probe
-windows (the meters report lifetime averages, which would hide a live stall), `emitHz` off
-the brick's thread meter, `sinkHz` off `MirrorSink.probe().written`, and the governor block
-off that same probe plus the `Device.stats` sensors the profiler's Serial-pressure block
-already reads. `emitHz` holding at ~1 kHz while `tickGapMs.max` spikes is the brick doing
-its job; `sinkHz` far below `emitHz` is the link throttling. The scan status line appends
-`· <sinkHz>/s` and turns warn below 20 poses per revolution, its tooltip naming WHICH rate
-is low and the governor's state/backoff count. Volt/pose telemetry is throttled to
-`VOLT_TELEMETRY_INTERVAL_MS`.
+**Late anchors.** The brick NEVER holds a frame back: a frame it processes before its
+marker push arrived passes through UNFLIPPED and counts as `unmatched`. Normally the push
+(sent when the strobe falls, at exposure end) beats the frame (readout + USB transfer), but
+not under load — hence the synchronous anchor push. `perf.trajectory.flipped` /
+`.unmatched` carry the bricks' counters (probed at the telemetry throttle), and when the
+unmatched share of `flipped + unmatched` over the last two periods (at least 500 ms, and
+at least 8 frames) exceeds 5 % the session warns ONCE per run: "falling-sweep frames
+arriving before their marker push — they are shown unflipped".
+
+**Retire** (stop, a switch to the ellipse, idle) runs consumers first: `flipPipes` → null
+(the views fall back to the raw convert pipes), the ring reader lets go of the flip pipes,
+the wiring rows drop, each brick detaches + un-advertises, and — outside the teardown
+drain — the reader re-binds the raw pipes. The RAW capture / recording pipes are never
+flipped (§capture).
 
 ## Recording {#recording}
 
@@ -439,26 +557,29 @@ through the shared `@orchestrator/capture-helper` (`capture/mirror-link`), holdi
 full-depth stacked L/R foveae + the undistorted center, and the preview sub-window saves
 them as `<resource>.<png|tiff>` (BGR, 16-bit for the foveae) + `<resource>.json`.
 
-`stackCount` is `state.cap_stack` (default 1 — one revolution IS the frame; no slider).
-The homographies are IDENTITY and the rect is the whole center frame: a frame that
-integrated a revolution has no single mirror pose to warp against, and the UNWARPED ring is
-exactly what the analyzer reads. Every resource's metadata carries a `mirror_link` block —
-`scan` (the applied timing, null when idle), `ring` (the last per-eye readout: fitted
+`stackCount` is `state.cap_stack` (default 1 — one window IS the frame; no slider).
+The homographies are IDENTITY and the rect is the whole center frame: a frame exposed along
+the scan path has no single mirror pose to warp against, and the UNWARPED frame is exactly
+what the analyzer reads. Every resource's metadata carries a `mirror_link` block — `scan`
+(the applied timing, null when idle), `pattern` (`mode`, `axis_deg`, `amp_deg`, `ratio`,
+`windows` — what the trajectory is built from), `ring` (the last per-eye readout: fitted
 circle, chip arc, reason), `shift`, `verge`, `baseline`, `target_angle`, and the
 center-pose volts/angles/`A2H` matrices for reference — so a saved frame explains itself.
-`scripts/ring-debug.py <image>` reads both.
+The capture reads the RAW pipes, which the §triangle-flip bricks do NOT touch: a
+falling-sweep frame is stored as the camera saw it (rows NOT reversed), and the same holds
+for the raw recording. `scripts/ring-debug.py <image>` reads both.
 
 OBSERVE-ONLY — no camera write, no allocation on the shot path. Nothing in a shot calls
 `lease.reconfigure` or any camera setter (the native `attachRawPipe` subscribes to the
 camera's EXISTING `Arv::Stream`), so the exposure override is untouched. The raw L/R pipes
 are PRE-ACQUIRED at activation with `CAPTURE_RING_DEPTH`: `rawPipes.acquire` on a 0→1
 transition advertises the pipe — allocating a depth × full-depth-frame SHM ring — and runs
-the native attach, both synchronous on the orchestrator loop that also runs the 1 ms pacer.
-Per shot that cost would stall the pacer for tens of ms and the mirror would draw a
-straight CHORD across the ring; pre-acquired, a shot only bumps the refcount and opens the
-consumer gate. The producers stay parked until then, so this costs nothing while idle.
-`telemetry.perf.tickGapMs` meters the pacer's own tick interval, so any remaining stall is
-visible on the rig instead of inferred from the ring.
+the native attach, both synchronous on the orchestrator loop that also delivers the
+trajectory pushes and the flip anchors (§triangle-flip). Per shot that cost would stall the
+loop for tens of ms and late anchors would leave falling frames unflipped; pre-acquired, a
+shot only bumps the refcount and opens the consumer gate. The producers stay parked until then, so this costs nothing while idle.
+`telemetry.perf.tickGapMs` meters the pacer's own tick interval, so any remaining stall on
+the orchestrator loop is visible on the rig instead of inferred.
 
 Exclusivity, as everywhere: a capture in flight refuses `startRecording`, a recording
 refuses a shot, and `busy()` names either. The drain awaits an in-flight capture before the
@@ -466,23 +587,29 @@ recording drain and the lease release.
 
 ## Teardown ordering {#teardown}
 
-Resource-scope defers, registered in REVERSE of the drain (LIFO): stop the pacer FIRST →
-release the volt link → close the native position input → release the orbit brick →
-`stopScan` (exposure restore on the live leases) + the gain restore → `triple = null` /
-`ready: false` → await the recording drain → dispose the vergence loop if engaged (both
-match workers → the pid node → wiring → its pipe connections → the needle/strip scale and
-slice producers) → dispose the ring node if one exists (worker → wiring → its L/R pipes) →
-retire the C undistort producer + drop the serial taps → release the leases LAST. The ring
-node's and the vergence loop's pipes are the session's ONLY pipe connections (the renderer
-binds every view, the recorder node connects its own raw pipes). Disengaging the loop
-FLUSHES its integrated `verge`/`v_shift` into the sliders and folds `pan` into the target
-ray first, so the pose the mirrors hold is bit-identical across the transition
-(§auto-vergence).
+Resource-scope defers, registered in REVERSE of the drain (LIFO): stop the pacer FIRST and
+close the JS position input → `stopScan` on the live leases (STOP + close the trajectory →
+retire the flip pipes, `flipPipes` → null → `disableHardwareTrigger` + the verbatim timing
+restore per eye, §lifecycle) + the gain restore → `triple = null` / `ready: false` → await
+the recording drain → dispose the vergence loop if engaged (both match workers → the pid
+node → wiring → its pipe connections → the needle/strip scale and slice producers) →
+dispose the ring node if one exists (worker → wiring → its L/R pipes) → retire the C
+undistort producer + drop the serial taps → release the leases LAST. During the drain the
+flip retire does NOT rebuild the ring reader on the raw pipes (the reader is disposed a few
+steps later anyway); a `stopScan` command does. The ring node's and the vergence loop's
+pipes are the session's ONLY pipe connections (the renderer binds every view, the recorder
+node connects its own raw pipes). Disengaging the loop FLUSHES its integrated
+`verge`/`v_shift` into the sliders and folds `pan` into the target ray first, so the pose
+the mirrors hold is bit-identical across the transition (§auto-vergence).
 
 ## Rig pass {#rig}
 
-Hardware-gated checks (`docs/hardware/rig.md`): the realized ring radius vs. `scan_amp`
-across 5/20/50/100 Hz (mirror LPF roll-off), exposure readback equals the period on both
-foveas, restore leaves Manage Cameras' values byte-identical, the dashed-ring readout of a
-known-frequency blinker, and the CHORD test — drag the gain slider (and re-apply the
-exposure) through a whole sweep while scanning: the ring must stay closed.
+Hardware-gated checks (`docs/hardware/rig.md`): the realized path vs. `scan_amp` /
+`scan_ratio` / `scan_axis_deg` across 5/20/50/100 Hz (mirror LPF roll-off), the exposed
+stretch matching `scan_window_px` (TriggerWidth: the strobe width equals each marker's
+`pulse_us`), `perf.trajectory.lateness_us` staying within tens of µs, restore leaving
+Manage Cameras' values byte-identical (ExposureMode / TriggerActivation included), the
+dashed readout of a known-frequency blinker in both modes, the triangle's falling frame
+arriving upright on the views with `unmatched` near zero, and a live steer / slider drag
+through a sweep while scanning: the path must move without a visible stutter (the
+phase-continuous `replace`).
