@@ -96,13 +96,14 @@ import {
   TRAJECTORY_MAX_TABLES,
   TrajectoryReplaceError,
   chunkTrajectorySamples,
+  trajectoryGraceUs,
   hostNsToMcuUs,
   mcuUsToHostNs,
   validateTrajectorySpec,
   type TrajectoryFrameOutcome,
   type TrajectorySpec,
 } from "@orchestrator/controller";
-import { setHostClock } from "@orchestrator/time-align";
+import { hostNowNs, setHostClock } from "@orchestrator/time-align";
 
 const BIAS = dac2volt(29490);
 const DV = 170;
@@ -125,6 +126,15 @@ function spec(n: number, periodUs = 20_000): TrajectorySpec {
       right: { x: 0.5 * i, y: 1 },
     })),
     markers: [{ tOffsetUs: periodUs / 2, pulseUs: 2000 }],
+  };
+}
+
+/** Pin the host clock (grace deadlines run on it); returns `elapse(µs)`. */
+function pinHostClock(startNs = 10_000_000_000n): (us: number) => void {
+  let now = startNs;
+  setHostClock(() => now);
+  return (us) => {
+    now += BigInt(us) * 1000n;
   };
 }
 
@@ -249,6 +259,7 @@ describe("Controller.uploadTrajectory (CMD_TRAJECTORY)", () => {
     mockPush.cb = null;
     mockPush.binds = 0;
     Object.assign(mockData, { inFlight: 0, maxInFlight: 0, rejectAt: -1, delayMs: 0 });
+    setHostClock(() => process.hrtime.bigint());
   });
 
   it("uploads BEGIN -> chunked DATA -> MARK -> COMMIT with converted positions", async () => {
@@ -295,6 +306,7 @@ describe("Controller.uploadTrajectory (CMD_TRAJECTORY)", () => {
   });
 
   it("starts at a host-ns instant on the MCU clock, stops, and disposes", async () => {
+    const elapse = pinHostClock();
     ctrl = await makeController();
     ctrl.setClockOffsetNs(5_000_000n);
     const handle = await ctrl.uploadTrajectory(spec(4));
@@ -312,9 +324,35 @@ describe("Controller.uploadTrajectory (CMD_TRAJECTORY)", () => {
     await handle.dispose(); // idempotent
     expect(trajectoryOps()).toEqual(["DELETE"]);
     await expect(handle.start()).rejects.toThrow(/disposed/);
-    // The id is free again.
-    const again = await ctrl.uploadTrajectory(spec(4));
-    expect(again.id).toBe(0);
+    // The table was played: its id sits out the grace (a capture in flight
+    // at the DELETE still pushes with it), then is free again.
+    expect((await ctrl.uploadTrajectory(spec(4))).id).toBe(1);
+    elapse(trajectoryGraceUs(spec(4)) + 1);
+    expect((await ctrl.uploadTrajectory(spec(4))).id).toBe(0);
+  });
+
+  it("a never-started table's id is reusable at once after dispose", async () => {
+    pinHostClock();
+    ctrl = await makeController();
+    const handle = await ctrl.uploadTrajectory(spec(4));
+    await handle.dispose();
+    expect((await ctrl.uploadTrajectory(spec(4))).id).toBe(0);
+  });
+
+  it("tracks clock calibration: set by an offset, lost after two missed pings in a row", async () => {
+    ctrl = await makeController();
+    expect(ctrl.clockCalibrated).toBe(false);
+    ctrl.setClockOffsetNs(123n);
+    expect(ctrl.clockCalibrated).toBe(true);
+    ctrl.noteClockPingMissed();
+    expect(ctrl.clockCalibrated).toBe(true); // one miss is tolerated
+    ctrl.setClockOffsetNs(124n); // a landed ping resets the streak
+    ctrl.noteClockPingMissed();
+    expect(ctrl.clockCalibrated).toBe(true);
+    ctrl.noteClockPingMissed();
+    expect(ctrl.clockCalibrated).toBe(false);
+    ctrl.setClockOffsetNs(125n);
+    expect(ctrl.clockCalibrated).toBe(true);
   });
 
   it("feeds onFrame from the SYN pushes, decoded like FrameOutcome", async () => {
@@ -441,9 +479,13 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
   const wireOps = () =>
     mockCalls.filter((c) => c.prop === "Trajectory").map((c) => c.arg);
 
+  // Advances the pinned host clock (grace deadlines), set by running().
+  let elapse: (us: number) => void = () => {};
+
   /** A handle on id 0, RUNNING since MCU 2 000 000 µs, wire log cleared. */
-  async function running() {
-    ctrl = await makeController();
+  async function running(fw = { major: 2, minor: 2, patch: 0 }) {
+    elapse = pinHostClock();
+    ctrl = await makeController(fw);
     ctrl.setClockOffsetNs(OFFSET);
     const handle = await ctrl.uploadTrajectory(spec(4));
     await handle.start(T_START_NS, 0);
@@ -485,7 +527,10 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
     expect(calls[7]).toEqual({ op: "START", id: 1, t_start: 2_000_000n, cycles: 0 });
     expect(calls[8]).toEqual({ op: "DELETE", id: 0 });
     expect(handle.id).toBe(1);
-    // A later replace carries the same anchor again and swaps back to id 0.
+    expect(handle.lastSwap).toBe("stop-start"); // 2.2.0: no atomic START
+    // Past the old table's grace, a later replace carries the same anchor
+    // again and swaps back to id 0.
+    elapse(trajectoryGraceUs(spec(4)) + 1);
     mockCalls.length = 0;
     await handle.replace(spec(4));
     const again = wireOps();
@@ -527,20 +572,94 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
     expect(start).toEqual({ op: "START", id: 1, t_start: 3_000_000n, cycles: 50 });
   });
 
-  it("keeps the listener set: new-id pushes reach it, the old id is unrouted", async () => {
+  it("keeps the listener set: new-id pushes reach it, the old id stays routed for its grace", async () => {
     const handle = await running();
     const got: TrajectoryFrameOutcome[] = [];
     handle.onFrame((f) => got.push(f));
     push(0);
     await handle.replace(reshaped(4));
     push(1);
-    push(0); // a straggler for the deleted table: nobody owns it
-    expect(got.map((f) => f.trajectoryId)).toEqual([0, 1]);
-    // The freed id is reusable — and its pushes do not leak into this handle.
-    const other = await ctrl!.uploadTrajectory(spec(2));
-    expect(other.id).toBe(0);
+    // A capture of the OLD table in flight at the swap pushes with the old
+    // id after it: inside the grace it still reaches the same listeners.
+    const graceUs = trajectoryGraceUs(spec(4)); // the OLD spec's
+    expect(graceUs).toBe(2_000 + 5_000 + 50_000);
+    elapse(graceUs - 1);
     push(0);
-    expect(got).toHaveLength(2);
+    expect(got.map((f) => f.trajectoryId)).toEqual([0, 1, 0]);
+    // Inside the grace the old id is not handed out again.
+    const other = await ctrl!.uploadTrajectory(spec(2));
+    expect(other.id).toBe(2);
+    // Past it, a straggler is nobody's, and the id is free.
+    elapse(2);
+    push(0);
+    expect(got).toHaveLength(3);
+    const reused = await ctrl!.uploadTrajectory(spec(2));
+    expect(reused.id).toBe(0);
+    const gotReused: TrajectoryFrameOutcome[] = [];
+    reused.onFrame((f) => gotReused.push(f));
+    push(0); // the new owner's — no leak into the old handle
+    expect(got).toHaveLength(3);
+    expect(gotReused).toHaveLength(1);
+  });
+
+  it("the grace is the OLD spec's max pulse + 5 ms margin + 50 ms slack, measured from the swap", async () => {
+    const handle = await running();
+    const got: TrajectoryFrameOutcome[] = [];
+    handle.onFrame((f) => got.push(f));
+    await handle.replace(reshaped(4)); // 0 -> 1, old pulse 2 000 µs
+    elapse(1_000);
+    await handle.replace(spec(4)); // 1 -> 2 (0 still in grace), old pulse 3 000 µs
+    expect(handle.id).toBe(2);
+    // id 0 expires 57 ms after the first swap; id 1 58 ms after the second.
+    elapse(57_000 - 1_000 - 1); // 1 µs before id 0's deadline
+    push(0);
+    push(1);
+    expect(got.map((f) => f.trajectoryId)).toEqual([0, 1]);
+    elapse(2);
+    push(0); // expired
+    push(1);
+    expect(got.map((f) => f.trajectoryId)).toEqual([0, 1, 1]);
+    elapse(58_000);
+    push(1); // expired
+    expect(got).toHaveLength(3);
+  });
+
+  it("a retired id's run-level push does not end the current run", async () => {
+    const handle = await running();
+    await handle.replace(reshaped(4));
+    push(0, { marker: null, status: "CANCELLED", cycle: 0 });
+    // Still running: a period change is refused.
+    await expect(handle.replace(reshaped(4, 40_000))).rejects.toThrow(/same period/);
+  });
+
+  it("dispose honors the grace: the id is not reused and its stragglers reach nobody", async () => {
+    const handle = await running();
+    const got: TrajectoryFrameOutcome[] = [];
+    handle.onFrame((f) => got.push(f));
+    await handle.dispose();
+    const next = await ctrl!.uploadTrajectory(spec(4));
+    expect(next.id).toBe(1);
+    const gotNext: TrajectoryFrameOutcome[] = [];
+    next.onFrame((f) => gotNext.push(f));
+    push(0);
+    expect(got).toHaveLength(0);
+    expect(gotNext).toHaveLength(0);
+    elapse(trajectoryGraceUs(spec(4)) + 1);
+    expect((await ctrl!.uploadTrajectory(spec(4))).id).toBe(0);
+  });
+
+  it("waits for a grace to run out instead of failing when every other id is taken", async () => {
+    const handle = await running(); // id 0
+    await ctrl!.uploadTrajectory(spec(2)); // 1
+    await ctrl!.uploadTrajectory(spec(2)); // 2
+    await handle.replace(reshaped(4)); // -> 3, 0 in grace
+    expect(handle.id).toBe(3);
+    // No free id: the next replace waits out id 0's grace (real time — the
+    // pinned clock stands still) rather than throwing at capacity.
+    const t0 = performance.now();
+    await handle.replace(spec(4));
+    expect(handle.id).toBe(0);
+    expect(performance.now() - t0).toBeGreaterThanOrEqual(50);
   });
 
   it("an upload failure leaves the old table running and frees the new id", async () => {
@@ -574,6 +693,7 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
   });
 
   it("from a stopped handle: plain re-upload + DELETE(old), any period, no STOP/START", async () => {
+    elapse = pinHostClock();
     ctrl = await makeController();
     ctrl.setClockOffsetNs(OFFSET);
     const handle = await ctrl.uploadTrajectory(spec(4));
@@ -592,7 +712,9 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
       ["START", 1],
       ["DELETE", 1],
     ]);
-    // Both ids are free again.
+    // Both ids are free again once their graces ran out (0 was played
+    // before the re-upload, 1 after it).
+    elapse(trajectoryGraceUs(reshaped(4)) + 1);
     expect((await ctrl.uploadTrajectory(spec(2))).id).toBe(0);
     expect((await ctrl.uploadTrajectory(spec(2))).id).toBe(1);
   });
@@ -645,6 +767,7 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
     await handle.dispose();
     expect(wireOps().at(-1)).toEqual({ op: "DELETE", id: 1 });
     await expect(handle.replace(spec(4))).rejects.toThrow(/disposed/);
+    elapse(trajectoryGraceUs(reshaped(4)) + 1);
     expect((await ctrl!.uploadTrajectory(spec(2))).id).toBe(0);
   });
 
@@ -661,5 +784,97 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
       ["DELETE", 1],
       ["DELETE", 0],
     ]);
+  });
+
+  describe("atomic swap (firmware 2.2.1)", () => {
+    const FW_221 = { major: 2, minor: 2, patch: 1 };
+
+    it("is gated on 2.2.1", async () => {
+      ctrl = await makeController(FW_221);
+      expect(ctrl.v221Capable).toBe(true);
+      expect(ctrl.v22Capable).toBe(true);
+      ctrl.release();
+      ctrl = await makeController({ major: 2, minor: 2, patch: 0 });
+      expect(ctrl.v221Capable).toBe(false);
+    });
+
+    it("swaps with ONE START(new, original t_start) — no STOP — then DELETE(old)", async () => {
+      const handle = await running(FW_221);
+      const got: TrajectoryFrameOutcome[] = [];
+      handle.onFrame((f) => got.push(f));
+      expect(handle.lastSwap).toBeNull();
+      await handle.replace(reshaped(4));
+      expect(trajectoryOps()).toEqual(["BEGIN", "DATA", "MARK", "COMMIT", "START", "DELETE"]);
+      expect(wireOps().slice(-2)).toEqual([
+        { op: "START", id: 1, t_start: 2_000_000n, cycles: 0 },
+        { op: "DELETE", id: 0 },
+      ]);
+      expect(handle.id).toBe(1);
+      expect(handle.lastSwap).toBe("atomic");
+      // The old table's in-flight capture still lands inside the grace.
+      push(0);
+      push(1);
+      expect(got.map((f) => f.trajectoryId)).toEqual([0, 1]);
+    });
+
+    it("falls back to STOP(old) + START(new) on a REJ 'already running'", async () => {
+      const handle = await running(FW_221);
+      mockOps.reject.push({
+        op: "START",
+        id: 1,
+        message: "A trajectory is already running (STOP it first)",
+      });
+      await handle.replace(reshaped(4));
+      expect(mockTimeline.filter((e) => e.startsWith("send:") || e.startsWith("rej:"))).toEqual([
+        "send:BEGIN:1",
+        "send:MARK:1",
+        "send:COMMIT:1",
+        "send:START:1",
+        "rej:START:1",
+        "send:STOP:0",
+        "send:START:1",
+        "send:DELETE:0",
+      ]);
+      expect(wireOps().slice(-3)).toEqual([
+        { op: "STOP", id: 0 },
+        { op: "START", id: 1, t_start: 2_000_000n, cycles: 0 },
+        { op: "DELETE", id: 0 },
+      ]);
+      expect(handle.id).toBe(1);
+      expect(handle.lastSwap).toBe("stop-start");
+    });
+
+    it("any other REJ of the atomic START stops nothing: TrajectoryReplaceError, still running", async () => {
+      const handle = await running(FW_221);
+      mockOps.reject.push({ op: "START", id: 1, message: "Trajectory not committed (COMMIT first)" });
+      const error = await handle.replace(reshaped(4)).catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(TrajectoryReplaceError);
+      expect((error as TrajectoryReplaceError).running).toBe(true);
+      expect(wireOps().slice(-2)).toEqual([
+        { op: "START", id: 1, t_start: 2_000_000n, cycles: 0 },
+        { op: "DELETE", id: 1 },
+      ]);
+      expect(trajectoryOps()).not.toContain("STOP");
+      expect(handle.id).toBe(0);
+      expect(handle.lastSwap).toBeNull();
+      // The never-started new id is free at once; still running → same period.
+      await expect(handle.replace(reshaped(4, 40_000))).rejects.toThrow(/same period/);
+      mockCalls.length = 0;
+      await handle.replace(reshaped(4));
+      expect(wireOps().find((a) => a.op === "BEGIN")).toMatchObject({ id: 1 });
+      expect(handle.lastSwap).toBe("atomic");
+    });
+
+    it("a 'now' start (inexact anchor) skips the atomic attempt", async () => {
+      ctrl = await makeController(FW_221);
+      ctrl.setClockOffsetNs(OFFSET);
+      setHostClock(() => OFFSET + 3_000_000_000n);
+      const handle = await ctrl.uploadTrajectory(spec(4));
+      await handle.start();
+      mockCalls.length = 0;
+      await handle.replace(reshaped(4));
+      expect(trajectoryOps().slice(-3)).toEqual(["STOP", "START", "DELETE"]);
+      expect(handle.lastSwap).toBe("stop-start");
+    });
   });
 });

@@ -21,6 +21,7 @@ import {
 } from "@lib/controller-codec";
 import { registerWorkload, type WorkloadHandle } from "./metering.js";
 import { hostNowNs } from "./time-align.js";
+import { trajectoryGraceUs } from "./trajectory-grace.js";
 
 type PortInfo = Awaited<ReturnType<typeof SerialPort.list>>[number];
 
@@ -53,6 +54,13 @@ export const RECOVER_MEMS_MIN_VERSION = { major: 2, minor: 1, patch: 0 } as cons
 // firmware REJects both properties ("Unknown packet type").
 export const SCHEDULE_MIN_VERSION = { major: 2, minor: 2, patch: 0 } as const;
 
+// Minimum firmware/protocol version for the ATOMIC trajectory swap (protocol
+// 2.2.1): `START {id = b, t_start, cycles}` while table `a` runs is accepted
+// iff `b` is committed, has `a`'s period and `t_start` equals `a`'s recorded
+// start (exact µs) — the firmware switches tables in place (no HOLD, no missed
+// marker). Older firmware REJs it "already running".
+export const ATOMIC_SWAP_MIN_VERSION = { major: 2, minor: 2, patch: 1 } as const;
+
 // Firmware limits (lib/Protocol/Packet.h Trajectory::CHUNK_SAMPLES,
 // firmware/include/Trajectory.h, Streams::SCHEDULE_DEPTH). Checked host-side so
 // a bad spec fails before anything goes on the wire; the firmware REJects past
@@ -64,6 +72,12 @@ export const TRAJECTORY_MAX_MARKERS = 8;
 export const SCHEDULE_DEPTH = 32;
 // DATA chunks kept in flight during an upload (ACK-backed, pipelined).
 const TRAJECTORY_UPLOAD_WINDOW = 8;
+// The retired-table grace rule (pure, shared with the controller node).
+export {
+  TRAJECTORY_GRACE_SLACK_US,
+  TRAJECTORY_STROBE_MARGIN_US,
+  trajectoryGraceUs,
+} from "./trajectory-grace.js";
 
 /** Host-steady NANOSECONDS → MCU-clock MICROSECONDS — the inverse of the
  *  FIN decode (`hostNs = mcuUs * 1000 + clockOffsetNs`). Rounds to the nearest
@@ -258,6 +272,11 @@ export interface TrajectoryFrameOutcome {
   right: Pos;
 }
 
+/** How the last running `replace` swapped tables: `atomic` = the firmware
+ *  2.2.1 in-place START (no HOLD, no missed marker), `stop-start` = the
+ *  STOP(old) + START(new) pair (older firmware, or the atomic START REJected). */
+export type TrajectorySwapKind = "atomic" | "stop-start";
+
 /** An uploaded (committed) MCU trajectory table. */
 export interface TrajectoryHandle {
   /** The CURRENT MCU table id — a getter: `replace` swaps it to the new
@@ -282,24 +301,42 @@ export interface TrajectoryHandle {
    *  leaves the old table running) if the upload fails. Not running → a plain
    *  re-upload that leaves the handle `ready`.
    *
-   *  Wire order while running: BEGIN/DATA/MARK/COMMIT(new) → STOP(old) +
-   *  START(new, t_start, cycles) written back to back (both awaited after) →
-   *  DELETE(old) best-effort. `t_start`/`cycles` are the run's original: the
-   *  exact MCU value sent by `start(atHostNs)`, or — after a "now" start —
-   *  the host clock at send time converted to MCU µs, so the carried phase is
-   *  then approximate to the serial latency (and relies on the calibrated
-   *  clock offset). One replace at a time per handle (a second concurrent
-   *  call throws; `NodeTrajectory.replace` coalesces); `start`/`stop`/
-   *  `dispose` wait for an in-flight one. A failure AFTER the STOP/START pair
-   *  went out throws `TrajectoryReplaceError` (`running` says whether the old
-   *  table is still running). */
+   *  Wire order while running: BEGIN/DATA/MARK/COMMIT(new), then
+   *  - ATOMIC first (firmware >= 2.2.1 and an exact `t_start`): a single
+   *    START(new, t_start, cycles) — the firmware swaps in place; a REJ
+   *    "already running" (the firmware did not take it) falls back to
+   *  - STOP(old) + START(new, t_start, cycles) written back to back (both
+   *    awaited after) — the only path below 2.2.1;
+   *  → DELETE(old) best-effort. `lastSwap` records which path landed.
+   *  `t_start`/`cycles` are the run's original: the exact MCU value sent by
+   *  `start(atHostNs)`, or — after a "now" start — the host clock at send
+   *  time converted to MCU µs, so the carried phase is then approximate to
+   *  the serial latency (and relies on the calibrated clock offset); such an
+   *  inexact anchor can never equal the firmware's, so the atomic START is
+   *  not attempted for it.
+   *
+   *  GRACE: the old id stays routed to this handle's listeners for
+   *  `trajectoryGraceUs(old spec)` after the swap (a marker capture in flight
+   *  at the swap still pushes with the old id) and is not handed out for a
+   *  new table meanwhile.
+   *
+   *  One replace at a time per handle (a second concurrent call throws;
+   *  `NodeTrajectory.replace` coalesces); `start`/`stop`/`dispose` wait for
+   *  an in-flight one. A START failure after the upload throws
+   *  `TrajectoryReplaceError` (`running` says whether the old table is still
+   *  running). */
   replace(spec: TrajectorySpec): Promise<void>;
+  /** The kind of the last successful RUNNING swap (null before one; a plain
+   *  re-upload from a stopped handle leaves it unchanged). */
+  readonly lastSwap: TrajectorySwapKind | null;
 }
 
-/** A `TrajectoryHandle.replace` that failed after the STOP/START pair: START
- *  of the new table was REJected. The handle tried to re-START the old table
- *  at the original `t_start`; `running` is false when that failed too (the
- *  run is over — the mirror holds its last position). */
+/** A `TrajectoryHandle.replace` whose START of the new table was REJected
+ *  (atomic START with a reason other than "already running", or the
+ *  STOP/START pair). After the pair, the handle tried to re-START the old
+ *  table at the original `t_start`; `running` is false when that failed too
+ *  (the run is over — the mirror holds its last position). A REJected atomic
+ *  START stopped nothing: `running` stays true. */
 export class TrajectoryReplaceError extends Error {
   constructor(
     message: string,
@@ -399,13 +436,34 @@ export class Controller {
   private bias = 0;
   // Owner-applied dt (unified-time): host-steady-ns offset mapping
   // the MCU µs clock into the trusted domain. 0 until calibration (the ping
-  // on connect); atomically swapped on mid-task re-calibration — outcomes
-  // decoded after the swap carry the new offset.
+  // on connect); atomically swapped on mid-task re-calibration (the
+  // controller session re-pings every 30 s) — outcomes decoded after the
+  // swap carry the new offset.
   private clockOffsetNs = 0n;
+  private _clockCalibrated = false;
+  private clockPingMisses = 0;
   /** Install the calibrated MCU→host offset (from `pingControllerOffset`).
-   *  Every FIN timestamp surfaced after this call is trusted host-ns. */
+   *  Every FIN timestamp surfaced after this call is trusted host-ns. Marks
+   *  the clock calibrated and clears the consecutive-miss count. */
   setClockOffsetNs(offsetNs: bigint): void {
     this.clockOffsetNs = offsetNs;
+    this._clockCalibrated = true;
+    this.clockPingMisses = 0;
+  }
+  /** A calibration ping round produced no offset (timed out or failed). Two
+   *  misses IN A ROW mark the clock uncalibrated again (`clockCalibrated`
+   *  false) — the last offset stays installed, but is no longer vouched for;
+   *  the next landed ping restores it. */
+  noteClockPingMissed(): void {
+    this.clockPingMisses++;
+    if (this.clockPingMisses >= 2) this._clockCalibrated = false;
+  }
+  /** True once a calibration ping landed (`setClockOffsetNs`); false again
+   *  after two consecutive missed pings (`noteClockPingMissed`). MirrorLink
+   *  refuses to scan while false: its trajectory start instant and every
+   *  marker timestamp ride this offset. */
+  get clockCalibrated(): boolean {
+    return this._clockCalibrated;
   }
   private _enabled = false;
   /** Host-side floor between two UPDATEs on one stream (ms): the JS
@@ -504,6 +562,15 @@ export class Controller {
     return (
       this.firmwareVersion != null &&
       versionAtLeast(this.firmwareVersion, SCHEDULE_MIN_VERSION)
+    );
+  }
+  /** True once `ready` has confirmed firmware >= 2.2.1 — the ATOMIC
+   *  trajectory swap (`TrajectoryHandle.replace` tries a single in-place
+   *  START before the STOP/START pair). */
+  get v221Capable() {
+    return (
+      this.firmwareVersion != null &&
+      versionAtLeast(this.firmwareVersion, ATOMIC_SWAP_MIN_VERSION)
     );
   }
   /** Cumulative serial byte/packet counters — the caller derives rates by
@@ -855,6 +922,11 @@ export class Controller {
   /** Per-id run tracking of the owning handle (a run-level ENDED/CANCELLED
    *  clears its running view) — routed with the listener set on a replace. */
   private readonly trajectoryRunHooks = new Map<number, (f: TrajectoryFrame) => void>();
+  /** Retired table ids in their GRACE period (`trajectoryGraceUs`): id →
+   *  host-steady ns deadline. Until then the id's pushes still reach the
+   *  retiring handle's listener set (a marker capture in flight at the swap
+   *  finishes later with the OLD id) and the id is not allocated again. */
+  private readonly trajectoryGrace = new Map<number, bigint>();
   private trajectoryPushBound = false;
 
   /** Decode one SYN CMD_TRAJECTORY push like `frame()`'s FIN: volts, and MCU
@@ -877,6 +949,9 @@ export class Controller {
     if (this.trajectoryPushBound) return;
     this.trajectoryPushBound = true;
     this.device.onPush(Protocol.Command.TrajectoryFrame, (f) => {
+      // A push for an id in grace: expire it first if the deadline passed
+      // (the routing goes with it — a straggler that late is nobody's).
+      if (this.trajectoryGrace.has(f.id)) this.sweepTrajectoryGrace();
       this.trajectoryRunHooks.get(f.id)?.(f);
       const listeners = this.trajectoryListeners.get(f.id);
       if (!listeners || listeners.size === 0) return;
@@ -891,14 +966,59 @@ export class Controller {
     });
   }
 
-  /** Reserve the lowest FREE table id (throws at capacity). */
-  private allocTrajectoryId(): number {
-    for (let candidate = 0; candidate < TRAJECTORY_MAX_TABLES; candidate++)
-      if (!this.trajectoryIds.has(candidate)) {
-        this.trajectoryIds.add(candidate);
-        return candidate;
-      }
-    throw new Error(`Trajectory capacity (${TRAJECTORY_MAX_TABLES} tables) exceeded`);
+  /** Put the retired table `id` in grace for `graceUs`: its pushes keep
+   *  reaching `listeners` (the retiring handle's set, possibly empty after a
+   *  dispose — then they are swallowed) and it is not allocated until the
+   *  deadline. The run hook is NOT kept: a retired table's pushes never end
+   *  the handle's current run. `graceUs <= 0` unroutes at once. */
+  private graceTrajectoryId(
+    id: number,
+    listeners: Set<(frame: TrajectoryFrameOutcome) => void>,
+    graceUs: number,
+  ): void {
+    this.trajectoryRunHooks.delete(id);
+    if (graceUs <= 0) {
+      if (this.trajectoryListeners.get(id) === listeners) this.trajectoryListeners.delete(id);
+      return;
+    }
+    this.trajectoryListeners.set(id, listeners);
+    this.trajectoryGrace.set(id, hostNowNs() + BigInt(Math.ceil(graceUs)) * 1000n);
+  }
+
+  /** Expire every grace entry whose deadline has passed (or every entry
+   *  with a deadline at or before `upToNs`), unrouting its id. */
+  private sweepTrajectoryGrace(upToNs: bigint = hostNowNs()): void {
+    for (const [id, until] of this.trajectoryGrace) {
+      if (until > upToNs) continue;
+      this.trajectoryGrace.delete(id);
+      // Only a not-yet-reallocated id can be in grace, so its routing is
+      // still the retiring handle's.
+      this.trajectoryListeners.delete(id);
+      this.trajectoryRunHooks.delete(id);
+    }
+  }
+
+  /** Reserve the lowest FREE table id — neither held by a handle nor in
+   *  grace. When every id is taken but some are only in grace, wait for the
+   *  earliest grace to run out (real time, so a frozen test clock cannot
+   *  wedge it); throws at capacity otherwise. */
+  private async allocTrajectoryId(): Promise<number> {
+    for (;;) {
+      this.sweepTrajectoryGrace();
+      for (let candidate = 0; candidate < TRAJECTORY_MAX_TABLES; candidate++)
+        if (!this.trajectoryIds.has(candidate) && !this.trajectoryGrace.has(candidate)) {
+          this.trajectoryIds.add(candidate);
+          return candidate;
+        }
+      if (this.trajectoryGrace.size === 0)
+        throw new Error(`Trajectory capacity (${TRAJECTORY_MAX_TABLES} tables) exceeded`);
+      let earliest: bigint | null = null;
+      for (const until of this.trajectoryGrace.values())
+        if (earliest === null || until < earliest) earliest = until;
+      const waitMs = Math.max(1, Math.ceil(Number(earliest! - hostNowNs()) / 1e6));
+      await new Promise((r) => setTimeout(r, waitMs));
+      this.sweepTrajectoryGrace(earliest!);
+    }
   }
 
   /** `set` with a synchronous throw (disconnected) turned into a rejection,
@@ -977,7 +1097,7 @@ export class Controller {
         "uploadTrajectory requires firmware >= 2.2.0 (CMD_TRAJECTORY unavailable)",
       );
     validateTrajectorySpec(spec);
-    const firstId = this.allocTrajectoryId();
+    const firstId = await this.allocTrajectoryId();
     this.bindTrajectoryPush();
     try {
       await this.uploadTable(firstId, spec);
@@ -989,15 +1109,20 @@ export class Controller {
     // The handle's CURRENT table — `replace` swaps it (and moves the
     // listener set + run hook to the new id); `id` reads it live.
     let id = firstId;
-    let periodUs = spec.periodUs;
+    let current = spec;
+    // The current table has been STARTed at least once — only then can a
+    // marker capture of it still be in flight when it retires (grace).
+    let played = false;
+    let lastSwap: TrajectorySwapKind | null = null;
     const listeners = new Set<(frame: TrajectoryFrameOutcome) => void>();
     // The host's view of the run: set on a START ack, cleared on a STOP ack,
     // dispose, or a run-level ENDED / CANCELLED push. `tStartMcuUs` is the
     // MCU instant the run is anchored at — the exact value sent for an
-    // explicit start, the converted send-time host clock for a "now" start
-    // (t_start = 0 on the wire; the carried phase is then approximate to the
-    // serial latency). `replace` re-STARTs the new table at it.
-    let run: { tStartMcuUs: bigint; cycles: number } | null = null;
+    // explicit start (`exact`), the converted send-time host clock for a
+    // "now" start (t_start = 0 on the wire; the carried phase is then
+    // approximate to the serial latency). `replace` re-STARTs the new table
+    // at it.
+    let run: { tStartMcuUs: bigint; cycles: number; exact: boolean } | null = null;
     const runHook = (f: TrajectoryFrame) => {
       if (f.marker === null && (f.status === "ENDED" || f.status === "CANCELLED")) run = null;
     };
@@ -1011,6 +1136,10 @@ export class Controller {
       if (this.trajectoryListeners.get(from) === listeners) this.trajectoryListeners.delete(from);
       if (this.trajectoryRunHooks.get(from) === runHook) this.trajectoryRunHooks.delete(from);
     };
+    /** Retire `table` (spec `of`, STARTed iff `wasPlayed`): grace its id when
+     *  a capture of it may still be in flight, else unroute it at once. */
+    const retire = (table: number, of: TrajectorySpec, wasPlayed: boolean) =>
+      this.graceTrajectoryId(table, listeners, wasPlayed ? trajectoryGraceUs(of) : 0);
     route(id);
     let disposed = false;
     // One replace at a time; start/stop/dispose wait for an in-flight one.
@@ -1021,7 +1150,11 @@ export class Controller {
     const live = (what: string) => {
       if (disposed) throw new Error(`Trajectory ${id} is disposed (${what})`);
     };
-    /** DELETE `table` best-effort and release its id. */
+    /** DELETE `table` best-effort and release its id. The DELETE may go out
+     *  at once even inside the grace: the firmware's push for an in-flight
+     *  marker capture carries the id copied into the capture request
+     *  (Capture.cpp `finishActive` → `Trajectory::push`) and never looks the
+     *  table up. */
     const drop = async (table: number) => {
       try {
         if (this.device.connected) await this.sendTrajectory({ op: "DELETE", id: table });
@@ -1031,16 +1164,28 @@ export class Controller {
         this.trajectoryIds.delete(table);
       }
     };
+    /** The swap landed: `newId` (spec `next`) is the handle's table now. */
+    const swapTo = (newId: number, next: TrajectorySpec, nowPlaying: boolean) => {
+      const oldId = id;
+      const old = current;
+      const oldPlayed = played;
+      route(newId);
+      id = newId;
+      current = next;
+      played = nowPlaying;
+      retire(oldId, old, oldPlayed);
+      return oldId;
+    };
 
     const doReplace = async (next: TrajectorySpec): Promise<void> => {
       validateTrajectorySpec(next);
-      if (run && next.periodUs !== periodUs)
+      if (run && next.periodUs !== current.periodUs)
         throw new Error(
-          `Trajectory ${id}: replace while running needs the same period (${periodUs} µs, got ${next.periodUs} µs) — stop, replace, then start`,
+          `Trajectory ${id}: replace while running needs the same period (${current.periodUs} µs, got ${next.periodUs} µs) — stop, replace, then start`,
         );
       if (!this.device.connected) throw new Error("Controller not connected");
       const oldId = id;
-      const newId = this.allocTrajectoryId();
+      const newId = await this.allocTrajectoryId();
       try {
         await this.uploadTable(newId, next);
       } catch (error) {
@@ -1055,30 +1200,55 @@ export class Controller {
       }
       const carried = run;
       if (!carried) {
-        // Not running: a plain re-upload — swap, then retire the old table.
-        route(newId);
-        unroute(oldId);
-        id = newId;
-        periodUs = next.periodUs;
+        // Not running: a plain re-upload — swap, then retire the old table
+        // (in grace if it was played: a stop() just before may have left a
+        // capture in flight).
+        swapTo(newId, next, false);
         await drop(oldId);
         return;
       }
-      // Running: STOP(old) + START(new, original t_start) back to back — the
-      // firmware joins a past t_start in progress, so the phase carries over.
-      // The new id's pushes reach the same listeners from START on.
-      route(newId);
-      const [stopped, started] = await Promise.allSettled([
-        this.sendTrajectory({ op: "STOP", id: oldId }),
+      const startNew = () =>
         this.sendTrajectory({
           op: "START",
           id: newId,
           t_start: carried.tStartMcuUs,
           cycles: carried.cycles,
-        }),
+        });
+      // The new id's pushes reach the same listeners from START on.
+      route(newId);
+      if (this.v221Capable && carried.exact) {
+        // ATOMIC (2.2.1): one START while the old table runs — the firmware
+        // swaps tables in place (same period, same exact t_start). A REJ
+        // "already running" means it did not take it (older semantics, or
+        // the anchor did not match): fall back to the STOP/START pair.
+        try {
+          await startNew();
+          lastSwap = "atomic";
+          swapTo(newId, next, true);
+          await drop(oldId);
+          return;
+        } catch (error) {
+          if (!/already running/i.test(errorMessage(error))) {
+            // Nothing was stopped: the old table keeps running.
+            unroute(newId);
+            await drop(newId);
+            throw new TrajectoryReplaceError(
+              `Trajectory ${oldId}: atomic START of the replacement table failed (${errorMessage(error)}) — still running the previous spec`,
+              true,
+              error,
+            );
+          }
+        }
+      }
+      // STOP(old) + START(new, original t_start) back to back — the firmware
+      // joins a past t_start in progress, so the phase carries over.
+      const [stopped, started] = await Promise.allSettled([
+        this.sendTrajectory({ op: "STOP", id: oldId }),
+        startNew(),
       ]);
       if (started.status === "fulfilled") {
-        unroute(oldId);
-        id = newId;
+        lastSwap = "stop-start";
+        swapTo(newId, next, true);
         await drop(oldId);
         return;
       }
@@ -1113,6 +1283,9 @@ export class Controller {
       get id() {
         return id;
       },
+      get lastSwap() {
+        return lastSwap;
+      },
       start: async (atHostNs?: bigint, cycles = 0) => {
         live("start");
         await settle();
@@ -1120,16 +1293,20 @@ export class Controller {
         const tStart =
           atHostNs === undefined ? 0n : hostNsToMcuUs(atHostNs, this.clockOffsetNs);
         // A "now" start has no exact MCU instant: estimate it from the host
-        // clock at send time (off by the serial latency).
-        const anchor =
-          atHostNs === undefined ? hostNsToMcuUs(hostNowNs(), this.clockOffsetNs) : tStart;
+        // clock at send time (off by the serial latency). An explicit instant
+        // that clamped to 0n (before the MCU epoch) is a "now" start too.
+        const exact = tStart !== 0n;
+        const anchor = exact ? tStart : hostNsToMcuUs(hostNowNs(), this.clockOffsetNs);
+        // Conservatively "played" from the write on (a lost ACK may still
+        // have started it).
+        played = true;
         await this.set(Protocol.Command.Trajectory, {
           op: "START",
           id,
           t_start: tStart,
           cycles,
         });
-        run = { tStartMcuUs: anchor, cycles };
+        run = { tStartMcuUs: anchor, cycles, exact };
       },
       stop: async () => {
         live("stop");
@@ -1144,7 +1321,9 @@ export class Controller {
         await settle();
         run = null;
         listeners.clear();
-        unroute(id);
+        // Grace the id like a swap does: a capture in flight at the DELETE
+        // still pushes with it, and must not reach the id's next owner.
+        retire(id, current, played);
         try {
           if (this.device.connected)
             await this.set(Protocol.Command.Trajectory, { op: "DELETE", id });

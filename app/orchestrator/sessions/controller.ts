@@ -43,6 +43,96 @@ const ZERO_PRESSURE = {
 // Serial + per-stream probes — 2 Hz keeps wire cost to a few numbers x <=8
 // streams.
 const PROBE_INTERVAL_MS = 500;
+/** MCU↔host clock re-calibration cadence — the cameras' owner threads
+ *  re-latch every 30 s; the controller's offset drifts the same way. */
+export const CLOCK_REPING_INTERVAL_MS = 30_000;
+/** Per-round deadline: pre-v1.1 firmware REJects the unknown System.Timestamp
+ *  property with seq 0 (dropped), so the read would hang to Device teardown
+ *  instead of rejecting. */
+export const CLOCK_PING_TIMEOUT_MS = 3_000;
+
+/** What the clock sync needs of a controller (the real `Controller`, or a
+ *  test fake). */
+export interface ClockSyncTarget {
+  readTimestamp(): Promise<bigint>;
+  setClockOffsetNs(offsetNs: bigint): void;
+  noteClockPingMissed(): void;
+  readonly clockCalibrated: boolean;
+}
+
+/**
+ * Keep `c`'s MCU↔host clock offset calibrated: one ping round now
+ * (`pingControllerOffset`, raced against `timeoutMs`), then one every
+ * `intervalMs`. A landed round installs the offset (`setClockOffsetNs` —
+ * atomic for outcomes decoded after it) and the calibration row; a timed-out
+ * or failed round counts a miss (`noteClockPingMissed` — two in a row flip
+ * `clockCalibrated` false). A round never overlaps the previous one.
+ * `onChange` fires whenever `clockCalibrated` flips. Returns the stop
+ * function (a round landing after it is discarded).
+ */
+export function startControllerClockSync(
+  c: ClockSyncTarget,
+  opts: {
+    intervalMs?: number;
+    timeoutMs?: number;
+    onChange?: (calibrated: boolean) => void;
+  } = {},
+): () => void {
+  const {
+    intervalMs = CLOCK_REPING_INTERVAL_MS,
+    timeoutMs = CLOCK_PING_TIMEOUT_MS,
+    onChange,
+  } = opts;
+  let stopped = false;
+  let inRound = false;
+  let reportedMiss = false;
+  const miss = (message: string) => {
+    c.noteClockPingMissed?.(); // tolerate a partial fake
+    // One report per streak of misses — not one every 30 s.
+    if (!reportedMiss) report("time-align", message);
+    reportedMiss = true;
+  };
+  const round = async () => {
+    if (stopped || inRound) return;
+    inRound = true;
+    const before = !!c.clockCalibrated;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const cal = await Promise.race([
+        pingControllerOffset(() => c.readTimestamp()),
+        new Promise<null>((r) => {
+          timer = setTimeout(() => r(null), timeoutMs);
+        }),
+      ]);
+      if (stopped) return;
+      if (cal) {
+        setCalibration("controller", cal);
+        // Owner-applied dt: every FIN / push timestamp the controller
+        // surfaces from here on carries the fresh offset.
+        c.setClockOffsetNs(cal.offsetNs);
+        reportedMiss = false;
+      } else
+        miss(
+          before
+            ? "controller: clock re-calibration ping timed out"
+            : "controller: timestamp ping timed out (pre-v1.1 firmware?) — clock UNCALIBRATED",
+        );
+    } catch (e) {
+      if (stopped) return;
+      miss(`controller: clock calibration failed: ${(e as Error).message}`);
+    } finally {
+      if (timer) clearTimeout(timer);
+      inRound = false;
+    }
+    if (!stopped && !!c.clockCalibrated !== before) onChange?.(!!c.clockCalibrated);
+  };
+  void round();
+  const interval = setInterval(() => void round(), intervalMs);
+  return () => {
+    stopped = true;
+    clearInterval(interval);
+  };
+}
 
 export function controllerSession(): ServerSession<typeof controller> {
   return defineSession("controller", controller, (s) => {
@@ -58,12 +148,15 @@ export function controllerSession(): ServerSession<typeof controller> {
         // Fixed at connect (firmware version) — republished here so the
         // renderer can gate the "Recover mirror" button; false when idle.
         canRecoverMems: !!c?.v21Capable,
+        // MirrorLink gates its scan on this (activeController()?.clockCalibrated).
+        clockCalibrated: !!c?.clockCalibrated,
         dv: c?.dv ?? 0,
         pos: c?.pos ?? NEUTRAL,
       });
     }
 
     let probeTimer: ReturnType<typeof setInterval> | null = null;
+    let stopClockSync: (() => void) | null = null;
     // One-shot unplug latch (reset per probe start) — the ping rejects every
     // 500 ms while unplugged; the banner must fire once, not spam.
     let unplugReported = false;
@@ -170,31 +263,17 @@ export function controllerSession(): ServerSession<typeof controller> {
               controllerNode().bindController(c);
               publish();
               startProbe();
-              // Unified time: MCU↔host clock calibration via
-              // the v1.1 System.Timestamp ping — fire-and-forget, RACED
-              // against a deadline because pre-v1.1 firmware REJects the
-              // unknown property with seq 0 (dropped) and the read would
-              // hang to Device teardown instead of rejecting.
-              void (async () => {
-                try {
-                  const cal = await Promise.race([
-                    pingControllerOffset(() => c.readTimestamp()),
-                    new Promise<null>((r) => setTimeout(() => r(null), 3000)),
-                  ]);
-                  if (cal) {
-                    setCalibration("controller", cal);
-                    // Owner-applied dt: every FIN timestamp the
-                    // controller surfaces from here on is trusted host-ns.
-                    c.setClockOffsetNs(cal.offsetNs);
-                  } else
-                    report(
-                      "time-align",
-                      "controller: timestamp ping timed out (pre-v1.1 firmware?) — clock UNCALIBRATED",
-                    );
-                } catch (e) {
-                  report("time-align", `controller: clock calibration failed: ${(e as Error).message}`);
-                }
-              })();
+              // Unified time: MCU↔host clock calibration via the v1.1
+              // System.Timestamp ping — now, then every 30 s (the offset
+              // drifts like the cameras'), each round raced against a 3 s
+              // deadline (pre-v1.1 firmware never answers). Publishes
+              // `clockCalibrated` whenever it flips.
+              stopClockSync?.();
+              stopClockSync = startControllerClockSync(c, {
+                onChange: () => {
+                  if (ctrl() === c) publish();
+                },
+              });
               return true;
             });
           } finally {
@@ -219,6 +298,8 @@ export function controllerSession(): ServerSession<typeof controller> {
             // console.
             report("controller", `disable-on-disconnect failed: ${(e as Error).message}`);
           }
+          stopClockSync?.();
+          stopClockSync = null;
           c?.release();
           stopProbe();
           publish();

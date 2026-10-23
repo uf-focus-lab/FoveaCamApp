@@ -254,6 +254,10 @@ export type TrajectoryStat = {
   /** Successful `replace()` swaps since open (phase-continuous re-shapes
    *  while running, plain re-uploads from `ready`). */
   reuploads: number;
+  /** How the last RUNNING swap went: `atomic` = the firmware 2.2.1 in-place
+   *  START (no HOLD, no missed marker), `stop-start` = the STOP + START pair
+   *  (older firmware, or the atomic START was REJected); null before one. */
+  lastSwap: "atomic" | "stop-start" | null;
 };
 
 export const controller = defineContract({
@@ -266,6 +270,10 @@ export const controller = defineContract({
     // gates the title-bar "Recover mirror" button. False while disconnected
     // or on older firmware.
     canRecoverMems: false as boolean,
+    // The MCU↔host clock offset is calibrated: true once the first
+    // System.Timestamp ping landed (re-pinged every 30 s), false again after
+    // two consecutive missed pings. MirrorLink refuses to scan while false.
+    clockCalibrated: false as boolean,
     dv: 0,
     pos: { left: { x: 0, y: 0 }, right: { x: 0, y: 0 } } as {
       left: Pos;
