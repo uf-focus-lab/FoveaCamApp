@@ -23,6 +23,10 @@ export const SCAN_HZ_RANGE = { min: 1, max: 100 } as const;
 /** Scan amplitude slider range, in degrees: the ellipse's semi-major radius,
  *  the triangle's half sweep. */
 export const SCAN_AMP_RANGE = { min: 0, max: 2 } as const;
+/** The axis slider's range: the 0.5° grid over (-180, 180]. The left end is
+ *  -179.5, not -180 (`normalizeAxisDeg` maps -180 to 180, which would send the
+ *  thumb to the right edge); `setAxis` folds (-180, -179.5) onto it. */
+export const AXIS_SLIDER_RANGE = { min: -179.5, max: 180 } as const;
 
 /** Main-axis direction range, degrees counter-clockwise from +x of the wide
  *  angular frame — the half-open interval (-180, 180]; see

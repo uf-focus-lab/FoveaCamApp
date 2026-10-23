@@ -166,7 +166,7 @@ the pattern — `steer`, `setAxis`, `verge`, `shift`, `baseline`, a vergence wri
 
 **Axis drag.** `setAxis(px)` maps the pixel through `undistort.angular` and sets
 `scan_axis_deg = axisDegFromPixelRay(A0 + pan, point)` — the direction from the center ray
-to it. A pointer ON the center (a zero-length ray) or an uncalibrated triple keeps the
+to it, folded onto −179.5 below it (the slider's left end, §views). A pointer ON the center (a zero-length ray) or an uncalibrated triple keeps the
 previous axis. The pane slider writes the state directly.
 
 **Sanitizing.** Every pattern key is clamped by its watch and the clamped value written
@@ -682,8 +682,8 @@ swap first — firmware 2.2.1 accepts `START {id = new, t_start = the run's exac
 while the old table runs and switches tables in place, keeping the phase clock and the
 marker crossing state (no HOLD, no push; a marker is never doubled, and a marker moved
 before the swap phase first fires next cycle) — and falls back to the
-back-to-back STOP(old) + START(new, same `t_start`) pair only on a REJ "already running"
-(older firmware), so the new table joins the run's phase either way; any other REJ swaps
+back-to-back STOP(old) + START(new, same `t_start`) pair on a REJ "already running", and
+always on firmware below 2.2.1 (no atomic START is attempted there), so the new table joins the run's phase either way; any other REJ swaps
 nothing (the old table keeps running, the replace fails `running: true` — the decision
 table in controller.md); `perf.trajectory.last_swap` says which landed.
 An in-flight capture of the OLD table keeps pushing after the swap, so the host keeps the
@@ -885,6 +885,5 @@ Hardware-gated checks (`docs/hardware/rig.md` "MirrorLink scan pass"):
 - **Replace continuity.** A live steer / slider / axis drag while scanning moves the path
   without a visible stutter (a marker is never doubled; one moved before the swap phase
   first fires next cycle); `perf.trajectory.last_swap` reads
-
   `atomic` on firmware 2.2.1 (`stop-start` on 2.2.0).
 - **Teardown.** Leaving the app mid-scan returns the mirrors to the center pose.

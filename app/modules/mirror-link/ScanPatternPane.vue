@@ -18,7 +18,13 @@ import SingleSelect, {
 } from "@src/inputs/single-select.vue";
 import type { StateOf } from "@lib/orchestrator/protocol";
 import { mirrorLink, type ScanMode, type ScanWindow } from "./contract";
-import { SCAN_AMP_RANGE, SCAN_HZ_RANGE, WINDOW_MAX, WINDOW_MIN } from "./scan";
+import {
+  AXIS_SLIDER_RANGE,
+  SCAN_AMP_RANGE,
+  SCAN_HZ_RANGE,
+  WINDOW_MAX,
+  WINDOW_MIN,
+} from "./scan";
 
 /** `state`: the session's live `state` proxy (`useSession(...).state`) —
  *  writes go straight to the session, as with every other drawer control.
@@ -49,8 +55,8 @@ const ellipse = computed(() => state.scan_mode === "ellipse");
  *  the slider's domain; the proxy still clamps on READ as a guard (a direct
  *  state write the session only normalizes), keeping the thumb on the track
  *  and the arrow keys stepping from the shown value. */
-const AXIS_MIN = -179.5;
-const AXIS_MAX = 180;
+const AXIS_MIN = AXIS_SLIDER_RANGE.min;
+const AXIS_MAX = AXIS_SLIDER_RANGE.max;
 const axisDeg = computed<number>({
   get: () => Math.min(Math.max(state.scan_axis_deg, AXIS_MIN), AXIS_MAX),
   set: (v) => void (state.scan_axis_deg = v),

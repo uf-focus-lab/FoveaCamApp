@@ -408,13 +408,14 @@ Teensy DMAMEM, 80 KB, first-fit), `MAX_MARKERS = 8` per table.
   1 Hz MEMS refresh) until the next stream write — UPDATE, an applied keyframe,
   a CREATE that takes the DAC, or a CMD_FRAME activation — takes the DAC back.
 - While a trajectory runs (armed or playing) it owns the DAC: `CMD_STREAM UPDATE`,
-  `CMD_SCHEDULE` and `Command::Actuate` are REJected (`A trajectory owns the DAC
-  (STOP it first)`; silent for seq 0), and it owns the trigger lines: the legacy
-  `Command::Trigger` REJs `A trajectory owns the trigger lines (STOP it first)`.
-  Both work again once the run is over (`HOLD` after STOP/ENDED is not running —
-  an Actuate there writes the DAC and becomes the hold position, which the 1 Hz
-  refresh re-commits). Conversely, `START` REJs `A trigger is pending (legacy
-  Trigger) — wait for its FIN` while a legacy `Command::Trigger` is pending: its
+  `CMD_SCHEDULE` and (v2.2.1) `Command::Actuate` are REJected (`A trajectory owns
+  the DAC (STOP it first)`; silent for seq 0), and (v2.2.1) it owns the trigger
+  lines: the legacy `Command::Trigger` REJs `A trajectory owns the trigger lines
+  (STOP it first)`. Both work again once the run is over (`HOLD` after STOP/ENDED
+  is not running — an Actuate there writes the DAC and, from v2.2.1, becomes the
+  hold position, which the 1 Hz refresh re-commits). Conversely (v2.2.1), `START`
+  REJs `A trigger is pending (legacy Trigger) — wait for its FIN` while a legacy
+  `Command::Trigger` is pending: its
   FIN would drop the trigger lines mid-way through a marker's pulse. A host
   `CMD_FRAME` is still accepted: it cannot re-point the DAC, so it exposes at
   the trajectory's current position (and reports it), and any marker crossing

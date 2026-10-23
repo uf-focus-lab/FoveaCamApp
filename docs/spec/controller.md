@@ -166,7 +166,7 @@ stopping the scan. MirrorLink calls it on every steer drag or slider move, at mo
     | any other REJ | — | nothing stopped; `DELETE(new)` and unroute it at once | `running: true` |
     | no REJ (transport) | ACK | the old table runs, phase-continuously. Serial order puts the lost `START(new)` before the re-START, so the new table is not live. It may have played briefly: its id is graced, then DELETEd | `running: true`, `replacement: { id, maybeLive: false }` |
     | no REJ (transport) | REJ "already running" | AMBIGUOUS: the old table (or, if `START(new)` is still pending on the device, soon the new one) is live. Nothing is queried and nothing is DELETEd. Both ids stay routed to the listener set; the new id stays reserved as a *sibling* with no grace deadline | `running: true`, `replacement: { id, maybeLive: true }` |
-    | no REJ (transport) | fails otherwise | the run is over: best-effort `STOP(old)` and `DELETE(new)` (a DELETE halts a playing table), new id graced | `running: false` |
+    | no REJ (transport) | fails otherwise | the run is over: best-effort `STOP(old)` and `STOP(each sibling)` (graced + DELETEd where the STOP landed), `DELETE(new)` (a DELETE halts a playing table), new id graced | `running: false` |
 
     A sibling is retired by the handle's next running swap. The atomic START works
     whichever of the two tables plays; the pair also STOPs each sibling. A plain

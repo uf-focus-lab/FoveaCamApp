@@ -8,8 +8,18 @@
 // in the renderer `Controller.vue` (state is plain fields; the session reads and
 // broadcasts it). Owns the serial `Device`; reuses the shared DAC math.
 
-import { createMirrorSink, Protocol, Device, type LogLevel } from "core/Controller";
-import type { CameraName, FirmwareVersion, FrameArg, MirrorSink } from "core/Controller";
+import {
+  createMirrorSink,
+  Protocol,
+  Device,
+  type LogLevel,
+} from "core/Controller";
+import type {
+  CameraName,
+  FirmwareVersion,
+  FrameArg,
+  MirrorSink,
+} from "core/Controller";
 import type { TrajectoryFrame, TrajectoryStatus } from "core/Controller"; // v2.2.0
 import { SerialPort } from "serialport";
 import {
@@ -47,7 +57,11 @@ export const STREAM_MIN_UPDATE_INTERVAL_MS = 0.2;
 // (System::Reset MEMS type). Older firmware REJects the unknown enum, so
 // `recoverMems()`/`v21Capable` gate on this — the v2Capable major-only version
 // gate taken one level finer (major.minor.patch).
-export const RECOVER_MEMS_MIN_VERSION = { major: 2, minor: 1, patch: 0 } as const;
+export const RECOVER_MEMS_MIN_VERSION = {
+  major: 2,
+  minor: 1,
+  patch: 0,
+} as const;
 
 // Minimum firmware/protocol version for the v2.2.0 surfaces: CMD_SCHEDULE
 // (`StreamHandle.scheduleAt`) and CMD_TRAJECTORY (`uploadTrajectory`). Older
@@ -60,7 +74,11 @@ export const SCHEDULE_MIN_VERSION = { major: 2, minor: 2, patch: 0 } as const;
 // start (exact µs) — the firmware switches tables in place (no HOLD; a marker
 // is never doubled, and one moved before the swap phase first fires next
 // cycle). Older firmware REJs it "already running".
-export const ATOMIC_SWAP_MIN_VERSION = { major: 2, minor: 2, patch: 1 } as const;
+export const ATOMIC_SWAP_MIN_VERSION = {
+  major: 2,
+  minor: 2,
+  patch: 1,
+} as const;
 
 // Firmware limits (lib/Protocol/Packet.h Trajectory::CHUNK_SAMPLES,
 // firmware/include/Trajectory.h, Streams::SCHEDULE_DEPTH). Checked host-side so
@@ -99,7 +117,8 @@ export function chunkTrajectorySamples<T>(
   samples: readonly T[],
   size = TRAJECTORY_CHUNK_SAMPLES,
 ): Array<{ firstIndex: number; samples: T[] }> {
-  if (!Number.isInteger(size) || size < 1) throw new Error("chunk size must be >= 1");
+  if (!Number.isInteger(size) || size < 1)
+    throw new Error("chunk size must be >= 1");
   const out: Array<{ firstIndex: number; samples: T[] }> = [];
   for (let i = 0; i < samples.length; i += size)
     out.push({ firstIndex: i, samples: samples.slice(i, i + size) });
@@ -162,7 +181,9 @@ export class StreamUpdateGate {
    *  `streamMinIntervalMs`, read on every `accept`). */
   constructor(
     initial: { left: Pos; right: Pos },
-    private readonly minIntervalMs: number | (() => number) = STREAM_MIN_UPDATE_INTERVAL_MS,
+    private readonly minIntervalMs:
+      | number
+      | (() => number) = STREAM_MIN_UPDATE_INTERVAL_MS,
     now = performance.now(),
   ) {
     this.lastLeft = clonePos(initial.left);
@@ -171,10 +192,15 @@ export class StreamUpdateGate {
   }
 
   accept(next: { left: Pos; right: Pos }, now = performance.now()): boolean {
-    if (samePos(next.left, this.lastLeft) && samePos(next.right, this.lastRight))
+    if (
+      samePos(next.left, this.lastLeft) &&
+      samePos(next.right, this.lastRight)
+    )
       return false;
     const minIntervalMs =
-      typeof this.minIntervalMs === "function" ? this.minIntervalMs() : this.minIntervalMs;
+      typeof this.minIntervalMs === "function"
+        ? this.minIntervalMs()
+        : this.minIntervalMs;
     if (now - this.lastSentAt < minIntervalMs) return false;
     this.lastLeft = clonePos(next.left);
     this.lastRight = clonePos(next.right);
@@ -311,10 +337,11 @@ export interface TrajectoryHandle {
   /** Subscribe to this table's pushes; returns the unsubscribe function. */
   onFrame(cb: (frame: TrajectoryFrameOutcome) => void): () => void;
   /** PHASE-CONTINUOUS swap to a new spec of the SAME period while running:
-   *  upload `spec` to a second table id, STOP this one, START the new one at
-   *  this run's original `t_start` (so the MCU joins the new table at the
-   *  phase the old one was at), DELETE the old table, and carry this handle's
-   *  identity (listeners, `id` updates) over. A live steer or slider move in
+   *  upload `spec` to a second table id, then swap to it at this run's
+   *  original `t_start` (atomic START first, the STOP/START pair as the
+   *  fallback — wire order below; either way the MCU joins the new table at
+   *  the phase the old one was at), DELETE the old table, and carry this
+   *  handle's identity (listeners, `id` updates) over. A live steer or slider move in
    *  MirrorLink rides this. Resolves once the new table runs; throws (and
    *  leaves the old table running) if the upload fails. Not running → a plain
    *  re-upload that leaves the handle `ready`.
@@ -390,7 +417,10 @@ export class TrajectoryReplaceError extends Error {
  *  - `already-running`: REJ "A trajectory is already running (STOP it first)"
  *  - `rejected`: any other firmware START REJ
  *  - `transport`: no REJ (or an unrecognised message) */
-export type TrajectoryStartFailure = "already-running" | "rejected" | "transport";
+export type TrajectoryStartFailure =
+  | "already-running"
+  | "rejected"
+  | "transport";
 
 const TRAJECTORY_START_REJ_TEXTS: readonly RegExp[] = [
   /Unknown trajectory id/i,
@@ -403,10 +433,14 @@ const TRAJECTORY_START_REJ_TEXTS: readonly RegExp[] = [
   /Unknown packet type/i,
 ];
 
-export function classifyTrajectoryStartError(error: unknown): TrajectoryStartFailure {
+export function classifyTrajectoryStartError(
+  error: unknown,
+): TrajectoryStartFailure {
   const message = errorMessage(error);
   if (/already running/i.test(message)) return "already-running";
-  return TRAJECTORY_START_REJ_TEXTS.some((re) => re.test(message)) ? "rejected" : "transport";
+  return TRAJECTORY_START_REJ_TEXTS.some((re) => re.test(message))
+    ? "rejected"
+    : "transport";
 }
 
 function errorMessage(error: unknown): string {
@@ -419,20 +453,37 @@ export function validateTrajectorySpec(spec: TrajectorySpec): void {
   const { samples, periodUs, markers = [] } = spec;
   if (!Number.isInteger(periodUs) || periodUs <= 0 || periodUs > 0xffffffff)
     throw new Error("periodUs must be a positive integer (µs)");
-  if (samples.length === 0) throw new Error("a trajectory needs at least one sample");
+  if (samples.length === 0)
+    throw new Error("a trajectory needs at least one sample");
   if (samples.length > TRAJECTORY_MAX_SAMPLES)
-    throw new Error(`a trajectory holds at most ${TRAJECTORY_MAX_SAMPLES} samples`);
+    throw new Error(
+      `a trajectory holds at most ${TRAJECTORY_MAX_SAMPLES} samples`,
+    );
   samples.forEach((s, i) => {
-    if (!Number.isInteger(s.tOffsetUs) || s.tOffsetUs < 0 || s.tOffsetUs >= periodUs)
-      throw new Error(`sample ${i}: tOffsetUs must be an integer in [0, periodUs)`);
+    if (
+      !Number.isInteger(s.tOffsetUs) ||
+      s.tOffsetUs < 0 ||
+      s.tOffsetUs >= periodUs
+    )
+      throw new Error(
+        `sample ${i}: tOffsetUs must be an integer in [0, periodUs)`,
+      );
     if (i > 0 && s.tOffsetUs <= samples[i - 1].tOffsetUs)
       throw new Error(`sample ${i}: tOffsetUs must be strictly increasing`);
   });
   if (markers.length > TRAJECTORY_MAX_MARKERS)
-    throw new Error(`a trajectory holds at most ${TRAJECTORY_MAX_MARKERS} markers`);
+    throw new Error(
+      `a trajectory holds at most ${TRAJECTORY_MAX_MARKERS} markers`,
+    );
   markers.forEach((m, i) => {
-    if (!Number.isInteger(m.tOffsetUs) || m.tOffsetUs < 0 || m.tOffsetUs >= periodUs)
-      throw new Error(`marker ${i}: tOffsetUs must be an integer in [0, periodUs)`);
+    if (
+      !Number.isInteger(m.tOffsetUs) ||
+      m.tOffsetUs < 0 ||
+      m.tOffsetUs >= periodUs
+    )
+      throw new Error(
+        `marker ${i}: tOffsetUs must be an integer in [0, periodUs)`,
+      );
     if (!Number.isInteger(m.pulseUs) || m.pulseUs <= 0)
       throw new Error(`marker ${i}: pulseUs must be a positive integer`);
   });
@@ -767,7 +818,10 @@ export class Controller {
         settle_time: settleTime,
       }),
     );
-    const new_pos = { left: decodeChannels(left), right: decodeChannels(right) };
+    const new_pos = {
+      left: decodeChannels(left),
+      right: decodeChannels(right),
+    };
     this._pos = new_pos;
     return { ...new_pos, completeTime: complete_time ?? 0 };
   }
@@ -785,8 +839,12 @@ export class Controller {
    */
   predictVolts(pos: { left?: Pos; right?: Pos }): { left: Pos; right: Pos } {
     return {
-      left: decodeChannels(channels(pos.left ?? this._pos.left, this.bias, this.dv)),
-      right: decodeChannels(channels(pos.right ?? this._pos.right, this.bias, this.dv)),
+      left: decodeChannels(
+        channels(pos.left ?? this._pos.left, this.bias, this.dv),
+      ),
+      right: decodeChannels(
+        channels(pos.right ?? this._pos.right, this.bias, this.dv),
+      ),
     };
   }
 
@@ -919,7 +977,9 @@ export class Controller {
       nodeId,
     });
     // One tunable for both update paths: the native gate's emission floor.
-    sink.setGovernor?.({ minIntervalUs: Math.round(this.streamMinIntervalMs * 1000) });
+    sink.setGovernor?.({
+      minIntervalUs: Math.round(this.streamMinIntervalMs * 1000),
+    });
     let closed = false;
     return {
       sink,
@@ -990,7 +1050,10 @@ export class Controller {
   >();
   /** Per-id run tracking of the owning handle (a run-level ENDED/CANCELLED
    *  clears its running view) — routed with the listener set on a replace. */
-  private readonly trajectoryRunHooks = new Map<number, (f: TrajectoryFrame) => void>();
+  private readonly trajectoryRunHooks = new Map<
+    number,
+    (f: TrajectoryFrame) => void
+  >();
   /** Retired table ids in their GRACE period (`trajectoryGraceUs`): id →
    *  host-steady ns deadline. Until then the id's pushes still reach the
    *  retiring handle's listener set (a marker capture in flight at the swap
@@ -1047,11 +1110,15 @@ export class Controller {
   ): void {
     this.trajectoryRunHooks.delete(id);
     if (graceUs <= 0) {
-      if (this.trajectoryListeners.get(id) === listeners) this.trajectoryListeners.delete(id);
+      if (this.trajectoryListeners.get(id) === listeners)
+        this.trajectoryListeners.delete(id);
       return;
     }
     this.trajectoryListeners.set(id, listeners);
-    this.trajectoryGrace.set(id, hostNowNs() + BigInt(Math.ceil(graceUs)) * 1000n);
+    this.trajectoryGrace.set(
+      id,
+      hostNowNs() + BigInt(Math.ceil(graceUs)) * 1000n,
+    );
   }
 
   /** Expire every grace entry whose deadline has passed (or every entry
@@ -1075,16 +1142,24 @@ export class Controller {
     for (;;) {
       this.sweepTrajectoryGrace();
       for (let candidate = 0; candidate < TRAJECTORY_MAX_TABLES; candidate++)
-        if (!this.trajectoryIds.has(candidate) && !this.trajectoryGrace.has(candidate)) {
+        if (
+          !this.trajectoryIds.has(candidate) &&
+          !this.trajectoryGrace.has(candidate)
+        ) {
           this.trajectoryIds.add(candidate);
           return candidate;
         }
       if (this.trajectoryGrace.size === 0)
-        throw new Error(`Trajectory capacity (${TRAJECTORY_MAX_TABLES} tables) exceeded`);
+        throw new Error(
+          `Trajectory capacity (${TRAJECTORY_MAX_TABLES} tables) exceeded`,
+        );
       let earliest: bigint | null = null;
       for (const until of this.trajectoryGrace.values())
         if (earliest === null || until < earliest) earliest = until;
-      const waitMs = Math.max(1, Math.ceil(Number(earliest! - hostNowNs()) / 1e6));
+      const waitMs = Math.max(
+        1,
+        Math.ceil(Number(earliest! - hostNowNs()) / 1e6),
+      );
       await new Promise((r) => setTimeout(r, waitMs));
       this.sweepTrajectoryGrace(earliest!);
     }
@@ -1116,17 +1191,18 @@ export class Controller {
       });
       const chunks = chunkTrajectorySamples(spec.samples);
       await pipelined(
-        chunks.map((chunk) => () =>
-          this.set(Trajectory, {
-            op: "DATA",
-            id,
-            first_index: chunk.firstIndex,
-            samples: chunk.samples.map((s) => ({
-              t_offset: s.tOffsetUs,
-              left: channels(s.left, this.bias, this.dv),
-              right: channels(s.right, this.bias, this.dv),
-            })),
-          }),
+        chunks.map(
+          (chunk) => () =>
+            this.set(Trajectory, {
+              op: "DATA",
+              id,
+              first_index: chunk.firstIndex,
+              samples: chunk.samples.map((s) => ({
+                t_offset: s.tOffsetUs,
+                left: channels(s.left, this.bias, this.dv),
+                right: channels(s.right, this.bias, this.dv),
+              })),
+            }),
         ),
         TRAJECTORY_UPLOAD_WINDOW,
       );
@@ -1191,9 +1267,14 @@ export class Controller {
     // "now" start (t_start = 0 on the wire; the carried phase is then
     // approximate to the serial latency). `replace` re-STARTs the new table
     // at it.
-    let run: { tStartMcuUs: bigint; cycles: number; exact: boolean } | null = null;
+    let run: { tStartMcuUs: bigint; cycles: number; exact: boolean } | null =
+      null;
     const runHook = (f: TrajectoryFrame) => {
-      if (f.marker === null && (f.status === "ENDED" || f.status === "CANCELLED")) run = null;
+      if (
+        f.marker === null &&
+        (f.status === "ENDED" || f.status === "CANCELLED")
+      )
+        run = null;
     };
     /** Route `to`'s pushes to this handle (listeners + run hook). */
     const route = (to: number) => {
@@ -1202,13 +1283,19 @@ export class Controller {
     };
     /** Forget `from`'s routing iff it is still this handle's. */
     const unroute = (from: number) => {
-      if (this.trajectoryListeners.get(from) === listeners) this.trajectoryListeners.delete(from);
-      if (this.trajectoryRunHooks.get(from) === runHook) this.trajectoryRunHooks.delete(from);
+      if (this.trajectoryListeners.get(from) === listeners)
+        this.trajectoryListeners.delete(from);
+      if (this.trajectoryRunHooks.get(from) === runHook)
+        this.trajectoryRunHooks.delete(from);
     };
     /** Retire `table` (spec `of`, STARTed iff `wasPlayed`): grace its id when
      *  a capture of it may still be in flight, else unroute it at once. */
     const retire = (table: number, of: TrajectorySpec, wasPlayed: boolean) =>
-      this.graceTrajectoryId(table, listeners, wasPlayed ? trajectoryGraceUs(of) : 0);
+      this.graceTrajectoryId(
+        table,
+        listeners,
+        wasPlayed ? trajectoryGraceUs(of) : 0,
+      );
     route(id);
     let disposed = false;
     // SERIALIZATION: start / stop / replace run one at a time, in call order,
@@ -1246,7 +1333,8 @@ export class Controller {
      *  table up. */
     const drop = async (table: number) => {
       try {
-        if (this.device.connected) await this.sendTrajectory({ op: "DELETE", id: table });
+        if (this.device.connected)
+          await this.sendTrajectory({ op: "DELETE", id: table });
       } catch {
         // best-effort — a dead/REJecting device
       } finally {
@@ -1254,7 +1342,9 @@ export class Controller {
       }
     };
     /** Grace + DELETE every sibling in `ids` (default: all). */
-    const dropSiblings = async (ids: Iterable<number> = [...siblings.keys()]) => {
+    const dropSiblings = async (
+      ids: Iterable<number> = [...siblings.keys()],
+    ) => {
       const gone: number[] = [];
       for (const sid of ids) {
         const sspec = siblings.get(sid);
@@ -1282,7 +1372,9 @@ export class Controller {
       id = newId;
       current = next;
       played = nowPlaying;
-      const retired = [{ id: oldId, graceUs: oldPlayed ? trajectoryGraceUs(old) : 0 }];
+      const retired = [
+        { id: oldId, graceUs: oldPlayed ? trajectoryGraceUs(old) : 0 },
+      ];
       retire(oldId, old, oldPlayed);
       for (const [sid, sspec] of siblings) {
         retire(sid, sspec, true);
@@ -1334,7 +1426,8 @@ export class Controller {
        *  exactly that t_start, so the run's anchor is EXACT from now on and
        *  later replaces may try the atomic START (even after a "now" start). */
       const anchorExact = () => {
-        if (run === carried && !carried.exact) run = { ...carried, exact: true };
+        if (run === carried && !carried.exact)
+          run = { ...carried, exact: true };
       };
       const startTable = (table: number) =>
         this.sendTrajectory({
@@ -1357,7 +1450,8 @@ export class Controller {
         try {
           await startTable(newId);
           lastSwap = "atomic";
-          for (const gone of swapTo(newId, next, true, onSwap)) await drop(gone);
+          for (const gone of swapTo(newId, next, true, onSwap))
+            await drop(gone);
           return;
         } catch (error) {
           const kind = classifyTrajectoryStartError(error);
@@ -1412,13 +1506,20 @@ export class Controller {
               );
             }
             // The re-START failed otherwise: the run is over. Make it so —
-            // STOP(old) and DELETE(new) (a DELETE halts a playing table).
+            // STOP(old) and every sibling (one may be the table actually
+            // playing), DELETE(new) (a DELETE halts a playing table).
             if (run === carried) run = null;
-            try {
-              if (this.device.connected) await this.sendTrajectory({ op: "STOP", id: oldId });
-            } catch {
-              // best-effort
-            }
+            const sibIds = [...siblings.keys()];
+            const stops = this.device.connected
+              ? await Promise.allSettled(
+                  [oldId, ...sibIds].map((sid) =>
+                    this.sendTrajectory({ op: "STOP", id: sid }),
+                  ),
+                )
+              : [];
+            await dropSiblings(
+              sibIds.filter((_, i) => stops[i + 1]?.status === "fulfilled"),
+            );
             retire(newId, next, true);
             await drop(newId);
             throw new TrajectoryReplaceError(
@@ -1451,12 +1552,15 @@ export class Controller {
         return;
       }
       // Siblings that took their STOP are done with.
-      await dropSiblings(sibIds.filter((_, i) => sibStops[i]?.status === "fulfilled"));
+      await dropSiblings(
+        sibIds.filter((_, i) => sibStops[i]?.status === "fulfilled"),
+      );
       // START(new) failed: retire it (in grace when it failed without a REJ —
       // it may have started); if STOP(old) went through, re-START the old
       // table at the same t_start (phase-continuous again) so the scan keeps
       // running on the old spec.
-      const startUnknown = classifyTrajectoryStartError(started.reason) === "transport";
+      const startUnknown =
+        classifyTrajectoryStartError(started.reason) === "transport";
       if (startUnknown) retire(newId, next, true);
       else unroute(newId);
       await drop(newId);
@@ -1472,7 +1576,9 @@ export class Controller {
       }
       throw new TrajectoryReplaceError(
         `Trajectory ${oldId}: START of the replacement table failed (${errorMessage(started.reason)})` +
-          (running ? " — still running the previous spec" : " and the old table could not be restarted"),
+          (running
+            ? " — still running the previous spec"
+            : " and the old table could not be restarted"),
         running,
         started.reason,
         startUnknown ? { id: newId, maybeLive: false } : null,
@@ -1491,13 +1597,17 @@ export class Controller {
         return serialize(async () => {
           live("start");
           const tStart =
-            atHostNs === undefined ? 0n : hostNsToMcuUs(atHostNs, this._clockOffsetNs);
+            atHostNs === undefined
+              ? 0n
+              : hostNsToMcuUs(atHostNs, this._clockOffsetNs);
           // A "now" start has no exact MCU instant: estimate it from the host
           // clock at send time (off by the serial latency). An explicit
           // instant that clamped to 0n (before the MCU epoch) is a "now"
           // start too.
           const exact = tStart !== 0n;
-          const anchor = exact ? tStart : hostNsToMcuUs(hostNowNs(), this._clockOffsetNs);
+          const anchor = exact
+            ? tStart
+            : hostNsToMcuUs(hostNowNs(), this._clockOffsetNs);
           // Conservatively "played" from the write on (a lost ACK may still
           // have started it).
           played = true;
@@ -1517,9 +1627,13 @@ export class Controller {
           const sibIds = [...siblings.keys()];
           const [own, ...sibStops] = await Promise.allSettled([
             this.sendTrajectory({ op: "STOP", id }),
-            ...sibIds.map((sid) => this.sendTrajectory({ op: "STOP", id: sid })),
+            ...sibIds.map((sid) =>
+              this.sendTrajectory({ op: "STOP", id: sid }),
+            ),
           ]);
-          await dropSiblings(sibIds.filter((_, i) => sibStops[i]?.status === "fulfilled"));
+          await dropSiblings(
+            sibIds.filter((_, i) => sibStops[i]?.status === "fulfilled"),
+          );
           if (own.status === "rejected") throw own.reason;
           run = null;
         });
@@ -1548,9 +1662,13 @@ export class Controller {
           listeners.delete(cb);
         };
       },
-      replace: async (next: TrajectorySpec, opts?: TrajectoryReplaceOptions) => {
+      replace: async (
+        next: TrajectorySpec,
+        opts?: TrajectoryReplaceOptions,
+      ) => {
         live("replace");
-        if (replacing) throw new Error(`Trajectory ${id}: a replace is already in flight`);
+        if (replacing)
+          throw new Error(`Trajectory ${id}: a replace is already in flight`);
         replacing = true;
         try {
           await serialize(() => doReplace(next, opts?.onSwap));

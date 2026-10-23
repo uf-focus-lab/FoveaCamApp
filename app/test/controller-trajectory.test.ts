@@ -53,7 +53,9 @@ vi.mock("core/Controller", () => {
         mockTimeline.push(`send:${arg.op}:${arg.id}`);
         const delay = mockOps.delayMs[arg.op];
         if (delay) await new Promise((r) => setTimeout(r, delay));
-        const i = mockOps.reject.findIndex((r) => r.op === arg.op && r.id === arg.id);
+        const i = mockOps.reject.findIndex(
+          (r) => r.op === arg.op && r.id === arg.id,
+        );
         if (i >= 0) {
           const [r] = mockOps.reject.splice(i, 1);
           mockTimeline.push(`rej:${arg.op}:${arg.id}`);
@@ -64,7 +66,10 @@ vi.mock("core/Controller", () => {
       }
       if (prop === "Trajectory" && arg.op === "DATA") {
         mockData.inFlight++;
-        mockData.maxInFlight = Math.max(mockData.maxInFlight, mockData.inFlight);
+        mockData.maxInFlight = Math.max(
+          mockData.maxInFlight,
+          mockData.inFlight,
+        );
         await new Promise((r) => setTimeout(r, mockData.delayMs));
         mockData.inFlight--;
         if (arg.first_index === mockData.rejectAt)
@@ -74,7 +79,13 @@ vi.mock("core/Controller", () => {
     });
   }
   const Protocol = {
-    System: { Enable: "Enable", Info: "Info", Version: "Version", Reset: "Reset", Timestamp: "Timestamp" },
+    System: {
+      Enable: "Enable",
+      Info: "Info",
+      Version: "Version",
+      Reset: "Reset",
+      Timestamp: "Timestamp",
+    },
     Config: { Log: "Log", LPF: "LPF", Bias: "Bias" },
     Command: {
       Actuate: "Actuate",
@@ -110,7 +121,9 @@ const BIAS = dac2volt(29490);
 const DV = 170;
 const P0 = { x: 0, y: 0 };
 
-async function makeController(fw = { major: 2, minor: 2, patch: 0 }): Promise<Controller> {
+async function makeController(
+  fw = { major: 2, minor: 2, patch: 0 },
+): Promise<Controller> {
   Object.assign(mockFirmware, fw);
   const ctrl = new Controller({ path: "/dev/fake-controller" } as never);
   await ctrl.ready;
@@ -140,7 +153,9 @@ function pinHostClock(startNs = 10_000_000_000n): (us: number) => void {
 }
 
 const trajectoryOps = () =>
-  mockCalls.filter((c) => c.prop === "Trajectory").map((c) => c.arg.op as string);
+  mockCalls
+    .filter((c) => c.prop === "Trajectory")
+    .map((c) => c.arg.op as string);
 
 describe("v2.2.0 pure helpers", () => {
   it("converts host-steady ns to MCU µs through the clock offset (FIN inverse)", () => {
@@ -150,7 +165,9 @@ describe("v2.2.0 pure helpers", () => {
     expect(hostNsToMcuUs(offset + 1_500n, offset)).toBe(2n);
     expect(hostNsToMcuUs(offset - 10n, offset)).toBe(0n); // before the MCU epoch
     // Round trip with the FIN decode direction.
-    expect(hostNsToMcuUs(mcuUsToHostNs(987_654_321n, offset), offset)).toBe(987_654_321n);
+    expect(hostNsToMcuUs(mcuUsToHostNs(987_654_321n, offset), offset)).toBe(
+      987_654_321n,
+    );
     expect(hostNsToMcuUs(42_000n, 0n)).toBe(42n); // uncalibrated: raw µs ×1000
   });
 
@@ -170,8 +187,12 @@ describe("v2.2.0 pure helpers", () => {
 
   it("validates a spec against the firmware limits", () => {
     expect(() => validateTrajectorySpec(spec(25))).not.toThrow();
-    expect(() => validateTrajectorySpec({ ...spec(2), periodUs: 0 })).toThrow(/periodUs/);
-    expect(() => validateTrajectorySpec({ periodUs: 100, samples: [] })).toThrow(/at least one/);
+    expect(() => validateTrajectorySpec({ ...spec(2), periodUs: 0 })).toThrow(
+      /periodUs/,
+    );
+    expect(() =>
+      validateTrajectorySpec({ periodUs: 100, samples: [] }),
+    ).toThrow(/at least one/);
     expect(() =>
       validateTrajectorySpec({
         periodUs: 100,
@@ -182,16 +203,25 @@ describe("v2.2.0 pure helpers", () => {
       }),
     ).toThrow(/strictly increasing/);
     expect(() =>
-      validateTrajectorySpec({ periodUs: 100, samples: [{ tOffsetUs: 100, left: P0, right: P0 }] }),
+      validateTrajectorySpec({
+        periodUs: 100,
+        samples: [{ tOffsetUs: 100, left: P0, right: P0 }],
+      }),
     ).toThrow(/\[0, periodUs\)/);
     expect(() =>
       validateTrajectorySpec({
         ...spec(2, 100),
-        markers: Array.from({ length: 9 }, () => ({ tOffsetUs: 1, pulseUs: 1 })),
+        markers: Array.from({ length: 9 }, () => ({
+          tOffsetUs: 1,
+          pulseUs: 1,
+        })),
       }),
     ).toThrow(/at most 8 markers/);
     expect(() =>
-      validateTrajectorySpec({ ...spec(2, 100), markers: [{ tOffsetUs: 1, pulseUs: 0 }] }),
+      validateTrajectorySpec({
+        ...spec(2, 100),
+        markers: [{ tOffsetUs: 1, pulseUs: 0 }],
+      }),
     ).toThrow(/pulseUs/);
   });
 });
@@ -210,7 +240,9 @@ describe("StreamHandle.scheduleAt (CMD_SCHEDULE)", () => {
     const stream = await ctrl.createStream({ left: P0, right: P0 });
     mockCalls.length = 0;
     const pos = { left: { x: 3, y: -2 }, right: { x: 1, y: 1 } };
-    stream.scheduleAt(1_000_000_000n + 250_000_000n, pos, { interpolate: true });
+    stream.scheduleAt(1_000_000_000n + 250_000_000n, pos, {
+      interpolate: true,
+    });
     stream.scheduleAt(1_000_000_000n + 260_000_000n, pos); // no gate/dedupe
     expect(mockCalls).toHaveLength(2);
     const [k] = mockCalls;
@@ -233,7 +265,9 @@ describe("StreamHandle.scheduleAt (CMD_SCHEDULE)", () => {
     expect(ctrl.v22Capable).toBe(false);
     const stream = await ctrl.createStream({ left: P0, right: P0 });
     mockCalls.length = 0;
-    expect(() => stream.scheduleAt(1n, { left: P0, right: P0 })).toThrow(/2\.2\.0/);
+    expect(() => stream.scheduleAt(1n, { left: P0, right: P0 })).toThrow(
+      /2\.2\.0/,
+    );
     expect(mockCalls).toHaveLength(0);
   });
 
@@ -259,7 +293,12 @@ describe("Controller.uploadTrajectory (CMD_TRAJECTORY)", () => {
     mockCalls.length = 0;
     mockPush.cb = null;
     mockPush.binds = 0;
-    Object.assign(mockData, { inFlight: 0, maxInFlight: 0, rejectAt: -1, delayMs: 0 });
+    Object.assign(mockData, {
+      inFlight: 0,
+      maxInFlight: 0,
+      rejectAt: -1,
+      delayMs: 0,
+    });
     setHostClock(() => process.hrtime.bigint());
   });
 
@@ -268,9 +307,22 @@ describe("Controller.uploadTrajectory (CMD_TRAJECTORY)", () => {
     const s = spec(25);
     const handle = await ctrl.uploadTrajectory(s);
     expect(handle.id).toBe(0);
-    expect(trajectoryOps()).toEqual(["BEGIN", "DATA", "DATA", "DATA", "MARK", "COMMIT"]);
+    expect(trajectoryOps()).toEqual([
+      "BEGIN",
+      "DATA",
+      "DATA",
+      "DATA",
+      "MARK",
+      "COMMIT",
+    ]);
     const calls = mockCalls.filter((c) => c.prop === "Trajectory");
-    expect(calls[0].arg).toEqual({ op: "BEGIN", id: 0, sample_count: 25, period: 20_000, step: false });
+    expect(calls[0].arg).toEqual({
+      op: "BEGIN",
+      id: 0,
+      sample_count: 25,
+      period: 20_000,
+      step: false,
+    });
     const data = calls.filter((c) => c.arg.op === "DATA").map((c) => c.arg);
     expect(data.map((d) => [d.first_index, d.samples.length])).toEqual([
       [0, 12],
@@ -315,8 +367,15 @@ describe("Controller.uploadTrajectory (CMD_TRAJECTORY)", () => {
     await handle.start(5_000_000n + 2_000_000_000n, 10);
     await handle.start();
     await handle.stop();
-    const ops = mockCalls.filter((c) => c.prop === "Trajectory").map((c) => c.arg);
-    expect(ops[0]).toEqual({ op: "START", id: 0, t_start: 2_000_000n, cycles: 10 });
+    const ops = mockCalls
+      .filter((c) => c.prop === "Trajectory")
+      .map((c) => c.arg);
+    expect(ops[0]).toEqual({
+      op: "START",
+      id: 0,
+      t_start: 2_000_000n,
+      cycles: 10,
+    });
     expect(ops[1]).toEqual({ op: "START", id: 0, t_start: 0n, cycles: 0 }); // now, forever
     expect(ops[2]).toEqual({ op: "STOP", id: 0 });
 
@@ -374,12 +433,25 @@ describe("Controller.uploadTrajectory (CMD_TRAJECTORY)", () => {
       marker: 0,
       cycle: 3,
       status: "OK",
-      result: { stream: 0, frame_id: 17, t_trigger: 100n, t_exposure: 600n, left, right },
+      result: {
+        stream: 0,
+        frame_id: 17,
+        t_trigger: 100n,
+        t_exposure: 600n,
+        left,
+        right,
+      },
     });
     expect(gotB).toHaveLength(0);
     expect(gotA).toHaveLength(1);
     const f = gotA[0];
-    expect(f).toMatchObject({ trajectoryId: 0, marker: 0, cycle: 3, status: "OK", frameId: 17 });
+    expect(f).toMatchObject({
+      trajectoryId: 0,
+      marker: 0,
+      cycle: 3,
+      status: "OK",
+      frameId: 17,
+    });
     expect(f.tTrigger).toBe(100n * 1000n + 7_000n); // trusted host-steady ns
     expect(f.tExposure).toBe(600n * 1000n + 7_000n);
     expect(f.left.x).toBeCloseTo(2, 2);
@@ -392,7 +464,14 @@ describe("Controller.uploadTrajectory (CMD_TRAJECTORY)", () => {
       marker: null,
       cycle: 10,
       status: "ENDED",
-      result: { stream: 0, frame_id: 0, t_trigger: 0n, t_exposure: 0n, left: [0, 0, 0, 0], right: [0, 0, 0, 0] },
+      result: {
+        stream: 0,
+        frame_id: 0,
+        t_trigger: 0n,
+        t_exposure: 0n,
+        left: [0, 0, 0, 0],
+        right: [0, 0, 0, 0],
+      },
     });
     expect(gotA[1]).toMatchObject({ marker: null, status: "ENDED", cycle: 10 });
     offA();
@@ -401,17 +480,27 @@ describe("Controller.uploadTrajectory (CMD_TRAJECTORY)", () => {
       marker: 0,
       cycle: 11,
       status: "OK",
-      result: { stream: 0, frame_id: 18, t_trigger: 1n, t_exposure: 2n, left, right },
+      result: {
+        stream: 0,
+        frame_id: 18,
+        t_trigger: 1n,
+        t_exposure: 2n,
+        left,
+        right,
+      },
     });
     expect(gotA).toHaveLength(2);
   });
 
   it("caps the table count, gates the version, and validates before the wire", async () => {
     ctrl = await makeController();
-    for (let i = 0; i < TRAJECTORY_MAX_TABLES; i++) await ctrl.uploadTrajectory(spec(2));
+    for (let i = 0; i < TRAJECTORY_MAX_TABLES; i++)
+      await ctrl.uploadTrajectory(spec(2));
     await expect(ctrl.uploadTrajectory(spec(2))).rejects.toThrow(/capacity/);
     mockCalls.length = 0;
-    await expect(ctrl.uploadTrajectory({ periodUs: 10, samples: [] })).rejects.toThrow();
+    await expect(
+      ctrl.uploadTrajectory({ periodUs: 10, samples: [] }),
+    ).rejects.toThrow();
     expect(mockCalls).toHaveLength(0);
     ctrl.release();
 
@@ -423,7 +512,9 @@ describe("Controller.uploadTrajectory (CMD_TRAJECTORY)", () => {
   it("DELETEs a partial table and frees the id when a chunk is REJected", async () => {
     ctrl = await makeController();
     mockData.rejectAt = 12;
-    await expect(ctrl.uploadTrajectory(spec(30))).rejects.toThrow(/past the end/);
+    await expect(ctrl.uploadTrajectory(spec(30))).rejects.toThrow(
+      /past the end/,
+    );
     const ops = trajectoryOps();
     expect(ops[0]).toBe("BEGIN");
     expect(ops.at(-1)).toBe("DELETE");
@@ -446,7 +537,12 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
     mockPush.binds = 0;
     mockOps.reject.length = 0;
     mockOps.delayMs = {};
-    Object.assign(mockData, { inFlight: 0, maxInFlight: 0, rejectAt: -1, delayMs: 0 });
+    Object.assign(mockData, {
+      inFlight: 0,
+      maxInFlight: 0,
+      rejectAt: -1,
+      delayMs: 0,
+    });
     setHostClock(() => process.hrtime.bigint());
   });
 
@@ -455,7 +551,10 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
     const s = spec(n, periodUs);
     return {
       ...s,
-      samples: s.samples.map((x) => ({ ...x, left: { x: x.left.x + 1, y: 2 } })),
+      samples: s.samples.map((x) => ({
+        ...x,
+        left: { x: x.left.x + 1, y: 2 },
+      })),
       markers: [{ tOffsetUs: 1_000, pulseUs: 3_000 }],
     };
   }
@@ -482,7 +581,8 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
 
   /** Poll (real time) until `cond` holds. */
   const until = async (cond: () => boolean) => {
-    for (let i = 0; i < 500 && !cond(); i++) await new Promise((r) => setTimeout(r, 1));
+    for (let i = 0; i < 500 && !cond(); i++)
+      await new Promise((r) => setTimeout(r, 1));
     expect(cond()).toBe(true);
   };
 
@@ -517,9 +617,17 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
       "DELETE",
     ]);
     const calls = wireOps();
-    expect(calls[0]).toEqual({ op: "BEGIN", id: 1, sample_count: 25, period: 20_000, step: false });
+    expect(calls[0]).toEqual({
+      op: "BEGIN",
+      id: 1,
+      sample_count: 25,
+      period: 20_000,
+      step: false,
+    });
     expect(calls.slice(1, 6).every((a) => a.id === 1)).toBe(true);
-    expect(calls[1].samples[0].left).toEqual(channels(next.samples[0].left, BIAS, DV));
+    expect(calls[1].samples[0].left).toEqual(
+      channels(next.samples[0].left, BIAS, DV),
+    );
     expect(calls[4]).toEqual({
       op: "MARK",
       id: 1,
@@ -531,7 +639,12 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
     expect(calls[6]).toEqual({ op: "STOP", id: 0 });
     // The exact MCU t_start the run was started with — the firmware joins it
     // in progress, so the phase carries over.
-    expect(calls[7]).toEqual({ op: "START", id: 1, t_start: 2_000_000n, cycles: 0 });
+    expect(calls[7]).toEqual({
+      op: "START",
+      id: 1,
+      t_start: 2_000_000n,
+      cycles: 0,
+    });
     expect(calls[8]).toEqual({ op: "DELETE", id: 0 });
     expect(handle.id).toBe(1);
     expect(handle.lastSwap).toBe("stop-start"); // 2.2.0: no atomic START
@@ -571,12 +684,22 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
     setHostClock(() => now);
     const handle = await ctrl.uploadTrajectory(spec(4));
     await handle.start(undefined, 50);
-    expect(wireOps().at(-1)).toEqual({ op: "START", id: 0, t_start: 0n, cycles: 50 });
+    expect(wireOps().at(-1)).toEqual({
+      op: "START",
+      id: 0,
+      t_start: 0n,
+      cycles: 50,
+    });
     now += 1_000_000_000n; // a second later: the anchor stays the START instant
     mockCalls.length = 0;
     await handle.replace(reshaped(4));
     const start = wireOps().find((a) => a.op === "START");
-    expect(start).toEqual({ op: "START", id: 1, t_start: 3_000_000n, cycles: 50 });
+    expect(start).toEqual({
+      op: "START",
+      id: 1,
+      t_start: 3_000_000n,
+      cycles: 50,
+    });
   });
 
   it("keeps the listener set: new-id pushes reach it, the old id stays routed for its grace", async () => {
@@ -636,7 +759,9 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
     await handle.replace(reshaped(4));
     push(0, { marker: null, status: "CANCELLED", cycle: 0 });
     // Still running: a period change is refused.
-    await expect(handle.replace(reshaped(4, 40_000))).rejects.toThrow(/same period/);
+    await expect(handle.replace(reshaped(4, 40_000))).rejects.toThrow(
+      /same period/,
+    );
   });
 
   it("dispose honors the grace: the id is not reused and its stragglers reach nobody", async () => {
@@ -693,8 +818,12 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
 
   it("refuses a period change while running before anything is sent", async () => {
     const handle = await running();
-    await expect(handle.replace(reshaped(4, 40_000))).rejects.toThrow(/same period/);
-    await expect(handle.replace({ periodUs: 10, samples: [] })).rejects.toThrow(/at least one/);
+    await expect(handle.replace(reshaped(4, 40_000))).rejects.toThrow(
+      /same period/,
+    );
+    await expect(handle.replace({ periodUs: 10, samples: [] })).rejects.toThrow(
+      /at least one/,
+    );
     expect(mockCalls).toHaveLength(0);
     expect(handle.id).toBe(0);
   });
@@ -708,7 +837,13 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
     await handle.stop();
     mockCalls.length = 0;
     await handle.replace(reshaped(4, 40_000));
-    expect(trajectoryOps()).toEqual(["BEGIN", "DATA", "MARK", "COMMIT", "DELETE"]);
+    expect(trajectoryOps()).toEqual([
+      "BEGIN",
+      "DATA",
+      "MARK",
+      "COMMIT",
+      "DELETE",
+    ]);
     expect(wireOps().at(-1)).toEqual({ op: "DELETE", id: 0 });
     expect(handle.id).toBe(1);
     // The swapped handle starts / disposes the NEW table.
@@ -761,7 +896,13 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
     expect((second as TrajectoryReplaceError).running).toBe(false);
     mockCalls.length = 0;
     await handle.replace(reshaped(4, 40_000));
-    expect(trajectoryOps()).toEqual(["BEGIN", "DATA", "MARK", "COMMIT", "DELETE"]);
+    expect(trajectoryOps()).toEqual([
+      "BEGIN",
+      "DATA",
+      "MARK",
+      "COMMIT",
+      "DELETE",
+    ]);
   });
 
   it("one replace at a time; dispose waits for it and deletes the swapped table", async () => {
@@ -823,7 +964,9 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
       // The upload of the new table only begins after START(0)'s ACK, and
       // the swap is a running one: STOP(0) + START(1) — never a plain
       // re-upload that DELETEs the starting table.
-      expect(sent.indexOf("ack:START:0")).toBeLessThan(sent.indexOf("send:BEGIN:1"));
+      expect(sent.indexOf("ack:START:0")).toBeLessThan(
+        sent.indexOf("send:BEGIN:1"),
+      );
       expect(wireOps().slice(-3)).toEqual([
         { op: "STOP", id: 0 },
         { op: "START", id: 1, t_start: 2_000_000n, cycles: 0 },
@@ -843,7 +986,9 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
       const stopped = handle.stop();
       const replaced = handle.replace(reshaped(4, 40_000)); // stopped by then: any period
       await Promise.all([started, stopped, replaced]);
-      const sent = mockTimeline.filter((e) => /^(send|ack):(START|STOP|BEGIN)/.test(e));
+      const sent = mockTimeline.filter((e) =>
+        /^(send|ack):(START|STOP|BEGIN)/.test(e),
+      );
       expect(sent).toEqual([
         "send:START:0",
         "ack:START:0",
@@ -886,7 +1031,14 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
       handle.onFrame((f) => got.push(f));
       expect(handle.lastSwap).toBeNull();
       await handle.replace(reshaped(4));
-      expect(trajectoryOps()).toEqual(["BEGIN", "DATA", "MARK", "COMMIT", "START", "DELETE"]);
+      expect(trajectoryOps()).toEqual([
+        "BEGIN",
+        "DATA",
+        "MARK",
+        "COMMIT",
+        "START",
+        "DELETE",
+      ]);
       expect(wireOps().slice(-2)).toEqual([
         { op: "START", id: 1, t_start: 2_000_000n, cycles: 0 },
         { op: "DELETE", id: 0 },
@@ -907,7 +1059,11 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
         message: "A trajectory is already running (STOP it first)",
       });
       await handle.replace(reshaped(4));
-      expect(mockTimeline.filter((e) => e.startsWith("send:") || e.startsWith("rej:"))).toEqual([
+      expect(
+        mockTimeline.filter(
+          (e) => e.startsWith("send:") || e.startsWith("rej:"),
+        ),
+      ).toEqual([
         "send:BEGIN:1",
         "send:MARK:1",
         "send:COMMIT:1",
@@ -928,7 +1084,11 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
 
     it("any other REJ of the atomic START stops nothing: TrajectoryReplaceError, still running", async () => {
       const handle = await running(FW_221);
-      mockOps.reject.push({ op: "START", id: 1, message: "Trajectory not committed (COMMIT first)" });
+      mockOps.reject.push({
+        op: "START",
+        id: 1,
+        message: "Trajectory not committed (COMMIT first)",
+      });
       const error = await handle.replace(reshaped(4)).catch((e: unknown) => e);
       expect(error).toBeInstanceOf(TrajectoryReplaceError);
       expect((error as TrajectoryReplaceError).running).toBe(true);
@@ -940,7 +1100,9 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
       expect(handle.id).toBe(0);
       expect(handle.lastSwap).toBeNull();
       // The never-started new id is free at once; still running → same period.
-      await expect(handle.replace(reshaped(4, 40_000))).rejects.toThrow(/same period/);
+      await expect(handle.replace(reshaped(4, 40_000))).rejects.toThrow(
+        /same period/,
+      );
       mockCalls.length = 0;
       await handle.replace(reshaped(4));
       expect(wireOps().find((a) => a.op === "BEGIN")).toMatchObject({ id: 1 });
@@ -972,7 +1134,14 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
       expect(anchor).toBe(3_000_000n); // the send-time estimate, now on the wire
       mockCalls.length = 0;
       await handle.replace(spec(4));
-      expect(trajectoryOps()).toEqual(["BEGIN", "DATA", "MARK", "COMMIT", "START", "DELETE"]);
+      expect(trajectoryOps()).toEqual([
+        "BEGIN",
+        "DATA",
+        "MARK",
+        "COMMIT",
+        "START",
+        "DELETE",
+      ]);
       // id 0 is still in its grace, so the third table is id 2.
       expect(wireOps().find((a) => a.op === "START")).toEqual({
         op: "START",
@@ -991,7 +1160,9 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
         const got: number[] = [];
         handle.onFrame((f) => got.push(f.trajectoryId));
         mockOps.reject.push({ op: "START", id: 1, message: TIMEOUT });
-        const error = (await handle.replace(reshaped(4)).catch((e: unknown) => e)) as TrajectoryReplaceError;
+        const error = (await handle
+          .replace(reshaped(4))
+          .catch((e: unknown) => e)) as TrajectoryReplaceError;
         expect(error).toBeInstanceOf(TrajectoryReplaceError);
         expect(error.running).toBe(true);
         expect(error.message).toMatch(/without a REJ.*re-STARTed table 0/);
@@ -1011,7 +1182,9 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
         expect(got).toEqual([1, 0]);
         mockCalls.length = 0;
         await handle.replace(reshaped(4));
-        expect(wireOps().find((a) => a.op === "BEGIN")).toMatchObject({ id: 2 });
+        expect(wireOps().find((a) => a.op === "BEGIN")).toMatchObject({
+          id: 2,
+        });
         expect(handle.lastSwap).toBe("atomic"); // still running, still exact
         elapse(trajectoryGraceUs(reshaped(4)) + 1);
         push(1);
@@ -1024,9 +1197,15 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
         handle.onFrame((f) => got.push(f.trajectoryId));
         mockOps.reject.push(
           { op: "START", id: 1, message: TIMEOUT },
-          { op: "START", id: 0, message: "A trajectory is already running (STOP it first)" },
+          {
+            op: "START",
+            id: 0,
+            message: "A trajectory is already running (STOP it first)",
+          },
         );
-        const error = (await handle.replace(reshaped(4)).catch((e: unknown) => e)) as TrajectoryReplaceError;
+        const error = (await handle
+          .replace(reshaped(4))
+          .catch((e: unknown) => e)) as TrajectoryReplaceError;
         expect(error).toBeInstanceOf(TrajectoryReplaceError);
         expect(error.running).toBe(true);
         expect(error.message).toMatch(/ambiguous/);
@@ -1046,7 +1225,9 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
         // The next swap (atomic: valid whichever of 0 / 1 plays) retires both.
         mockCalls.length = 0;
         await handle.replace(spec(4));
-        expect(wireOps().find((a) => a.op === "BEGIN")).toMatchObject({ id: 2 });
+        expect(wireOps().find((a) => a.op === "BEGIN")).toMatchObject({
+          id: 2,
+        });
         expect(wireOps().slice(-3)).toEqual([
           { op: "START", id: 2, t_start: 2_000_000n, cycles: 0 },
           { op: "DELETE", id: 0 },
@@ -1064,7 +1245,11 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
         const handle = await running(FW_221);
         mockOps.reject.push(
           { op: "START", id: 1, message: TIMEOUT },
-          { op: "START", id: 0, message: "A trajectory is already running (STOP it first)" },
+          {
+            op: "START",
+            id: 0,
+            message: "A trajectory is already running (STOP it first)",
+          },
         );
         await handle.replace(reshaped(4)).catch(() => {});
         mockOps.reject.push({
@@ -1090,7 +1275,11 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
         const handle = await running(FW_221);
         mockOps.reject.push(
           { op: "START", id: 1, message: TIMEOUT },
-          { op: "START", id: 0, message: "A trajectory is already running (STOP it first)" },
+          {
+            op: "START",
+            id: 0,
+            message: "A trajectory is already running (STOP it first)",
+          },
         );
         await handle.replace(reshaped(4)).catch(() => {});
         mockCalls.length = 0;
@@ -1103,7 +1292,13 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
         // Not running any more: a plain re-upload, the sibling is gone.
         mockCalls.length = 0;
         await handle.replace(reshaped(4, 40_000));
-        expect(trajectoryOps()).toEqual(["BEGIN", "DATA", "MARK", "COMMIT", "DELETE"]);
+        expect(trajectoryOps()).toEqual([
+          "BEGIN",
+          "DATA",
+          "MARK",
+          "COMMIT",
+          "DELETE",
+        ]);
         expect(wireOps().at(-1)).toEqual({ op: "DELETE", id: 0 });
       });
 
@@ -1113,7 +1308,11 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
         handle.onFrame((f) => got.push(f.trajectoryId));
         mockOps.reject.push(
           { op: "START", id: 1, message: TIMEOUT },
-          { op: "START", id: 0, message: "A trajectory is already running (STOP it first)" },
+          {
+            op: "START",
+            id: 0,
+            message: "A trajectory is already running (STOP it first)",
+          },
         );
         await handle.replace(reshaped(4)).catch(() => {});
         mockCalls.length = 0;
@@ -1144,15 +1343,28 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
         handle.onFrame((f) => got.push(f.trajectoryId));
         mockOps.reject.push(
           { op: "START", id: 1, message: TIMEOUT },
-          { op: "START", id: 0, message: "A trajectory is already running (STOP it first)" },
+          {
+            op: "START",
+            id: 0,
+            message: "A trajectory is already running (STOP it first)",
+          },
         );
         await handle.replace(reshaped(4)).catch(() => {});
         push(0, { marker: null, status: "ENDED", cycle: 10 });
         got.length = 0;
         mockCalls.length = 0;
         await handle.replace(reshaped(4, 40_000)); // not running: any period
-        expect(trajectoryOps()).toEqual(["BEGIN", "DATA", "MARK", "COMMIT", "DELETE", "DELETE"]);
-        expect(wireOps().find((a) => a.op === "BEGIN")).toMatchObject({ id: 2 });
+        expect(trajectoryOps()).toEqual([
+          "BEGIN",
+          "DATA",
+          "MARK",
+          "COMMIT",
+          "DELETE",
+          "DELETE",
+        ]);
+        expect(wireOps().find((a) => a.op === "BEGIN")).toMatchObject({
+          id: 2,
+        });
         expect(wireOps().slice(-2)).toEqual([
           { op: "DELETE", id: 0 },
           { op: "DELETE", id: 1 },
@@ -1177,9 +1389,15 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
         const handle = await running(FW_221);
         mockOps.reject.push(
           { op: "START", id: 1, message: TIMEOUT },
-          { op: "START", id: 0, message: "Request timeout (no device response)" },
+          {
+            op: "START",
+            id: 0,
+            message: "Request timeout (no device response)",
+          },
         );
-        const error = (await handle.replace(reshaped(4)).catch((e: unknown) => e)) as TrajectoryReplaceError;
+        const error = (await handle
+          .replace(reshaped(4))
+          .catch((e: unknown) => e)) as TrajectoryReplaceError;
         expect(error).toBeInstanceOf(TrajectoryReplaceError);
         expect(error.running).toBe(false);
         expect(error.message).toMatch(/could not be restarted/);
@@ -1202,7 +1420,9 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
           id: 1,
           message: "Cannot perform action: system is not enabled",
         });
-        const error = (await handle.replace(reshaped(4)).catch((e: unknown) => e)) as TrajectoryReplaceError;
+        const error = (await handle
+          .replace(reshaped(4))
+          .catch((e: unknown) => e)) as TrajectoryReplaceError;
         expect(error.running).toBe(true);
         expect(error.replacement).toBeNull();
         expect(wireOps().slice(-2)).toEqual([
@@ -1217,7 +1437,9 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
 describe("classifyTrajectoryStartError / Controller.clockOffsetNs", () => {
   it("tells the firmware's START REJ texts from host-side transport failures", () => {
     const k = (m: string) => classifyTrajectoryStartError(new Error(m));
-    expect(k("A trajectory is already running (STOP it first)")).toBe("already-running");
+    expect(k("A trajectory is already running (STOP it first)")).toBe(
+      "already-running",
+    );
     for (const m of [
       "Unknown trajectory id (BEGIN first)",
       "Trajectory not committed (COMMIT first)",
@@ -1226,6 +1448,7 @@ describe("classifyTrajectoryStartError / Controller.clockOffsetNs", () => {
       "A trigger is pending (legacy Trigger) — wait for its FIN",
       "Unknown trajectory operation",
       "Trajectory packet too short for its operation",
+      "Unknown packet type",
     ])
       expect(k(m)).toBe("rejected");
     for (const m of [

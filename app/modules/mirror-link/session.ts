@@ -162,6 +162,7 @@ import {
   patternPeriodUs,
   patternSamples,
   sameWindowValue,
+  AXIS_SLIDER_RANGE,
   SCAN_AMP_RANGE,
   SCAN_HZ_RANGE,
   SCAN_RATIO_RANGE,
@@ -227,10 +228,6 @@ const REPLACE_INTERVAL_MS = 100;
 /** No-exposure watchdog: a run with no OK marker push for this many periods
  *  warns once (spec §exposure-windows). */
 const NO_OK_PERIODS = 2;
-
-/** The axis slider's left end (the pane's `AXIS_MIN`: the 0.5° grid over
- *  (-180, 180]) — `setAxis` folds (-180, -179.5) onto it. */
-const AXIS_SLIDER_MIN_DEG = -179.5;
 
 /** Unmatched-flip watchdog (spec §triangle-flip): over the last two periods
  *  (at least this long, so a slow scan still averages a few frames), more than
@@ -3120,7 +3117,7 @@ export default function mirrorLinkSession(
           if (raw === null) return;
           // Fold into the slider's domain (a 0.5° fold at the seam): the state
           // never holds an angle the slider cannot show (spec §scan-patterns).
-          const deg = Math.max(raw, AXIS_SLIDER_MIN_DEG);
+          const deg = Math.max(raw, AXIS_SLIDER_RANGE.min);
           if (deg === s.state.scan_axis_deg) return;
           s.setState("scan_axis_deg", deg); // a server write fires no watch
           publishScanGeometry();

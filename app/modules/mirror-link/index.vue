@@ -221,6 +221,13 @@ const scanStatus = computed<{ text: string; tone: string; title: string }>(
       const traj = telemetry.perf.trajectory;
       const p = traj.pushes;
       const failed = p.timeout + p.busy + p.other;
+      // `stalled` = no OK push for two periods (a cable coming loose after N
+      // good exposures); a run that never answered says so instead.
+      const stall = traj.stalled
+        ? p.ok > 0
+          ? "No exposure has completed for two scan periods — the cameras stopped answering the trigger. "
+          : "No exposure has completed this run — the cameras are not answering the trigger. "
+        : "";
       if (t.mismatch)
         return {
           text,
@@ -238,18 +245,17 @@ const scanStatus = computed<{ text: string; tone: string; title: string }>(
             ". " +
             `Applied exposure L ${ms(t.exposure_us.L)} ms · R ${ms(t.exposure_us.R)} ms, ` +
             `frame rate L ${t.frame_rate.L.toFixed(1)} Hz · R ${t.frame_rate.R.toFixed(1)} Hz. ` +
+            stall +
             trajectoryDetail.value,
         };
-      // Amber also mid-run: `stalled` = no OK push for two periods (a cable
-      // coming loose after N good exposures), not only "none ever succeeded".
+      // Amber also mid-run (stalled), not only when none ever succeeded.
       if (traj.stalled || (p.ok === 0 && failed > 0))
         return {
           text,
           tone: "warn",
           title:
-            (traj.stalled
-              ? "No exposure has completed for two scan periods — the cameras stopped answering the trigger. "
-              : "No exposure has completed this run — the cameras are not answering the trigger. ") +
+            (stall ||
+              "No exposure has completed this run — the cameras are not answering the trigger. ") +
             trajectoryDetail.value,
         };
       return {
