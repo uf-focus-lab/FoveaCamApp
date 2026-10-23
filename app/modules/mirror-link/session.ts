@@ -82,6 +82,7 @@ import {
 } from "@orchestrator/pid-node";
 import { createSlicePipe, type SliceHandle, type SlicePipeSeam } from "@orchestrator/slice-pipe";
 import { createScalePipe, type ScaleHandle, type ScalePipeSeam } from "@orchestrator/scale-pipe";
+import type { FlipPipeSeam } from "@orchestrator/flip-pipe";
 import {
   foveaTileSize,
   matchMagnification,
@@ -192,6 +193,7 @@ export default function mirrorLinkSession(
   sliceSeam: SlicePipeSeam,
   scaleSeam: ScalePipeSeam,
   compressSeam?: CompressPipeSeam,
+  flipSeam?: FlipPipeSeam,
 ): ServerSession<typeof mirrorLink> {
   return defineResourceSession("mirror-link", mirrorLink, (s) => {
     let triple: CalibratedTriple | null = null;

@@ -49,6 +49,13 @@ Napi::Value attachScalePipe(const Napi::CallbackInfo &info);
 Napi::Value setScaleParams(const Napi::CallbackInfo &info);
 Napi::Value detachScalePipe(const Napi::CallbackInfo &info);
 Napi::Value scaleProbeAll(const Napi::CallbackInfo &info);
+// mirror-link triangle flip: the per-frame VERTICAL FLIP brick keyed on
+// trajectory-marker anchors, defined in core/lib/Aravis/FlipStream.cpp.
+Napi::Value attachFlipPipe(const Napi::CallbackInfo &info);
+Napi::Value pushFlipAnchor(const Napi::CallbackInfo &info);
+Napi::Value flipProbe(const Napi::CallbackInfo &info);
+Napi::Value flipProbeAll(const Napi::CallbackInfo &info);
+Napi::Value detachFlipPipe(const Napi::CallbackInfo &info);
 // stereo-disparity-and-heatmap-nodes: the two-input SGBM disparity brick,
 // defined in core/lib/Aravis/StereoStream.cpp.
 Napi::Value attachStereoPipe(const Napi::CallbackInfo &info);
@@ -230,6 +237,19 @@ static Object init(Env env, Object exports) {
                Function::New<Arv::detachScalePipe>(env, "detachScalePipe"));
     Aravis.Set("scaleProbeAll",
                Function::New<Arv::scaleProbeAll>(env, "scaleProbeAll"));
+    // mirror-link triangle flip: a pass-through copy of a convert pipe whose
+    // frames are cv::flip(…, 0)'d (rows reversed) iff matched (nearest within
+    // toleranceNs, PairStream root rule) to a marker anchor marked `flip`.
+    // docs/spec/core-streams.md#flip-stream
+    Aravis.Set("attachFlipPipe",
+               Function::New<Arv::attachFlipPipe>(env, "attachFlipPipe"));
+    Aravis.Set("pushFlipAnchor",
+               Function::New<Arv::pushFlipAnchor>(env, "pushFlipAnchor"));
+    Aravis.Set("flipProbe", Function::New<Arv::flipProbe>(env, "flipProbe"));
+    Aravis.Set("flipProbeAll",
+               Function::New<Arv::flipProbeAll>(env, "flipProbeAll"));
+    Aravis.Set("detachFlipPipe",
+               Function::New<Arv::detachFlipPipe>(env, "detachFlipPipe"));
     // stereo-disparity-and-heatmap-nodes: the FIRST two-input brick — a native
     // cv::StereoSGBM thread pairing two convert/undistort/fovea/scale taps into
     // a CV_32F disparity pipe (reactive {numDisparities|blockSize|minDisparity})

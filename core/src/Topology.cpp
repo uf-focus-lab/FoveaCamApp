@@ -80,6 +80,7 @@ Value report(const CallbackInfo &info) {
     Arv::appendUndistortReports(env, rows, seen);
     Arv::appendFoveaReports(env, rows, seen);
     Arv::appendScaleReports(env, rows, seen);
+    Arv::appendFlipReports(env, rows, seen);
     Arv::appendStereoReports(env, rows, seen);
     Arv::appendHeatmapReports(env, rows, seen);
     Arv::appendCompositeReports(env, rows, seen);

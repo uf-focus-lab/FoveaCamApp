@@ -157,3 +157,48 @@ v = slew(center) + J · amp · (cos φ, sin φ)
   BEFORE the stream ejects its subscribers ([eject-and-drain](#eject-and-drain)), which
   also runs from the CoreObject `destruct` hook so a live port link pinning the brick
   cannot leave the thread running. Guarded by `core/test/53-orbit-stream.ts`.
+
+## FlipStream {#flip-stream}
+
+Source: `core/lib/Aravis/FlipStream.{h,cpp}`, exported as `Aravis.attachFlipPipe` /
+`pushFlipAnchor` / `flipProbe` / `flipProbeAll` / `detachFlipPipe`; the app drives it
+through `app/orchestrator/flip-pipe.ts` (`FlipPipeSeam`, injected into the mirror-link
+session). The MirrorLink triangle scan exposes one frame on the rising sweep and one on
+the falling sweep; the falling-sweep frame reaches every consumer (views, ring reader)
+VERTICALLY flipped. The brick is a pass-through copy of a source pipe (a fovea `convert`
+pipe in production; any convert / undistort / fovea / scale pipe resolves) that flips the
+frames matched to an anchor marked `flip`.
+
+- **Chained brick.** A `ChainedStream` modelled on `ScaleStream`: Leaky/latest-wins
+  `OwnedFrame` tap, demand propagation (it runs iff its pipe has consumers; while running
+  it keeps the upstream chain awake), a max-bound gated `PipeOfferSubscriber`, the reused
+  output buffer released on park. Advertise the flip pipe with the SOURCE pipe's own spec
+  (same format, dims, footprint) BEFORE attaching — an unknown pipe throws.
+- **Product.** Matched-`flip` frame: `cv::flip(src, dst, 0)` (rows reversed) into the
+  reused buffer. Any other frame: passed through by header (the tap's `OwnedFrame`
+  already owns a deep copy made for this brick, so no second copy). Pixel format, dims and
+  stride are the source's; `deviceTimestamp`/`systemTimestamp`, the crop origin and the
+  upstream `convertMs` are forwarded unchanged — the trusted-time invariant, and the v4
+  slot header reads as the source pipe's would.
+- **Anchors.** `pushFlipAnchor(pipeId, { tExposure, flip })` at FIN rate (OK marker
+  pushes: `flip: marker === 1`), `tExposure` in the owner-applied trusted host-ns domain,
+  the same domain as a frame's `deviceTimestamp`. They go into a mutex-guarded bounded
+  pool (`anchorCap`, default 16, drop-oldest; evictions counted as `anchorDrops`).
+- **Matching rule.** PairStream's root rule (`matchesFrame`, no side delta), narrowed to
+  the nearest anchor: an anchor is a candidate iff
+  `|int64(frame.deviceTimestamp) − tExposure| <= toleranceNs` (two-sided, inclusive); the
+  smallest difference wins, ties going to the older anchor. The frame flips iff a winner
+  exists and is marked `flip`; with no candidate it passes through unflipped and counts
+  `unmatched`. Frames arrive in timestamp order, so after each frame the pool sheds every
+  anchor older than the winner (it can never be nearest to a later frame) or, with no
+  winner, every anchor below `ts − toleranceNs`. The session passes
+  `toleranceNs = 0.4 · T` (the sweep time).
+- **Counters.** `flipProbe(pipeId)` returns the thread meter (input `frame`, output
+  `flip`) plus `frames`, `flipped`, `unmatched`, `anchorPoolSize`, `anchorDrops` and
+  `toleranceNs`, or `null` for an unknown pipe; `flipProbeAll()` returns the same rows
+  keyed by pipe id for the perf/workload fold. `Topology.report()` shows a kind `"flip"`
+  row with one `frame` input edge from the source pipe.
+- **Teardown.** `detachFlipPipe` unregisters the consumer gate FIRST, then drops the
+  binding outside the registry lock (unsubscribe, then the brick's `closeChain()` +
+  `shutdown()` join), idempotent (`false` when unknown). JS retires a flip node detach
+  then unadvertise (`FlipHandle.retire`). Guarded by `core/test/54-flip-stream.ts`.

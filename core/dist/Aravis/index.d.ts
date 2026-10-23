@@ -472,6 +472,76 @@ declare module "core/Aravis" {
    */
   export function scaleProbeAll(): Record<string, ScaleProbeSnapshot>;
 
+  /** Options for `attachFlipPipe`. */
+  export interface FlipPipeOptions {
+    /** Match window in ns (>= 0, inclusive, two-sided): a frame is matched to
+     *  the anchor NEAREST its `deviceTimestamp` among those with
+     *  `|deviceTimestamp − tExposure| <= toleranceNs`. */
+    toleranceNs: bigint;
+    /** Bounded anchor pool (drop-oldest); default 16, >= 1. */
+    anchorCap?: number;
+  }
+
+  /** One trajectory-marker anchor pushed via `pushFlipAnchor`. `tExposure` is
+   *  the marker push's OWNER-APPLIED trusted host-steady ns — the same domain
+   *  as a frame's `deviceTimestamp`. `flip`: a frame matched to this anchor is
+   *  vertically flipped. */
+  export interface FlipAnchor {
+    tExposure: bigint;
+    flip: boolean;
+  }
+
+  /** `flipProbe` snapshot: the shared meter shape (input `frame`, output
+   *  `flip`) + the brick's counters. */
+  export interface FlipProbeSnapshot extends ProbeSnapshot {
+    /** Frames processed (flipped + passed through). */
+    frames: number;
+    /** Frames matched to a `flip: true` anchor (rows reversed). */
+    flipped: number;
+    /** Frames with NO anchor inside the tolerance — passed through unflipped. */
+    unmatched: number;
+    /** Live anchor pool size (pruned per frame; bounded by `anchorCap`). */
+    anchorPoolSize: number;
+    /** Anchors evicted by the `anchorCap` bound (drop-oldest) before use. */
+    anchorDrops: number;
+    toleranceNs: bigint;
+  }
+
+  /**
+   * Attach the per-frame VERTICAL FLIP brick (MirrorLink triangle scan,
+   * docs/spec/core-streams.md#flip-stream): a pass-through copy of the source
+   * brick's frames (convert / undistort / fovea / scale pipe; Leaky/latest-wins
+   * OwnedFrame tap, demand propagation keeps the upstream chain awake) where a
+   * frame matched to an anchor marked `flip` is `cv::flip(…, 0)`'d (rows
+   * reversed). Same pixel format, dims and stride as the source; timestamps,
+   * crop origin and convertMs forwarded UNCHANGED (trusted-time). Advertise
+   * `pipeId` with the SOURCE pipe's spec first (unknown pipe throws). Matching
+   * is PairStream's root rule (`|deviceTimestamp − tExposure| <= toleranceNs`,
+   * no side delta) narrowed to the nearest anchor (ties → the older); no match
+   * → pass through and count `unmatched`. Throws on a missing/negative
+   * `toleranceNs`, a bad `anchorCap` or an unknown source.
+   */
+  export function attachFlipPipe(
+    sourcePipeId: string,
+    pipeId: string,
+    options: FlipPipeOptions,
+  ): boolean;
+
+  /** Push one marker anchor into the flip brick's bounded pool (drop-oldest).
+   *  FIN-rate, cheap. Returns false for an unknown pipe id; throws on a
+   *  missing `tExposure` (bigint) or `flip` (boolean). */
+  export function pushFlipAnchor(pipeId: string, anchor: FlipAnchor): boolean;
+
+  /** The flip brick's counters + meter, or null for an unknown pipe id. */
+  export function flipProbe(pipeId: string): FlipProbeSnapshot | null;
+
+  /** Every live flip brick's `flipProbe` row → `{ [pipeId]: FlipProbeSnapshot }`
+   *  (keys AND meter names are the node ids; folds like `scaleProbeAll`). */
+  export function flipProbeAll(): Record<string, FlipProbeSnapshot>;
+
+  /** Detach + join the flip producer. Idempotent (false if unknown). */
+  export function detachFlipPipe(pipeId: string): boolean;
+
   /**
    * Reactive matcher spec for `attachStereoPipe`/`setStereoParams`. All fields
    * optional; validated NAPI-side and applied on the next frame (matcher

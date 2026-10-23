@@ -378,6 +378,27 @@ const orbitSeam: import("./orbit-pipe.js").OrbitSeam = {
       }
     ).createOrbitStream(name),
 };
+// The triangle scan's per-frame VERTICAL FLIP brick (FlipStream,
+// docs/spec/core-streams.md#flip-stream): chained on a fovea convert pipe, it
+// flips the frames matched to a falling-sweep marker anchor. Same seam shape as
+// slice/scale — advertise/unadvertise from the pipe session handle, the rest
+// from `Aravis.*` (real d.ts types via a `typeof Aravis` Pick).
+const aravisFlip: Pick<
+  typeof Aravis,
+  "attachFlipPipe" | "pushFlipAnchor" | "flipProbe" | "detachFlipPipe" | "flipProbeAll"
+> = Aravis;
+const flipSeam: import("./flip-pipe.js").FlipPipeSeam = {
+  advertise: pipeBroker.advertise,
+  unadvertise: pipeBroker.unadvertise,
+  attach: (src, id, opts) => void aravisFlip.attachFlipPipe(src, id, opts),
+  pushAnchor: (id, anchor) => void aravisFlip.pushFlipAnchor(id, anchor),
+  probe: (id) => aravisFlip.flipProbe(id),
+  detach: (id) => void aravisFlip.detachFlipPipe(id),
+};
+// The flip bricks' meters — same sibling-probe shape as the scale bricks.
+registerNativeProbe(
+  () => aravisFlip.flipProbeAll() as unknown as Record<string, WorkloadSnapshot>,
+);
 const mirrorLink = hub.add(
   mirrorLinkSession(
     asBroker(Pipe),
@@ -387,6 +408,7 @@ const mirrorLink = hub.add(
     sliceSeam,
     scaleSeam,
     compressSeam,
+    flipSeam,
   ),
 );
 

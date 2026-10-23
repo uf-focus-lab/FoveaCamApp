@@ -69,6 +69,10 @@ void appendFoveaReports(Napi::Env env, Napi::Array &rows,
                         std::set<std::string> &seen);
 void appendScaleReports(Napi::Env env, Napi::Array &rows,
                         std::set<std::string> &seen);
+// The marker-keyed vertical FLIP brick (kind "flip", source-pipe input edge,
+// same frame type out).
+void appendFlipReports(Napi::Env env, Napi::Array &rows,
+                       std::set<std::string> &seen);
 // The two-input SGBM brick (kind "stereo", left/right input edges) + the
 // colormap brick (kind "heatmap").
 void appendStereoReports(Napi::Env env, Napi::Array &rows,
