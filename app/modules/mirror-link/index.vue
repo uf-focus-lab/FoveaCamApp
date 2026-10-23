@@ -5,9 +5,11 @@ You may find the full license in project root directory.
 --------------------------------------------------- -->
 <!--
   MirrorLink — a thin client over the `mirror-link` session: drag the wide view
-  to place the scan center, converge with verge/shift (or Auto Vergence), and run
-  a circular scan whose per-frame exposure spans one revolution. Renders frames,
-  overlays telemetry, drives state; no core / camera / calibration access.
+  to place the scan center (or its handle to turn the scan axis), converge with
+  verge/shift (or Auto Vergence), and run the scan pattern set in the Scan
+  Pattern pane — an ellipse or a triangle sweep whose exposure windows trigger
+  the foveas. Renders frames, overlays telemetry, drives state; no core /
+  camera / calibration access.
   Behavior spec: docs/spec/mirror-link.md.
 -->
 <script setup lang="ts">
@@ -41,9 +43,17 @@ import {
 } from "@lib/vergence/tuning";
 import RingOverlay from "./RingOverlay.vue";
 import RingHistogram from "./RingHistogram.vue";
-import { ringGeometry, strokeFor } from "./overlay";
+import ScanPatternPane from "./ScanPatternPane.vue";
+import {
+  AXIS_HANDLE_DOT,
+  hitsAxisHandle,
+  isClosedPath,
+  polylinePath,
+  ringGeometry,
+  strokeFor,
+} from "./overlay";
 import { mirrorLink } from "./contract";
-import { SCAN_AMP_RANGE, SCAN_HZ_RANGE, SHIFT_RANGE_DEG } from "./scan";
+import { SCAN_HZ_RANGE, SHIFT_RANGE_DEG } from "./scan";
 
 const session = useSession(mirrorLink, "mirror-link");
 const { state, telemetry } = session;
@@ -54,15 +64,19 @@ const controller = computed(getController);
 new Capture(session, "mirror-link");
 new Recording(session, "mirror-link");
 
-// The L/R views bind the RAW convert pipes — a frame integrating a full
-// revolution has no single mirror pose to warp against (spec §views). The
-// center view binds the intrinsic undistort pipe, raw fallback uncalibrated.
-const frameL = usePipeFrame(() =>
-  state.serials?.L ? nodeId.convert(state.serials.L) : null,
-);
-const frameR = usePipeFrame(() =>
-  state.serials?.R ? nodeId.convert(state.serials.R) : null,
-);
+// The L/R views bind the RAW convert pipes — a frame integrating a scan window
+// has no single mirror pose to warp against (spec §views) — or, while the
+// triangle runs, the session's FLIP pipes over them, which turn the
+// falling-sweep frame upright (spec §triangle-flip). The center view binds the
+// intrinsic undistort pipe, raw fallback uncalibrated.
+function foveaPipe(side: "L" | "R"): string | null {
+  const flip = state.flipPipes?.[side];
+  if (flip) return flip;
+  const serial = state.serials?.[side];
+  return serial ? nodeId.convert(serial) : null;
+}
+const frameL = usePipeFrame(() => foveaPipe("L"));
+const frameR = usePipeFrame(() => foveaPipe("R"));
 const frameC = usePipeFrame(
   () =>
     state.undistortPipe ??
@@ -77,11 +91,38 @@ const size = computed(() => ({
 }));
 const stroke = computed(() => strokeFor(frameC.value?.shape));
 
-// --- steering (spec §targeting) ---------------------------------------------
+// --- steering + the axis handle (spec §targeting, §views) -------------------
+// The StreamView cursor is already in wide FRAME px (the overlay's viewBox).
+// A press landing within `stroke · AXIS_HANDLE_HIT` of the axis handle starts
+// an AXIS drag: every move then turns the main axis (`setAxis`) and steering is
+// suppressed until release. Anywhere else the drag steers, as it always has.
+// Both go out per cursor event, fire-and-forget, exactly alike — the session
+// coalesces the trajectory re-upload (spec §actuation).
 const cursor = shallowRef<(Rect & { buttons: number }) | null>(null);
-watch(cursor, (c) => {
-  if (c) void session.call("steer", { x: c.x, y: c.y });
+const axisDrag = ref(false);
+watch(cursor, (c, prev) => {
+  if (!c) {
+    axisDrag.value = false;
+    return;
+  }
+  // The FIRST event of a drag (null → point) is the press: classify it once.
+  if (!prev)
+    axisDrag.value = hitsAxisHandle(c, telemetry.axis_handle_px, stroke.value);
+  const px = { x: c.x, y: c.y };
+  if (axisDrag.value) void session.call("setAxis", px);
+  else void session.call("steer", px);
 });
+/** Hidden on the {0,0} uncalibrated sentinel. */
+const handleShown = computed(() => {
+  const h = telemetry.axis_handle_px;
+  return h.x !== 0 || h.y !== 0;
+});
+// Hover affordance: a grab cursor over the handle's hit zone.
+const overHandle = ref(false);
+function onHover(m: { x: number; y: number } | null): void {
+  overHandle.value =
+    m !== null && hitsAxisHandle(m, telemetry.axis_handle_px, stroke.value);
+}
 
 const drawer_height = ref(0);
 const distance = computed(() => vergeToDistance(state.verge, state.baseline));
@@ -116,90 +157,103 @@ const gainTitle = computed(() =>
       "No right-click reset: that would slam a live camera to minimum gain.",
 );
 
-// --- scan (spec §lifecycle) -------------------------------------------------
+// --- scan (spec §lifecycle, §scan-patterns) ---------------------------------
 const scanning = computed(() => telemetry.scan !== null);
 const period_ms = computed(() =>
   (1000 / Math.max(state.scan_hz, SCAN_HZ_RANGE.min)).toFixed(1),
 );
 
-/** Poses per revolution below which the commanded circle reaches the mirror as
- *  a visible polygon (spec §actuation). */
-const POLYGON_POSES_PER_REV = 20;
+/** One exposure window as `start–end` (ms) within the trajectory period. */
+const windowText = (w: { t_offset_us: number; pulse_us: number }) =>
+  `${ms(w.t_offset_us)}–${ms(w.t_offset_us + w.pulse_us)}`;
 
-/** The pose-rate verdict: which end of the volt path is starving the ring, and
- *  why the sink's governor backed off. Null while the ring is dense enough. */
-const poseRate = computed<{ sinkHz: number; warn: string | null }>(() => {
-  const o = telemetry.perf.orbit;
-  const hz = telemetry.scan?.hz ?? 0;
-  if (!o.native || hz <= 0)
-    return { sinkHz: o.sinkHz, warn: null };
-  const perRev = o.sinkHz / hz;
-  if (perRev >= POLYGON_POSES_PER_REV) return { sinkHz: o.sinkHz, warn: null };
-  const g = o.governor;
-  const low =
-    o.emitHz < o.sinkHz * 1.2
-      ? `the generator itself is slow (emit ${o.emitHz.toFixed(0)}/s)`
-      : `the serial link is throttling (emit ${o.emitHz.toFixed(0)}/s, wire ${o.sinkHz.toFixed(0)}/s)`;
-  return {
-    sinkHz: o.sinkHz,
-    warn:
-      `polygon: ${perRev.toFixed(0)} poses per revolution — ${low}. ` +
-      `Governor ${g.state} at ${g.effectiveRateHz.toFixed(0)} Hz, ` +
-      `${g.backoffs} backoffs, ${g.softFails} soft fails, outq ${g.outq} B.`,
-  };
+/** The MCU run's bookkeeping, for the status hover (spec §actuation). */
+const trajectoryDetail = computed(() => {
+  const p = telemetry.perf.trajectory;
+  const n = p.pushes;
+  let s =
+    `Marker pushes: ${n.ok} ok · ${n.timeout} timeout · ${n.busy} busy · ${n.other} other; ` +
+    `last lateness ${p.lateness_us.toFixed(0)} µs; ${p.reuploads} live re-uploads`;
+  if (telemetry.scan?.mode === "triangle")
+    s +=
+      `; flipped L ${p.flipped.L} · R ${p.flipped.R}, ` +
+      `unmatched L ${p.unmatched.L} · R ${p.unmatched.R}`;
+  return s + ".";
 });
 
 const scanStatus = computed<{ text: string; tone: string; title: string }>(
   () => {
     const t = telemetry.scan;
     if (t) {
-      const rate = poseRate.value;
+      const timed = t.exposure_mode === "Timed";
       const text =
-        `${t.hz.toFixed(1)} Hz · ${ms(t.period_us)} ms · L ${ms(t.exposure_us.L)} ms · R ${ms(
-          t.exposure_us.R,
-        )} ms` + (rate.sinkHz > 0 ? ` · ${rate.sinkHz.toFixed(0)}/s` : "");
-      if (rate.warn) return { text, tone: "warn", title: rate.warn };
+        `${t.mode} · ${t.hz.toFixed(1)} Hz · ${ms(t.period_us)} ms · ` +
+        `${t.windows.map(windowText).join(" + ")} ms` +
+        (timed ? " · timed" : "");
+      const p = telemetry.perf.trajectory.pushes;
+      const failed = p.timeout + p.busy + p.other;
       if (t.mismatch)
         return {
           text,
           tone: "warn",
           title:
-            `A fovea exposure misses the ${ms(t.period_us)} ms revolution — its frame covers ` +
-            `only part of the ring. Applied frame rates: L ${t.frame_rate.L.toFixed(
-              1,
-            )} Hz, R ${t.frame_rate.R.toFixed(1)} Hz.`,
+            `The cameras cannot take the requested window${timed ? "s (no TriggerWidth exposure on this model)" : ""}: ` +
+            `applied exposure L ${ms(t.exposure_us.L)} ms · R ${ms(t.exposure_us.R)} ms, ` +
+            `frame rate L ${t.frame_rate.L.toFixed(1)} Hz · R ${t.frame_rate.R.toFixed(1)} Hz. ` +
+            trajectoryDetail.value,
+        };
+      if (p.ok === 0 && failed > 0)
+        return {
+          text,
+          tone: "warn",
+          title:
+            "No exposure has completed this run — the cameras are not answering the trigger. " +
+            trajectoryDetail.value,
         };
       return {
         text,
         tone: "ok",
         title:
-          `Each fovea frame integrates one full ${ms(t.period_us)} ms revolution` +
-          (rate.sinkHz > 0
-            ? `, commanded at ${rate.sinkHz.toFixed(0)} poses/s ` +
-              `(${(rate.sinkHz / t.hz).toFixed(0)} per revolution).`
-            : "."),
+          (timed
+            ? `Timed fallback: each trigger exposes L ${ms(t.exposure_us.L)} ms · R ${ms(t.exposure_us.R)} ms. `
+            : "Each trigger pulse is the exposure: every fovea frame covers exactly its window of the path. ") +
+          trajectoryDetail.value,
       };
     }
     const reason = telemetry.scan_blocked;
+    const triangle = state.scan_mode === "triangle";
+    const period = (Number(period_ms.value) * (triangle ? 2 : 1)).toFixed(1);
     return {
       text: reason ? "idle — refused" : "idle",
       tone: reason ? "warn" : "muted",
       title:
         reason ??
-        `Start the scan to override both fovea cameras to ${period_ms.value} ms exposure at ` +
-          `${state.scan_hz.toFixed(1)} Hz. Manage Cameras' settings are restored on stop.`,
+        `Start the ${state.scan_mode} scan: the controller runs it and triggers both foveas ` +
+          `${triangle ? "twice" : "once"} per ${period} ms period. Manage Cameras' settings are restored on stop.`,
     };
   },
 );
 
-// The commanded ring in volt space, closed back onto its first point so the
-// PosView polyline reads as a loop (spec §views). Empty stays empty.
-const close = (path: readonly Pos[]): Pos[] =>
-  path.length > 1 ? [...path, path[0]] : [...path];
+// The commanded path in volt space, closed back onto its first point for the
+// ellipse so the PosView polyline reads as a loop; the line and the triangle
+// stay open (spec §views). Empty stays empty.
+const closedPath = computed(() =>
+  isClosedPath(state.scan_mode, state.scan_ratio),
+);
+const closeIf = (path: readonly Pos[]): Pos[] =>
+  closedPath.value && path.length > 1 ? [...path, path[0]] : [...path];
 const scanPath = computed(() => ({
-  L: close(telemetry.scan_path.L),
-  R: close(telemetry.scan_path.R),
+  L: closeIf(telemetry.scan_path.L),
+  R: closeIf(telemetry.scan_path.R),
 }));
+
+// The same path and its exposed windows in wide px, for the center view.
+const pathD = computed(() =>
+  polylinePath(telemetry.scan_path_px, closedPath.value),
+);
+const windowDs = computed(() =>
+  telemetry.scan_window_px.map((w) => polylinePath(w, false)),
+);
 
 // The button label stays telemetry-truthful (`scanning`); `busy` only disables
 // it while a start/stop round-trip is in flight.
@@ -220,8 +274,8 @@ async function toggleScan(): Promise<void> {
 const scanHint = computed(() => {
   if (!telemetry.ready) return "Waiting for the camera triple to be leased.";
   return scanning.value
-    ? "Stop the scan and restore both fovea cameras' exposure settings."
-    : "Start the circular scan and override both fovea cameras so one frame spans one revolution.";
+    ? "Stop the scan and restore both fovea cameras' trigger and exposure settings."
+    : "Start the scan pattern and trigger both fovea cameras at its exposure windows.";
 });
 // --- auto vergence (spec §targeting) ----------------------------------------
 // The SAME fovea-into-wide template-match loop Disparity Scope runs: engage it
@@ -297,7 +351,7 @@ const vergenceStatus = computed<{ text: string; tone: string; title: string }>(
         // Its own tone: a deliberate, expected pause — not a fault, not "off".
         tone: "ok dim",
         title:
-          "Held while the scan runs: each fovea frame is a RING, not the patch the " +
+          "Held while the scan runs: each fovea frame is the scanned PATH, not the patch the " +
           "match needs. Stop the scan to converge, then start it again.",
       };
     if (text === "no calibration")
@@ -549,8 +603,9 @@ const statusR = computed(() => ringStatus("R"));
         :color="THEME.L"
         style="width: 100%"
       >
-        <!-- The commanded scan circle in volt space; the crosshair marks its
-             CENTER (spec §views). An empty path draws nothing. -->
+        <!-- The commanded scan path in volt space (closed for the ellipse,
+             open otherwise); the crosshair marks its CENTER (spec §views). An
+             empty path draws nothing. -->
         <Line2D
           :data="scanPath.L"
           :color="THEME.L"
@@ -566,21 +621,54 @@ const statusR = computed(() => ringStatus("R"));
         :title="ROLE.C"
         :payload="frameC"
         :theme="THEME.C"
+        :class="{ 'axis-grab': overHandle, 'axis-drag': axisDrag }"
         v-model="cursor"
+        @mouse="onHover"
       >
-        <!-- Scan ring: dashed + faint while idle (a preview of the path),
-             solid while active (spec §views). -->
-        <circle
-          v-if="telemetry.scan_px > 0"
-          :cx="telemetry.target.x"
-          :cy="telemetry.target.y"
-          :r="telemetry.scan_px"
+        <!-- Scan path: dashed + faint while idle (a preview), solid while
+             active; closed for the ellipse, open for the line and the
+             triangle. The EXPOSED windows ride on top, emphasized — thicker,
+             full opacity — and dashed with it while idle (spec §views). Empty
+             uncalibrated. -->
+        <path
+          v-if="pathD"
+          :d="pathD"
           fill="none"
           :stroke="THEME.C"
           :stroke-width="stroke"
+          stroke-linejoin="round"
           :stroke-dasharray="scanning ? undefined : stroke * 4"
-          :opacity="scanning ? 1 : 0.4"
+          :opacity="scanning ? 0.6 : 0.4"
         />
+        <path
+          v-for="(d, i) in windowDs"
+          :key="'w' + i"
+          :d="d"
+          fill="none"
+          :stroke="THEME.C"
+          :stroke-width="stroke * 2"
+          stroke-linejoin="round"
+          :stroke-dasharray="scanning ? undefined : stroke * 4"
+        />
+        <!-- The main-axis handle: a short spoke from the center to the +amp
+             end and a dot there; press within its hit zone and drag to turn
+             the axis (spec §views). Hidden uncalibrated ({0,0}). -->
+        <g v-if="handleShown" :opacity="overHandle || axisDrag ? 1 : 0.75">
+          <line
+            :x1="telemetry.target.x"
+            :y1="telemetry.target.y"
+            :x2="telemetry.axis_handle_px.x"
+            :y2="telemetry.axis_handle_px.y"
+            :stroke="THEME.C"
+            :stroke-width="stroke"
+          />
+          <circle
+            :cx="telemetry.axis_handle_px.x"
+            :cy="telemetry.axis_handle_px.y"
+            :r="stroke * AXIS_HANDLE_DOT * (axisDrag ? 1.3 : 1)"
+            :fill="THEME.C"
+          />
+        </g>
         <!-- Where each fovea is AIMED (the offset-free center pose, shift
              included) — hidden uncalibrated. -->
         <template v-if="state.undistortPipe">
@@ -712,8 +800,9 @@ const statusR = computed(() => ringStatus("R"));
         :color="THEME.R"
         style="width: 100%"
       >
-        <!-- The commanded scan circle in volt space; the crosshair marks its
-             CENTER (spec §views). An empty path draws nothing. -->
+        <!-- The commanded scan path in volt space (closed for the ellipse,
+             open otherwise); the crosshair marks its CENTER (spec §views). An
+             empty path draws nothing. -->
         <Line2D
           :data="scanPath.R"
           :color="THEME.R"
@@ -725,15 +814,18 @@ const statusR = computed(() => ringStatus("R"));
     </div>
   </div>
   <Drawer v-model="drawer_height">
-    <!-- THREE columns (spec §views): mirror controls · the vergence loop (its
-         toggle + status, then the shared tuning block) · scan. The ring views
-         live under the center tile, not here. A nested split rather than a new
-         layout component. -->
+    <!-- FOUR columns (spec §views): mirror controls · the vergence loop (its
+         toggle + status, then the shared tuning block) · the Scan Pattern
+         pane · gain / scan frequency / ring reader / status. The ring views
+         live under the center tile, not here. Nested splits rather than a new
+         layout component, ≈ 0.20 / 0.23 / 0.27 / 0.30 of the drawer: the two
+         right columns carry the longest strings (the window readouts, the
+         frequency readout and the status line). -->
     <HorizontalDivision
-      :division="0.26"
+      :division="0.2"
       class="fill"
-      :min-width-left="0.2"
-      :min-width-right="0.4"
+      :min-width-left="0.15"
+      :min-width-right="0.6"
     >
       <template #left>
         <div class="options fill">
@@ -774,12 +866,12 @@ const statusR = computed(() => ringStatus("R"));
         </div>
       </template>
       <template #right>
-        <!-- Nested split: the vergence column, then the scan column. -->
+        <!-- Nested split: the vergence column, then the two scan columns. -->
         <HorizontalDivision
-          :division="0.42"
+          :division="0.29"
           class="fill"
-          :min-width-left="0.3"
-          :min-width-right="0.3"
+          :min-width-left="0.2"
+          :min-width-right="0.5"
         >
           <template #left>
             <div class="options fill">
@@ -843,67 +935,75 @@ const statusR = computed(() => ringStatus("R"));
             </div>
           </template>
           <template #right>
-        <div class="options fill">
-          <!-- Gain leads the column: it is SESSION-wide, not scan-scoped
-               (spec §gain). No `neutral` — a stray right-click must never slam
-               a LIVE camera to range-min. -->
-          <RangeSlider
-            v-model="gain"
-            :title="gainTitle"
-            :min="telemetry.gain_range.min"
-            :max="telemetry.gain_range.max"
-            :step="0.1"
-            :disabled="gainDisabled"
-          >
-            <span>Gain</span>
-            <span>{{ gainDisabled ? "—" : gain.toFixed(1) + " dB" }}</span>
-          </RangeSlider>
-          <RangeSlider
-            v-model="state.scan_hz"
-            title="Revolutions per second — also the per-frame exposure the foveas are overridden to while scanning. Right-click resets to neutral."
-            :min="SCAN_HZ_RANGE.min"
-            :max="SCAN_HZ_RANGE.max"
-            :neutral="10"
-            :step="0.5"
-          >
-            <span>Scan Frequency</span>
-            <span
-              >{{ state.scan_hz.toFixed(1) }} Hz &middot;
-              {{ period_ms }} ms</span
+            <!-- Innermost split: the Scan Pattern pane, then gain / frequency
+                 / ring reader / status. -->
+            <HorizontalDivision
+              :division="0.47"
+              class="fill"
+              :min-width-left="0.35"
+              :min-width-right="0.35"
             >
-          </RangeSlider>
-          <RangeSlider
-            v-model="state.scan_amp"
-            title="Ring RADIUS in degrees; the mirrors attenuate it at high frequency. Right-click resets to neutral."
-            :min="SCAN_AMP_RANGE.min"
-            :max="SCAN_AMP_RANGE.max"
-            :neutral="0.5"
-            :step="0.01"
-          >
-            <span>Scan Amplitude</span>
-            <span>{{ state.scan_amp.toFixed(2) }}&deg;</span>
-          </RangeSlider>
-          <div class="toggle-row" :title="RING_TITLE">
-            <span>Ring Reader</span>
-            <SingleSelect
-              v-model="ringReader"
-              :options="RING_OPTIONS"
-              :disabled="!telemetry.ready"
-              class="ring-toggle"
-              aria-label="Ring reader"
-            />
-          </div>
-          <div class="status-row">
-            <span>Status</span>
-            <span
-              class="scan-status"
-              :class="scanStatus.tone"
-              :title="scanStatus.title"
-            >
-              {{ scanStatus.text }}
-            </span>
-          </div>
-            </div>
+              <template #left>
+                <ScanPatternPane :state="state" />
+              </template>
+              <template #right>
+                <div class="options fill">
+                  <!-- Gain leads the column: it is SESSION-wide, not
+                       scan-scoped (spec §gain). No `neutral` — a stray
+                       right-click must never slam a LIVE camera to range-min. -->
+                  <RangeSlider
+                    v-model="gain"
+                    :title="gainTitle"
+                    :min="telemetry.gain_range.min"
+                    :max="telemetry.gain_range.max"
+                    :step="0.1"
+                    :disabled="gainDisabled"
+                  >
+                    <span>Gain</span>
+                    <span>{{
+                      gainDisabled ? "—" : gain.toFixed(1) + " dB"
+                    }}</span>
+                  </RangeSlider>
+                  <!-- The BASE period both patterns share (spec
+                       §scan-patterns): one ellipse revolution, one triangle
+                       sweep. -->
+                  <RangeSlider
+                    v-model="state.scan_hz"
+                    title="Base scan frequency: one ellipse revolution or one triangle sweep per period — the triangle's full period is twice this. Right-click resets to neutral."
+                    :min="SCAN_HZ_RANGE.min"
+                    :max="SCAN_HZ_RANGE.max"
+                    :neutral="10"
+                    :step="0.5"
+                  >
+                    <span>Scan Frequency</span>
+                    <span
+                      >{{ state.scan_hz.toFixed(1) }} Hz &middot;
+                      {{ period_ms }} ms</span
+                    >
+                  </RangeSlider>
+                  <div class="toggle-row" :title="RING_TITLE">
+                    <span>Ring Reader</span>
+                    <SingleSelect
+                      v-model="ringReader"
+                      :options="RING_OPTIONS"
+                      :disabled="!telemetry.ready"
+                      class="ring-toggle"
+                      aria-label="Ring reader"
+                    />
+                  </div>
+                  <div class="status-row">
+                    <span>Status</span>
+                    <span
+                      class="scan-status"
+                      :class="scanStatus.tone"
+                      :title="scanStatus.title"
+                    >
+                      {{ scanStatus.text }}
+                    </span>
+                  </div>
+                </div>
+              </template>
+            </HorizontalDivision>
           </template>
         </HorizontalDivision>
       </template>
@@ -935,6 +1035,15 @@ const statusR = computed(() => ringStatus("R"));
   .stream {
     width: 30vw;
     height: 22.5vw;
+  }
+
+  // The axis handle's affordance on the center view (spec §views): the grab
+  // cursor over its hit zone, grabbing for the length of an axis drag.
+  .stream.axis-grab :deep(canvas) {
+    cursor: grab;
+  }
+  .stream.axis-drag :deep(canvas) {
+    cursor: grabbing;
   }
 }
 

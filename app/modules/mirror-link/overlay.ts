@@ -65,3 +65,41 @@ export function ringGeometry(
       : [];
   return { stroke, circle, on, arc, ticks };
 }
+
+/** SVG path data for a polyline in frame px; `closed` joins the last point
+ *  back to the first (the ellipse), open otherwise (the line, the triangle).
+ *  Fewer than two points draw nothing. */
+export function polylinePath(
+  points: readonly { x: number; y: number }[],
+  closed: boolean,
+): string {
+  if (points.length < 2) return "";
+  let d = `M ${points[0].x} ${points[0].y}`;
+  for (let i = 1; i < points.length; i++)
+    d += ` L ${points[i].x} ${points[i].y}`;
+  return closed ? d + " Z" : d;
+}
+
+/** Whether the scan is a CLOSED path: the ellipse, unless its ratio collapses
+ *  it to a line (spec §scan-patterns). */
+export function isClosedPath(mode: string, ratio: number): boolean {
+  return mode === "ellipse" && ratio > 0;
+}
+
+/** Axis-handle sizes as multiples of the overlay stroke: the drawn dot's
+ *  radius, and the grab radius around it (spec §views). */
+export const AXIS_HANDLE_DOT = 3;
+export const AXIS_HANDLE_HIT = 6;
+
+/** Whether a press at `p` (frame px) grabs the axis handle at `handle`. A
+ *  `{0,0}` handle is the uncalibrated sentinel — hidden, never hit. */
+export function hitsAxisHandle(
+  p: { x: number; y: number },
+  handle: { x: number; y: number },
+  stroke: number,
+): boolean {
+  if (handle.x === 0 && handle.y === 0) return false;
+  return (
+    Math.hypot(p.x - handle.x, p.y - handle.y) <= stroke * AXIS_HANDLE_HIT
+  );
+}
