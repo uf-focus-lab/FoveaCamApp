@@ -220,6 +220,7 @@ Reusable set under `app/src/components/**` (+ inputs/layouts/record/capture). "T
 | `Badge` | pill label | `color, solid`, slot | `--theme` (default `gray`) | **only badge primitive** |
 | `CameraRole` | L/C/R badge | `role` | via `THEME[role]` | thin wrapper over Badge |
 | `RangeSelect` / `range-slider` (inputs) | numeric range input | — | — | two range widgets (`components/RangeSelect` + `inputs/range-slider`) |
+| `dual-range-slider` (inputs) | two-thumb `[start, end]` interval input | `modelValue, min, max, step, minGap, neutral, disabled, color, label, valueText`; label slot | `color` (infill + glyphs), `--theme`/`--accent` focus outline | `range-slider`'s twin (same body, infill, glyphs, keyboard, right-click-neutral); value math in `inputs/dual-range.ts`; first user MirrorLink's Scan Pattern pane |
 | `Matrix` | numeric matrix table | `mat, round` | `#ccc`/`#eee` borders (hardcoded) | monospace right-aligned cells |
 | `PosView` | 2D XY pad (voltage/angle), drag | `pos, color, unit, lim` | `--color` (active) / gray (idle) | drag surface pattern |
 | `NavBack` | back arrow bar | slot; `back` event | `#fff3` hover | hand-rolled button + SVG |
