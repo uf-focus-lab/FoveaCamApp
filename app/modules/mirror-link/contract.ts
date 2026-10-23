@@ -91,6 +91,8 @@ export type TrajectoryTelemetry = {
   skew_us: { L: number; R: number };
   /** The flip bricks' match tolerance this run (µs). */
   flip_tolerance_us: number;
+  /** How the last live re-upload swapped tables (`TrajectoryStat.lastSwap`); null before any. */
+  last_swap: "atomic" | "stop-start" | null;
 };
 
 /** Matched fovea footprint + confidence, lifted into wide-frame pixels — the
@@ -243,6 +245,7 @@ export const mirrorLink = defineContract({
         unmatched: { L: 0, R: 0 },
         skew_us: { L: 0, R: 0 },
         flip_tolerance_us: 0,
+        last_swap: null,
       } as TrajectoryTelemetry,
     },
     // Capture manifest telemetry (spec §capture); image data pulled via

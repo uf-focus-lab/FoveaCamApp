@@ -179,6 +179,7 @@ vi.mock("@orchestrator/controller-node", () => {
       updateAt: (_t: bigint, p: unknown) => p,
       close: async () => void ctl.events.push("pos-close"),
     }),
+    trajectorySnapshot: () => ({ lastSwap: "atomic" }),
     async openTrajectory(spec: Spec, opts: { name: string }) {
       if (ctl.openGate) await ctl.openGate;
       if (ctl.openError) throw ctl.openError;
@@ -852,6 +853,7 @@ describe("live geometry → replace", () => {
     expect(h.tele.scan.amp_deg).toBe(0.8);
     await h.tick();
     expect(h.tele.perf.trajectory.reuploads).toBe(2);
+    expect(h.tele.perf.trajectory.last_swap).toBe("atomic");
   });
 
   it("skips an identical spec (a no-op write re-uploads nothing)", async () => {
@@ -1153,6 +1155,7 @@ describe("telemetry", () => {
       unmatched: { L: 0, R: 0 },
       skew_us: { L: 0, R: 0 },
       flip_tolerance_us: 0,
+      last_swap: null,
     });
   });
 

@@ -242,12 +242,6 @@ const runEndReason = (state: NodeTrajectoryState): string =>
     ? "controller disconnected — scan stopped"
     : "the controller ended the trajectory run — scan stopped";
 
-/** The controller's MCU↔host clock calibration flag. Read defensively: the
- *  getter (`Controller.clockCalibrated`) lands with the controller fix round;
- *  a build without it reads as calibrated (the old behavior). */
-const clockCalibrated = (c: object): boolean =>
-  (c as { clockCalibrated?: boolean }).clockCalibrated ?? true;
-
 /** Physical saturation limits for the vergence DOF, in radians (the shared
  *  degree constants). The drawer's Verge/Shift sliders ARE these DOF, so their
  *  ranges are the controllers' limits (spec §targeting). */
@@ -606,6 +600,7 @@ export default function mirrorLinkSession(
     const pushes = { ok: 0, timeout: 0, busy: 0, other: 0 };
     let latenessUs = 0;
     let reuploads = 0;
+    let lastSwap: TrajectoryTelemetry["last_swap"] = null;
     let lastOkMs = 0;
     /** Flip counters for THIS run: `base` holds what retired bricks counted
      *  (a tolerance change or a restart rebuilds them), `flipCounts` is base +
@@ -639,6 +634,7 @@ export default function mirrorLinkSession(
       pushes.ok = pushes.timeout = pushes.busy = pushes.other = 0;
       latenessUs = 0;
       reuploads = 0;
+      lastSwap = null;
       lastOkMs = 0;
       flipBase.flipped = { L: 0, R: 0 };
       flipBase.unmatched = { L: 0, R: 0 };
@@ -659,6 +655,7 @@ export default function mirrorLinkSession(
         unmatched: { ...flipCounts.unmatched },
         skew_us: { ...flipSkewUs },
         flip_tolerance_us: flips.L || flips.R ? Number(flipToleranceNs) / 1000 : 0,
+        last_swap: lastSwap,
       };
     }
 
@@ -1183,7 +1180,9 @@ export default function mirrorLinkSession(
         publishScanBlocked("controller firmware >= 2.2.0 required");
         return false;
       }
-      if (!clockCalibrated(c)) {
+      // Every trusted timestamp (marker pushes, flip anchors, lateness) rides
+      // the MCU↔host offset — no scan on an unpinged or lapsed clock.
+      if (!c.clockCalibrated) {
         publishScanBlocked("controller clock not calibrated yet");
         return false;
       }
@@ -1406,6 +1405,8 @@ export default function mirrorLinkSession(
       runRaw = built.raw;
       rememberSpec(traj, built.spec);
       reuploads++;
+      // Atomic (firmware 2.2.1) or the STOP/START pair — the node's row says.
+      lastSwap = controllerNode().trajectorySnapshot?.()?.lastSwap ?? lastSwap;
       // Markers moved closer than the flip bricks' tolerance allows: rebuild
       // them tighter (a wider spacing keeps the bricks — nearest wins anyway).
       const tol = flipTolerance(built);
