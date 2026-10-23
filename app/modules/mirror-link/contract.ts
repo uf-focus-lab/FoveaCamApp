@@ -11,10 +11,7 @@
 // Behavior spec: docs/spec/mirror-link.md (patterns: §scan-patterns).
 
 import { cmd, defineContract } from "@lib/orchestrator/protocol";
-import {
-  captureCommands,
-  captureTelemetry,
-} from "@lib/orchestrator/contracts";
+import { captureCommands, captureTelemetry } from "@lib/orchestrator/contracts";
 import type { Point2d, Rect } from "core/Geometry";
 import { DEFAULT_VERGENCE_TUNING } from "@lib/vergence/tuning";
 import type { Pos } from "@lib/controller-codec";
@@ -23,8 +20,9 @@ import type { RingReadout } from "@lib/ring-code";
 
 /** The applied scan timing, published exactly while the scan is ACTIVE (spec
  *  §lifecycle). `exposure_us`/`frame_rate` are the values the cameras actually
- *  took (post-clamp), so a rig that can't reach `hz` is visible; `mismatch` is
- *  set when the applied exposure misses `period_us` by more than the tolerance.
+ *  took (post-clamp, 0 in TriggerWidth where the pulse IS the exposure), so a
+ *  rig that can't reach `hz` is visible; `mismatch` / `mismatch_reason` name
+ *  the feasibility check that failed (spec §exposure-windows, the reason table).
  *
  *  MUST stay a `type` alias, NOT an `interface` — a telemetry slot's value is
  *  constrained to `Serializable` (an index-signature type), which an interface
@@ -103,7 +101,8 @@ export type MatchInfo = { rect: Rect; score: number };
 export const mirrorLink = defineContract({
   state: {
     /** Leased camera serials per role — the L/R views bind the RAW
-     *  `camera/<serial>/convert` pipes (spec §views). Set on acquire. */
+     *  `camera/<serial>/convert` pipes, or the flip pipes in front of them
+     *  while a triangle scan runs (`flipPipes`, spec §views). Set on acquire. */
     serials: {} as Partial<Record<"L" | "C" | "R", string>>,
     /** The advertised center `undistort:<serial>` pipe id while active — null
      *  when unadvertised (no calibration); the renderer falls back to the raw
@@ -237,8 +236,9 @@ export const mirrorLink = defineContract({
     match_right: null as MatchInfo | null,
     // Control-path latency — `c.actuate()` round-trip — and the pacer's own
     // tick interval: a stall on the orchestrator loop (an allocation, a
-    // synchronous native call) shows up as a `tickGapMs.max` spike, which on
-    // the rig is a straight chord across the scanned ring.
+    // synchronous native call) shows up as a `tickGapMs.max` spike. The pacer
+    // drives only the IDLE pose (the scan itself plays on the MCU, see
+    // `trajectory`), so a stall there is a late re-aim, not a path artefact.
     perf: {
       actuateMs: { mean: 0, max: 0 } as Stat,
       tickGapMs: { mean: 0, max: 0 } as Stat,

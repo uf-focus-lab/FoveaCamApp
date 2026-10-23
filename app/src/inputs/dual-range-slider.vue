@@ -214,7 +214,7 @@ const thumbAria = computed(() => {
     :class="{ dragging: active !== null }"
     @mousedown="track"
     @contextmenu="resetToNeutral"
-    :disabled="disabled"
+    :disabled="disabled || undefined"
   >
     <div class="intent">
       <slot></slot>
@@ -256,8 +256,10 @@ const thumbAria = computed(() => {
   user-select: none;
   margin-top: calc(1ch + 8px);
   margin-bottom: calc(1ch + 8px);
-  // [disabled]: `:disabled` never matches a <div>; Vue reflects the boolean
-  // prop as a bare attribute.
+  // [disabled]: `:disabled` never matches a <div>, and Vue writes a false
+  // boolean on a <div> as disabled="false" (which [disabled] WOULD match) —
+  // so the template binds `disabled || undefined`: the attribute is present
+  // only while disabled.
   &[disabled] {
     cursor: not-allowed;
     opacity: 0.5;

@@ -216,14 +216,16 @@ frames matched to an anchor marked `flip`.
   arriving afterwards is pruned by a later frame. The session pushes the anchor synchronously on the FIN, which
   precedes the frame's arrival in practice; a rising `unmatched` share is the symptom
   when it does not.
-- **Tolerance (as the session computes it).** `toleranceNs = 0.4 · min(T, closest marker
-  spacing)`, where `T` is the sweep time (half the triangle's 2T period) and the marker
-  spacing is taken circularly over the period (`session.ts` `flipTolerance`), floored at
-  1 ms for clock alignment (`docs/spec/mirror-link-scan-patterns.md`, review round 1);
-  when that floor exceeds 0.45 × the closest marker spacing the windows are too close to
-  flip reliably at that frequency and the scan reports `mismatch`. Bounding by the
-  marker spacing keeps a frame whose own anchor is late from matching the neighbouring
-  marker.
+- **Tolerance (as the session computes it).** `toleranceNs = 0.4 · min(T, edge gap)`,
+  where `T` is the sweep time (half the triangle's 2T period) and the edge gap is the
+  smallest distance between EDGES of markers with different flip — the next marker's
+  start minus the previous marker's end, circularly over the period (`scan.ts`
+  `flipToleranceUs` / `minFlipEdgeGapUs`; the brick matches either edge, so that gap is
+  the ambiguity distance) — floored at 1 ms for clock alignment and capped at 0.45 × the
+  edge gap (`docs/spec/mirror-link-scan-patterns.md`, review rounds 1 and 2); when the
+  floor exceeds the cap the windows are too close to flip reliably at that frequency and
+  the scan reports `mismatch`. Bounding by the edge gap keeps a frame whose own anchor is
+  late from matching the neighbouring marker's nearer edge.
 - **Counters.** `flipProbe(pipeId)` returns the thread meter (input `frame`, output
   `flip`) plus `frames`, `flipped`, `unmatched`, `anchorPoolSize`, `anchorDrops`,
   `toleranceNs` and `matchedSkewNs`, or `null` for an unknown pipe; `flipProbeAll()`

@@ -44,6 +44,17 @@ const MODE_OPTIONS: readonly SingleSelectOption<ScanMode>[] = [
 ];
 
 const ellipse = computed(() => state.scan_mode === "ellipse");
+/** The axis slider's range: the 0.5° grid over (-180, 180]. A handle drag
+ *  (`setAxis`) may leave the state in (-180, -179.5), which the slider cannot
+ *  show — the proxy clamps on READ so the thumb stays on the track and the
+ *  arrow keys step from the shown value; the state keeps the exact angle
+ *  until the slider writes. */
+const AXIS_MIN = -179.5;
+const AXIS_MAX = 180;
+const axisDeg = computed<number>({
+  get: () => Math.min(Math.max(state.scan_axis_deg, AXIS_MIN), AXIS_MAX),
+  set: (v) => void (state.scan_axis_deg = v),
+});
 const plusSign = (v: string) => (v.startsWith("-") ? v : "+" + v);
 
 /** The base period T (ms): one ellipse revolution, one triangle sweep. Window
@@ -114,7 +125,9 @@ const SYNC_TITLE = `Give the falling sweep the rising sweep's window: ${SYNC_MEA
 
 <template>
   <div class="options fill">
-    <h4 title="The path both foveas trace around the aimed center, and where along it they expose.">
+    <h4
+      title="The path both foveas trace around the aimed center, and where along it they expose."
+    >
       <span>Scan Pattern</span>
     </h4>
     <div class="toggle-row" :title="MODE_TITLE">
@@ -127,10 +140,10 @@ const SYNC_TITLE = `Give the falling sweep the rising sweep's window: ${SYNC_MEA
       />
     </div>
     <RangeSlider
-      v-model="state.scan_axis_deg"
+      v-model="axisDeg"
       :title="AXIS_TITLE"
-      :min="-179.5"
-      :max="180"
+      :min="AXIS_MIN"
+      :max="AXIS_MAX"
       :neutral="0"
       :step="0.5"
     >
@@ -159,7 +172,9 @@ const SYNC_TITLE = `Give the falling sweep the rising sweep's window: ${SYNC_MEA
         :detents="[0]"
       >
         <span>Ratio</span>
-        <span>{{ state.scan_ratio > 0 ? state.scan_ratio.toFixed(2) : "line" }}</span>
+        <span>{{
+          state.scan_ratio > 0 ? state.scan_ratio.toFixed(2) : "line"
+        }}</span>
       </RangeSlider>
       <DualRangeSlider
         v-model="scanWindow"

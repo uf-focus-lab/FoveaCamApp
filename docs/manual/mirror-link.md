@@ -215,7 +215,8 @@ current settings would run.
 | trigger rate above the camera's maximum frame rate | The cameras cannot take frames that fast — lower **Scan Frequency**. |
 | exposures closer than the sensor readout | One exposure starts before the sensor has finished reading out the previous frame — in triangle mode move the two windows' ends apart (more time from one window's end to the next one's start), or lower **Scan Frequency**. |
 | exposure windows too close for reliable flipping at this frequency | The two triangle frames are too close together in time to tell apart which one to flip — widen the spacing between the windows, or lower **Scan Frequency**. |
-| unequal windows: Timed exposure uses the rising window for both | On a timed-fallback camera with **Sync Windows** off, the camera takes the rising window's length for both frames; set the windows equal (or turn Sync on) if that is not what you want. |
+| unequal windows: Timed exposure gives both the rising window's length | On a timed-fallback camera with **Sync Windows** off, the camera takes the rising window's length for both frames; set the windows equal (or turn Sync on) if that is not what you want. |
+| Timed exposure would run into the next trigger | On a timed-fallback camera the (equal) exposure is longer than the gap to the next trigger, so the second frame would start exposing before the first one ends — shorten the windows, or lower **Scan Frequency**. |
 | Timed exposure clamped to the camera's exposure range | On a timed-fallback camera the window is longer or shorter than the camera can expose — change the window's length. |
 | controller clock calibration lapsed | The controller's clock link stopped answering mid-scan, so the frames can no longer be timed against the path — check the controller's connection. |
 

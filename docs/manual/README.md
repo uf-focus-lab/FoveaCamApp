@@ -26,7 +26,7 @@ Read in this order the first time:
    steering bench), [Tracking - Multi](./multi-fovea.md) (multiple tracked
    targets), [Disparity Scope](./disparity-scope.md) (closed-loop vergence
    with PID tuning and a match debugger), and [MirrorLink](./mirror-link.md)
-   (circular fovea scan that reads a blinking source as a dashed ring).
+   (ellipse / line / triangle fovea scans with triggered exposure windows).
 6. **[Recording and Capture](./recording-and-capture.md)** — record any app's
    session to a `.fcap` file or grab full-depth stills, from every app's title
    bar.
