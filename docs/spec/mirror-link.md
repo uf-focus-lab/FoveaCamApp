@@ -379,7 +379,8 @@ says why it cannot run as asked):
 with the run's spec — a failed re-upload leaves it at the value the MCU plays, unless the
 failed swap's table may be live, §actuation), `period_us`
 (T or 2T), `windows`
-(`{ t_offset_us, pulse_us }` per marker, as the MCU runs them — republished after every
+(`{ t_offset_us, pulse_us }` per marker, as the MCU runs them (unless the failed swap's
+table may be live — `mismatch` names it) — republished after every
 re-upload / restart), `exposure_mode` (`TriggerWidth`, or `Timed` when either eye fell
 back), the per-eye applied `exposure_us` (0 in TriggerWidth) and readback `frame_rate`,
 `mismatch`, and `mismatch_reason` — one sentence, the reasons joined with "; " in this
@@ -394,7 +395,7 @@ order, null without a mismatch:
 | `exposures closer than the sensor readout` | triangle: an end-to-end spacing below the readout time (`SensorReadoutTime`, else `1 / frame_rate_range.max`) |
 | `exposure windows too close for reliable flipping at this frequency` | triangle: the flip tolerance floor exceeds its cap (§triangle-flip) |
 | `controller clock calibration lapsed` | the controller clock went uncalibrated mid-scan (§lifecycle; no stop) |
-| `replacement swap unconfirmed — the mirror may run the previous edit` | a live edit's swap failed in a way that may have landed (§actuation); cleared by the next landed swap |
+| `replacement swap unconfirmed — the mirror may run the previous edit` | a live edit's swap failed in a way that may have landed (§actuation); cleared by the next landed swap or a failed pair swap that STOPped the sibling |
 
 A mismatch warns once until it clears (`report("mirror-link", "the cameras cannot take
 the exposure windows as asked: <reason>…", "warning")`).
@@ -706,12 +707,26 @@ swap — an atomic START replaces whichever table plays, the STOP/START pair STO
 sibling — a failed pair swap that STOPped it (`TrajectoryReplaceError.retiredSiblings`:
 the entry moves to the grace), or the run's end retires it. While such a sibling exists the MCU may be running
 the abandoned geometry, so `scan.mismatch` names "replacement swap unconfirmed — the mirror
-may run the previous edit" and an edit back to the running geometry still swaps (the
-identical-spec shortcut is suspended) so the next landed swap settles it. In the Timed
-fallback a pre-swap exposure shrink is written back only when the new table can never be
-live: while it may be, the shorter exposure is safe under either table and the longer one
-could overrun its pulse; the clamp check is suspended meanwhile (the camera deliberately
-differs from the running table).
+may run the previous edit" until the next landed swap or a failed pair swap that STOPped
+the sibling, and an edit back to the running geometry still swaps (the identical-spec
+shortcut is suspended) so the next landed swap settles it. The session does not wait for an
+edit: the failure schedules ONE settling replace of the current geometry (throttled like an
+edit) per unconfirmed streak — re-armed by a landed swap, the run's table closing, a new run
+or a user edit — and none once `1 + siblings ≥ TRAJECTORY_MAX_TABLES − 1` (each unclear
+retry reserves another table). Should the running table plus the siblings fill the
+controller's `TRAJECTORY_MAX_TABLES` (checked before an upload and after a failure; the
+controller's own "Trajectory capacity … exceeded" refusal counts too), no edit could land
+any more: the session restarts the CURRENT spec — stop → start at the same period,
+phase-fresh, `closeTrajectory` STOPping and DELETEing every sibling — and reports "live
+edits exhausted the controller's tables — the scan restarts". In the Timed fallback a
+pre-swap exposure shrink is written back only when the new table can never be live: while
+it may be, the shorter exposure is safe under either table and the longer one could overrun
+its pulse. Once a failed swap leaves only the running table possibly live (a failed pair
+swap STOPped the last sibling) the camera grows back to the running table's own marker-0
+pulse — safe, that table is the one playing and its MCU pulses carry it. The clamp check is
+suspended while a sibling may be live or the Timed camera holds an exposure written for
+another pulse than the running table's (the camera deliberately differs from it); the
+identical-spec shortcut is suspended in that second case too, so the swap re-times it.
 
 **`perf.trajectory`** (`TrajectoryTelemetry`, published with `perf` at the
 `VOLT_TELEMETRY_INTERVAL_MS` throttle; counters reset per scan): `running` (scan active and

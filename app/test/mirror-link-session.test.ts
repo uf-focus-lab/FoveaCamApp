@@ -232,6 +232,7 @@ vi.mock("@orchestrator/controller-node", () => {
 });
 
 vi.mock("@orchestrator/controller", () => ({
+  TRAJECTORY_MAX_TABLES: 4,
   activeController: () => {
     ctl.controllerReads++;
     return ctl.controller;
@@ -1376,6 +1377,244 @@ describe("failed replace: the routed new id is scored against ITS spec", () => {
     await vi.advanceTimersByTimeAsync(0);
     await settle();
     expect(h.triple.leases.L.camera.exposure).toBe(80_000);
+  });
+
+  it("a failed pair swap that STOPped the sibling grows the Timed camera back to the running table's exposure", async () => {
+    const h = await harness({
+      state: { scan_mode: "triangle", tri_window_sync: false },
+    });
+    h.triple.leases.R.camera.modes.splice(1); // R: Timed only
+    await h.setState("tri_window_rise", [0.1, 0.9]);
+    await h.setState("tri_window_fall", [0.1, 0.9]);
+    await h.call("startScan");
+    await settle();
+    ctl.replaceError = await replaceErrorWith(7, true);
+    await h.setState("tri_window_rise", [0.1, 0.6]);
+    await vi.advanceTimersByTimeAsync(0);
+    await settle();
+    expect(h.triple.leases.L.camera.exposure).toBe(50_000);
+    // Back to the running geometry, but the swap falls to the pair: sibling 7
+    // is STOPped (retired) and the START fails — the old table plays alone,
+    // its MCU pulses carry 80 ms, so the camera grows back to it.
+    const { TrajectoryReplaceError } = await import("@orchestrator/controller");
+    ctl.replaceError = new (TrajectoryReplaceError as unknown as new (
+      m: string,
+      r: boolean,
+      c?: unknown,
+      rep?: { id: number; maybeLive: boolean } | null,
+      sibs?: readonly number[],
+    ) => Error)("pair START REJ", true, undefined, null, [7]);
+    perfNow += 200;
+    await h.setState("tri_window_rise", [0.1, 0.9]);
+    await vi.advanceTimersByTimeAsync(200);
+    await settle();
+    expect(h.traj().replaceCalls).toBe(2);
+    expect(h.triple.leases.L.camera.exposure).toBe(80_000);
+    expect(h.tele.scan.exposure_us.L).toBe(80_000);
+    expect(h.tele.scan.mismatch).toBe(false);
+    expect(ctl.reports.some((r) => r.includes("clamped"))).toBe(false);
+    // A Timed falling-END edit afterwards behaves as ever: identical MCU
+    // spec, no swap, the unequal-windows reason alone.
+    ctl.replaceError = null;
+    perfNow += 200;
+    await h.setState("tri_window_fall", [0.1, 0.6]);
+    await vi.advanceTimersByTimeAsync(200);
+    await settle();
+    expect(h.traj().replaceCalls).toBe(2);
+    expect(h.tele.scan.mismatch_reason).toBe(
+      "unequal windows: Timed exposure gives both the rising window's length",
+    );
+  });
+
+  it("reason order: the unconfirmed swap comes LAST, after a Timed reason", async () => {
+    const h = await harness({
+      state: { scan_mode: "triangle", tri_window_sync: false },
+    });
+    h.triple.leases.R.camera.modes.splice(1); // R: Timed only
+    await h.setState("tri_window_rise", [0.1, 0.5]);
+    await h.setState("tri_window_fall", [0.1, 0.8]);
+    await h.call("startScan");
+    await settle();
+    expect(h.tele.scan.mismatch_reason).toBe(
+      "unequal windows: Timed exposure gives both the rising window's length",
+    );
+    ctl.replaceError = await replaceErrorWith(7, true);
+    await h.setState("scan_amp", 0.9);
+    await vi.advanceTimersByTimeAsync(0);
+    await settle();
+    expect(h.traj().replaceCalls).toBe(1);
+    expect(h.tele.scan.mismatch_reason).toBe(
+      "unequal windows: Timed exposure gives both the rising window's length; " +
+        "replacement swap unconfirmed — the mirror may run the previous edit",
+    );
+  });
+
+  it("the failure warning says which table may run", async () => {
+    const h = await harness();
+    await h.call("startScan");
+    ctl.replaceError = await replaceErrorWith(7, true);
+    await h.setState("scan_amp", 0.9);
+    await vi.advanceTimersByTimeAsync(0);
+    await settle();
+    expect(
+      ctl.reports.filter((r) =>
+        r.includes("may run either the previous or the new edit"),
+      ),
+    ).toHaveLength(1);
+    expect(ctl.reports.some((r) => r.includes("keeps its previous"))).toBe(
+      false,
+    );
+
+    const g = await harness();
+    await g.call("startScan");
+    ctl.replaceError = new Error("upload REJ");
+    await g.setState("scan_amp", 0.9);
+    await vi.advanceTimersByTimeAsync(0);
+    await settle();
+    expect(
+      ctl.reports.filter((r) =>
+        r.includes(
+          "live trajectory re-upload failed: upload REJ — the scan keeps its previous geometry",
+        ),
+      ),
+    ).toHaveLength(1);
+    expect(ctl.reports.some((r) => r.includes("may run either"))).toBe(false);
+  });
+
+  it("capacity: three possibly-live failures fill the tables → the current spec restarts", async () => {
+    const h = await harness();
+    await h.call("startScan");
+    const first = h.traj();
+    for (const [i, amp] of [0.6, 0.7, 0.8].entries()) {
+      ctl.replaceError = await replaceErrorWith(7 + i, true);
+      perfNow += 200;
+      await h.setState("scan_amp", amp);
+      await vi.advanceTimersByTimeAsync(200);
+      await settle(30);
+    }
+    // 1 running + 3 possibly-live siblings = TRAJECTORY_MAX_TABLES: no swap
+    // can be uploaded — stop → start of the CURRENT spec.
+    // The edits + the first streak's one settling retry (inside the first
+    // edit's 200 ms, failing on id 7 again).
+    expect(first.replaceCalls).toBe(4);
+    expect(first.stops).toBeGreaterThanOrEqual(1);
+    expect(first.closes).toBe(1);
+    expect(ctl.trajectories).toHaveLength(2);
+    expect(h.traj().state).toBe("running");
+    expect(h.traj().startCalls).toBe(1);
+    const ref = patternSamples("ellipse", 10, 0, 0.8, 0.5);
+    const want = chainVolts({ x: 0, y: 0 }, ref[5]!.offset);
+    expect(h.traj().spec.samples[5]!.left.x).toBeCloseTo(want.left.x, 9);
+    expect(
+      ctl.reports.filter((r) =>
+        r.includes(
+          "live edits exhausted the controller's tables — the scan restarts",
+        ),
+      ),
+    ).toHaveLength(1);
+    expect(h.tele.scan.mismatch).toBe(false);
+    expect(h.tele.scan.amp_deg).toBe(0.8);
+    // A fourth edit swaps on the fresh run as usual.
+    ctl.replaceError = null;
+    perfNow += 200;
+    await h.setState("scan_amp", 0.9);
+    await vi.advanceTimersByTimeAsync(200);
+    await settle();
+    expect(h.traj().replaced).toHaveLength(1);
+    expect(h.tele.scan.amp_deg).toBe(0.9);
+    expect(h.tele.scan.mismatch).toBe(false);
+  });
+
+  it("capacity: the controller's own capacity refusal restarts the scan too", async () => {
+    const h = await harness();
+    await h.call("startScan");
+    ctl.replaceError = new Error("Trajectory capacity (4 tables) exceeded");
+    await h.setState("scan_amp", 0.9);
+    await vi.advanceTimersByTimeAsync(0);
+    await settle(30);
+    expect(ctl.trajectories).toHaveLength(2);
+    expect(ctl.trajectories[0]!.closes).toBe(1);
+    expect(h.traj().state).toBe("running");
+    expect(
+      ctl.reports.some((r) => r.includes("exhausted the controller's tables")),
+    ).toBe(true);
+    expect(ctl.reports.some((r) => r.includes("re-upload failed"))).toBe(false);
+  });
+
+  it("settling: one automatic replace per unconfirmed streak (re-armed by a user edit)", async () => {
+    const h = await harness();
+    await h.call("startScan");
+    ctl.replaceError = await replaceErrorWith(7, true);
+    await h.setState("scan_amp", 0.9);
+    await vi.advanceTimersByTimeAsync(0);
+    await settle();
+    expect(h.traj().replaceCalls).toBe(1);
+    // No user edit: inside the throttle nothing yet…
+    perfNow += 50;
+    await vi.advanceTimersByTimeAsync(50);
+    await settle();
+    expect(h.traj().replaceCalls).toBe(1);
+    // …past it ONE settling replace of the current geometry.
+    perfNow += 100;
+    await vi.advanceTimersByTimeAsync(100);
+    await settle();
+    expect(h.traj().replaceCalls).toBe(2);
+    // It fails unclear again (same sibling): no further automatic retry.
+    perfNow += 1000;
+    await vi.advanceTimersByTimeAsync(1000);
+    await settle();
+    expect(h.traj().replaceCalls).toBe(2);
+    expect(h.tele.scan.mismatch_reason).toBe(
+      "replacement swap unconfirmed — the mirror may run the previous edit",
+    );
+    // A user edit re-arms one retry after ITS failure.
+    await h.setState("scan_amp", 1.0);
+    await vi.advanceTimersByTimeAsync(0);
+    await settle();
+    expect(h.traj().replaceCalls).toBe(3);
+    perfNow += 200;
+    await vi.advanceTimersByTimeAsync(200);
+    await settle();
+    expect(h.traj().replaceCalls).toBe(4);
+    perfNow += 1000;
+    await vi.advanceTimersByTimeAsync(1000);
+    await settle();
+    expect(h.traj().replaceCalls).toBe(4);
+    // The settling retry that lands clears the state.
+    ctl.replaceError = null;
+    await h.setState("scan_amp", 0.8);
+    await vi.advanceTimersByTimeAsync(0);
+    await settle();
+    expect(h.traj().replaced).toHaveLength(1);
+    expect(h.tele.scan.mismatch).toBe(false);
+  });
+
+  it("settling: never when the retry could leave no table free", async () => {
+    const h = await harness();
+    await h.call("startScan");
+    ctl.replaceError = await replaceErrorWith(7, true);
+    await h.setState("scan_amp", 0.9);
+    await vi.advanceTimersByTimeAsync(0);
+    await settle();
+    // The settling retry also fails unclear, on a NEW id: two siblings now
+    // (1 + 2 ≥ TRAJECTORY_MAX_TABLES − 1) — and a user edit's failure there
+    // schedules none either.
+    ctl.replaceError = await replaceErrorWith(8, true);
+    perfNow += 200;
+    await vi.advanceTimersByTimeAsync(200);
+    await settle();
+    expect(h.traj().replaceCalls).toBe(2);
+    ctl.replaceError = await replaceErrorWith(8, true);
+    perfNow += 200;
+    await h.setState("scan_amp", 1.0);
+    await vi.advanceTimersByTimeAsync(200);
+    await settle();
+    expect(h.traj().replaceCalls).toBe(3);
+    perfNow += 1000;
+    await vi.advanceTimersByTimeAsync(1000);
+    await settle();
+    expect(h.traj().replaceCalls).toBe(3);
+    expect(ctl.trajectories).toHaveLength(1);
   });
 });
 

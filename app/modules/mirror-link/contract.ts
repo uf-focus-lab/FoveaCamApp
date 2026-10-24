@@ -44,8 +44,10 @@ export type ScanTelemetry = {
   /** The TRAJECTORY period on the MCU (µs): T, or 2T for the triangle. */
   period_us: number;
   /** Trigger markers per period: 1 (ellipse) or 2 (triangle), in marker
-   *  order. Each window is `{ t_offset_us, pulse_us }` — the exposure starts
-   *  at the offset and lasts the pulse (TriggerWidth exposure). */
+   *  order, as the RUNNING table carries them (unless the failed swap's table
+   *  may be live — `mismatch` names it). Each window is `{ t_offset_us,
+   *  pulse_us }` — the exposure starts at the offset and lasts the pulse
+   *  (TriggerWidth exposure). */
   windows: { t_offset_us: number; pulse_us: number }[];
   /** How the cameras take the window: `TriggerWidth` (the trigger pulse IS
    *  the exposure, the primary mode) or `Timed` (fallback on a model without
@@ -53,7 +55,10 @@ export type ScanTelemetry = {
    *  windows then mismatch). */
   exposure_mode: "TriggerWidth" | "Timed";
   /** Per-eye applied values (post-clamp): the Timed exposure (0 in
-   *  TriggerWidth mode) and the camera's readback frame rate limit. */
+   *  TriggerWidth mode), written for the running table's windows (unless the
+   *  failed swap's table may be live — `mismatch` names it; the camera then
+   *  keeps the shorter exposure), and the camera's readback frame rate
+   *  limit. */
   exposure_us: { L: number; R: number };
   frame_rate: { L: number; R: number };
   /** Set when the scan cannot run as asked — one of the spec's reason table
