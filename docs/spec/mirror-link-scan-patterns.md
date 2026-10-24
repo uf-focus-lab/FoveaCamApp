@@ -573,10 +573,15 @@ UI/docs lens (others pending below). Fixed in round 8:
   per streak (flag cleared on a landed swap, `closeTrajectory`,
   `resetRunStats`, or a user edit), and never when
   `1 + siblingIds.size >= TRAJECTORY_MAX_TABLES − 1` (each unclear retry
-  reserves another table; the capacity rule then applies). The same hook
-  runs when `retiredSiblings` empties `siblingIds` while the Timed camera
-  holds the shorter exposure (so the windows are swapped onto the camera's
-  real exposure instead of a false "clamped" reason). (3) `windows` /
+  reserves another table; the capacity rule then applies). When
+  `retiredSiblings` empties `siblingIds` (nothing may be live any more)
+  while the Timed camera holds the shorter exposure, the failure branch
+  re-grows the camera directly to the RUNNING table's pulse
+  (`retimeIfNeeded(t, runRaw[0].pulseUs)`, safe: that table plays); a
+  `timedStale()` guard (Timed and `appliedPulseUs ≠ runRaw[0].pulseUs`)
+  suspends the clamp check and the identical-spec shortcut meanwhile, as
+  does a pending `retimeAfter`. The controller's capacity refusal is a typed
+  `TrajectoryCapacityError` (round 9). (3) `windows` /
   `exposure_us` carry the same may-be-live caveat as `amp_deg` (spec +
   contract). (4) Tests pin the reason ORDER (two reasons at once) and the
   "may run either the previous or the new edit" warning text.

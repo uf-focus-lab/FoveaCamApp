@@ -105,6 +105,7 @@ import {
   Controller,
   TRAJECTORY_CHUNK_SAMPLES,
   TRAJECTORY_MAX_TABLES,
+  TrajectoryCapacityError,
   TrajectoryReplaceError,
   classifyTrajectoryStartError,
   chunkTrajectorySamples,
@@ -496,7 +497,9 @@ describe("Controller.uploadTrajectory (CMD_TRAJECTORY)", () => {
     ctrl = await makeController();
     for (let i = 0; i < TRAJECTORY_MAX_TABLES; i++)
       await ctrl.uploadTrajectory(spec(2));
-    await expect(ctrl.uploadTrajectory(spec(2))).rejects.toThrow(/capacity/);
+    await expect(ctrl.uploadTrajectory(spec(2))).rejects.toThrow(
+      TrajectoryCapacityError,
+    );
     mockCalls.length = 0;
     await expect(
       ctrl.uploadTrajectory({ periodUs: 10, samples: [] }),

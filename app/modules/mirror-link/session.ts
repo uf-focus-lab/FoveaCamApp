@@ -44,6 +44,7 @@ import {
 import {
   activeController,
   TRAJECTORY_MAX_TABLES,
+  TrajectoryCapacityError,
   TrajectoryReplaceError,
   type TrajectoryFrameOutcome,
   type TrajectorySpec,
@@ -1745,11 +1746,10 @@ export default function mirrorLinkSession(
       await restartScanNow({ force: true });
     }
 
-    /** The controller's own capacity refusal (`allocateTrajectoryId`; no typed
-     *  error carries it). */
+    /** The controller's own capacity refusal (`allocTrajectoryId`) — defensive:
+     *  the sibling count check above it makes it unreachable in practice. */
     const isCapacityError = (e: unknown): boolean =>
-      e instanceof Error &&
-      /Trajectory capacity \(\d+ tables\) exceeded/.test(e.message);
+      e instanceof TrajectoryCapacityError;
 
     /** Timed: the camera holds an exposure written for another marker-0 pulse
      *  than the RUNNING table's (a possibly-live failed shrink kept the shorter

@@ -396,6 +396,16 @@ export interface TrajectoryHandle {
  *  replaces whichever table plays; the pair STOPs it first), a failed pair
  *  swap whose sibling STOP landed (`retiredSiblings` names those), `stop()`,
  *  the "run is over" branch, or `dispose()`. */
+/** Every table id is held (the current table plus possibly-live siblings,
+ *  none merely in grace — a graced id is waited for instead): a consumer
+ *  that keeps editing live (MirrorLink) restarts its run to free them. */
+export class TrajectoryCapacityError extends Error {
+  constructor() {
+    super(`Trajectory capacity (${TRAJECTORY_MAX_TABLES} tables) exceeded`);
+    this.name = "TrajectoryCapacityError";
+  }
+}
+
 export class TrajectoryReplaceError extends Error {
   constructor(
     message: string,
@@ -1156,10 +1166,7 @@ export class Controller {
           this.trajectoryIds.add(candidate);
           return candidate;
         }
-      if (this.trajectoryGrace.size === 0)
-        throw new Error(
-          `Trajectory capacity (${TRAJECTORY_MAX_TABLES} tables) exceeded`,
-        );
+      if (this.trajectoryGrace.size === 0) throw new TrajectoryCapacityError();
       let earliest: bigint | null = null;
       for (const until of this.trajectoryGrace.values())
         if (earliest === null || until < earliest) earliest = until;

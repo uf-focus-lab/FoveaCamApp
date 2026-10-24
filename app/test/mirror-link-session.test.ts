@@ -237,6 +237,11 @@ vi.mock("@orchestrator/controller", () => ({
     ctl.controllerReads++;
     return ctl.controller;
   },
+  TrajectoryCapacityError: class TrajectoryCapacityError extends Error {
+    constructor() {
+      super("Trajectory capacity (4 tables) exceeded");
+    }
+  },
   TrajectoryReplaceError: class TrajectoryReplaceError extends Error {
     constructor(
       message: string,
@@ -1555,7 +1560,10 @@ describe("failed replace: the routed new id is scored against ITS spec", () => {
   it("capacity: the controller's own capacity refusal restarts the scan too", async () => {
     const h = await harness();
     await h.call("startScan");
-    ctl.replaceError = new Error("Trajectory capacity (4 tables) exceeded");
+    const { TrajectoryCapacityError } =
+      await import("@orchestrator/controller");
+    ctl.replaceError =
+      new (TrajectoryCapacityError as unknown as new () => Error)();
     await h.setState("scan_amp", 0.9);
     await vi.advanceTimersByTimeAsync(0);
     await settle(30);
