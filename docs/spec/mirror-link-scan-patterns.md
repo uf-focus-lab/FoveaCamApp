@@ -580,3 +580,34 @@ UI/docs lens (others pending below). Fixed in round 8:
   `exposure_us` carry the same may-be-live caveat as `amp_deg` (spec +
   contract). (4) Tests pin the reason ORDER (two reasons at once) and the
   "may run either the previous or the new edit" warning text.
+- **Firmware/harness lens (round 8):** the firmware is clean (checked:
+  32-bit intermediates, the budget clamp with a shrinking swap, markers at
+  offset 0 / P−1 / two at one offset, swap or STOP in a crossing tick, a
+  strobe that never falls, disable mid-run). Harness decisions —
+  (1) **C6a false failure (should-fix):** a sim preempted inside one loop
+  pass after driving a pre-wrap word makes `before.back()` stale and the
+  "ramp keeps advancing" check fails strictly on correct firmware
+  (demonstrated by injection). `(void)mcuNow(wire)` precedes C6a's drain +
+  `swapMark` so the drained words are the current phase's; the `drain()`
+  comment says it sees every word emitted by then, not the DAC state at the
+  request. (2) **Coverage gap (should-fix):** two firmware mutants survive —
+  dropping the cycles-budget clamp (an offset-0 marker fires one extra
+  capture at `t_start + cycles·P`) and dropping the `first` guard (an
+  offset-0 marker never fires in cycle 0) — and no stage exercises any push
+  status but OK / ENDED. New stage C7: a finite run (cycles = 2) with a
+  marker at offset 0 → exactly OK(c0), OK(c1), ENDED; strobes disarmed →
+  STROBE_TIMEOUT pushes with cycle identity and `t_exposure = 0`, and the
+  next close marker BUSY with `t_trigger == due`; a host CMD_FRAME in flight
+  at a marker phase → BUSY; Enable(false) mid-capture → marker CANCELLED
+  then run CANCELLED (NO_MARKER). Both mutants must die. (3) **Summed-stall
+  excuse over-credits:** stalls during the exposure cannot delay anything,
+  so BUSY/ENDED-first use the MEASURED lateness: the overtaken OK's
+  `t_trigger − due` is L, and the excuse requires the longest stall reaching
+  `due(c+1)` (or `tEnd`) to have started at or before `t_trigger(c) + FALL`;
+  `discardPushes` stops summing over `[busyAt − P, busyAt]`. (4) **Two
+  legitimate BUSY shapes** are classified: C5's in-flight read accepts a
+  BUSY from the SUCCESSOR id for cycle ≥ sc+1 under the BUSY rule (a ≥ P
+  stall from before a's fall); `discardPushes(untilLast)` gives a BUSY of
+  `last+1` the BUSY rule, not the skipped-cycle check. (5) **C4's
+  30-ms-after-STOP drop** gets one more `(void)mcuNow(wire)` after the wait
+  loop (a capture in flight at STOP can push after an in-pass preemption).
