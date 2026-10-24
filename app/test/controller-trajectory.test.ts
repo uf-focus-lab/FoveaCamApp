@@ -1325,6 +1325,57 @@ describe("TrajectoryHandle.replace (phase-continuous swap)", () => {
         expect(got).toEqual([1]);
       });
 
+      it("a failed pair swap does NOT retire a sibling whose STOP failed — it stays reserved and routed", async () => {
+        const handle = await running(FW_221);
+        const got: number[] = [];
+        handle.onFrame((f) => got.push(f.trajectoryId));
+        mockOps.reject.push(
+          { op: "START", id: 1, message: TIMEOUT },
+          {
+            op: "START",
+            id: 0,
+            message: "A trajectory is already running (STOP it first)",
+          },
+        );
+        await handle.replace(reshaped(4)).catch(() => {}); // sibling 1
+        mockOps.reject.push(
+          {
+            op: "START",
+            id: 2,
+            message: "A trajectory is already running (STOP it first)",
+          },
+          { op: "STOP", id: 1, message: TIMEOUT },
+          {
+            op: "START",
+            id: 2,
+            message: "Cannot perform action: system is not enabled",
+          },
+        );
+        mockCalls.length = 0;
+        const error = (await handle
+          .replace(spec(4))
+          .catch((e: unknown) => e)) as TrajectoryReplaceError;
+        expect(error).toBeInstanceOf(TrajectoryReplaceError);
+        expect(error.retiredSiblings).toEqual([]);
+        expect(
+          wireOps()
+            .filter((a) => a.op === "DELETE")
+            .map((a) => a.id),
+        ).toEqual([2]); // the sibling is NOT deleted
+        // Still reserved + routed with no deadline…
+        elapse(10 * trajectoryGraceUs(reshaped(4)));
+        push(1);
+        expect(got).toEqual([1]);
+        // …and a later stop() STOPs and retires it.
+        mockCalls.length = 0;
+        await handle.stop();
+        expect(wireOps()).toEqual([
+          { op: "STOP", id: 0 },
+          { op: "STOP", id: 1 },
+          { op: "DELETE", id: 1 },
+        ]);
+      });
+
       it("after an ambiguous outcome, stop() STOPs both tables and retires the sibling", async () => {
         const handle = await running(FW_221);
         mockOps.reject.push(

@@ -1085,8 +1085,9 @@ class NodeTrajectoryImpl implements NodeTrajectory {
    *  (`untilNs` = the controller's grace from the swap instant — set at the
    *  swap itself via `onSwap`, before `replace` resolves; one entry per id,
    *  so a second swap inside the first's grace keeps both), and an ambiguous
-   *  replacement that may be live (`untilNs: null`, until the next swap or
-   *  the run's end graces it). */
+   *  replacement that may be live (`untilNs: null`, until the next swap, a
+   *  failed pair swap that STOPped it — `retiredSiblings` — or the run's end
+   *  graces it). */
   private readonly retired = new Map<
     number,
     { spec: TrajectorySpec; untilNs: bigint | null }

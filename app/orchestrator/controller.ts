@@ -1330,8 +1330,11 @@ export class Controller {
     // SIBLINGS: replacement tables left reserved and routed to this handle
     // because they MAY be live on the MCU (an atomic START that failed without
     // a REJ, whose old-table re-START was then REJected "already running" —
-    // see `doReplace`). id → spec. The next stop() / swap STOPs and retires
-    // them (grace, then DELETE); dispose() DELETEs them.
+    // see `doReplace`). id → spec. Retired (graced, then DELETEd) at the next
+    // landed swap (the atomic START replaces whichever table plays; the pair
+    // STOPs each sibling first), by a failed pair swap whose sibling STOP
+    // landed (`retiredSiblings` on the error), by stop() (STOPs them), by the
+    // "run is over" branch, or by dispose() (DELETEs them).
     const siblings = new Map<number, TrajectorySpec>();
     /** DELETE `table` best-effort and release its id. The DELETE may go out
      *  at once even inside the grace: the firmware's push for an in-flight
