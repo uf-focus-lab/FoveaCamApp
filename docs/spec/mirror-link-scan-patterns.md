@@ -499,15 +499,62 @@ Four reviews on ec68dc7. No blockers. Fixed in round 7:
   (b) the stall excuse is classified by mismatch KIND: a repeated or
   backward (cycle, marker) or a wrong table id is always strict; a skipped
   cycle needs a stall ≥ ~P; a BUSY needs the inter-marker idle gap; an ENDED
-  overtaking the last OK needs the end gap; a STROBE_TIMEOUT keeps
-  TIMEOUT_SLACK; (c) three strict checks that fail on correct firmware under
-  starvation become stall-aware: C5's latch check is a fixture miss when a
-  strobe fall line precedes b's first CH1_B word on stdout (deterministic
-  order), `discardPushes` keeps draining pushes with cycle ≤ `last` (a
-  BUSY(c) legitimately precedes OK(c−1)), and C4's `ran.size() > 10` is tied
-  to elapsed MCU time; (d) `checkTimed` does a GET round trip before pumping
-  so a stall inside one loop pass is reported before the check reads, and
-  the comments say so; (e) `checkRamp`'s "keeps advancing across the swap"
-  uses the window `[tSwap, tSwap + P]` and compares b's first CH1_B word
-  against the last word before the swap; (f) C4's post-START loop expects
-  exactly OK(cycle 0) then ENDED.
+  overtaking the last OK needs the end gap — for these two the stall time
+  is SUMMED over the window from the due phase to the push's own phase, with
+  margin = gap − 2 × the 2 ms report threshold (a late fire followed by a
+  late completion is two stalls; a single-stall rule failed on correct
+  firmware), which also refines round 6 (e); a STROBE_TIMEOUT keeps
+  TIMEOUT_SLACK; `discardPushes` classifies each (cycle, marker) once and
+  excuses only a capture push behind a later BUSY or a skipped `last`;
+  (c) three strict checks that fail on correct firmware under starvation
+  become stall-aware: C5's latch check requires a's value strictly and then
+  re-arms when BOTH strobe fall lines precede b's first CH1_B word on stdout
+  (deterministic order), else requires b's strictly; `discardPushes` keeps
+  draining pushes with cycle ≤ `last` after one GET round trip (a BUSY(c)
+  legitimately precedes OK(c−1)); C4 STOPs after >10 ramp words or 1 s of
+  MCU time and drops the run's pushes once the MCU clock is 30 ms past the
+  STOP; C4's fresh-START and reset-hold checks count DAC words from the
+  reset's init word (`dac cs=LR 280001`, printed while the burst is handled)
+  rather than from a mark taken before the burst; (d) `checkTimed` does TWO
+  GET round trips before reading stalls (the first can be answered by the
+  loop pass that sent the push), and the comments say so; (e) `checkRamp`'s
+  "keeps advancing across the swap" uses the window `[tSwap, tSwap + P]` and
+  compares b's first ch0 word against the last word before the swap; a
+  missing wrap needs a skipped cycle, an extra wrap is strict; (f) C4's
+  post-START sequence expects exactly OK(id 0, marker 0, cycle 0) then
+  ENDED(cycle 1, `t_start + P`).
+
+## Review round 8 (2026-10-24) — findings and decisions
+
+UI/docs lens (others pending below). Fixed in round 8:
+
+- **Mismatch hover on TriggerWidth cameras** printed "Applied exposure L 0.0
+  ms · R 0.0 ms" (`exposure_us` is 0 by contract there). Decision: per eye,
+  TriggerWidth prints "exposure = trigger pulse" (the window length), Timed
+  prints the applied ms; the second figure is labelled "max frame rate" (it
+  is the camera's readback limit). Spec §views wording follows.
+- **A scan stopped mid-run read "idle — refused".** Decision: telemetry
+  carries `scan_blocked_kind: "refused" | "stopped" | null` next to
+  `scan_blocked`; the status line reads "idle — stopped" (warn) for an
+  abort and "idle — refused" for a Start refusal; the restart-time clock
+  check stops with "controller clock calibration lapsed — press Start once
+  it recovers" (distinct from the Start refusal "controller clock not
+  calibrated yet"). The spec §lifecycle and the manual list every stop
+  reason: run ended / cancelled / controller disconnected, "scan restart
+  failed: …", "exposure re-apply failed: …", "flip pipe rebuild failed: …",
+  the lapsed clock on a Mode/Frequency change (the manual's lapsed row says
+  such a change stops the scan until the clock recovers).
+- **A latched refusal** stays until Start or Stop (no re-evaluation):
+  the hover ends with "press Start to re-check" and the manual says so.
+- **Ring rows:** the dead `off` branches go (the row and the strip are
+  mounted only while the reader is on); one vocabulary on both — `idle`
+  (scan not running) and `reading…` (waiting for a frame); the strip's
+  strings are listed in spec §views.
+- **Accessible names contain the visible labels:** the sync checkbox is
+  named by its `<label>` ("Sync Windows"; the explanation moves to `title`),
+  the mode selector is named "Mode".
+- **Comment:** the Auto Vergence button comment matches its solid fills.
+- **Manual:** "Make any change to the scan's aim or shape (even back to the
+  same value)" settles an unconfirmed swap (gain / ring / PID edits do not).
+- **Brief:** round 7's harness items (b)-(f) amended to what landed (summed
+  stalls, both falls, init-word anchor, two round trips, wrap rule).
