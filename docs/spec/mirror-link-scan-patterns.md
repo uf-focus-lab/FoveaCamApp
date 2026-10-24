@@ -604,7 +604,13 @@ Fixed in round 8 (UI/docs lens first; the session and firmware/harness lenses fo
   STROBE_TIMEOUT pushes with cycle identity and `t_exposure = 0`, and the
   next close marker BUSY with `t_trigger == due`; a host CMD_FRAME in flight
   at a marker phase → BUSY; Enable(false) mid-capture → marker CANCELLED
-  then run CANCELLED (NO_MARKER). Both mutants must die. (3) **Summed-stall
+  then run CANCELLED (NO_MARKER). Both mutants must die. As landed: C7b is
+  two runs (one marker → STROBE_TIMEOUT for cycle 1; then two markers 20 ms
+  apart with cycles = 1 → m1 BUSY ahead of m0's STROBE_TIMEOUT); C7c's host
+  frame also FINs; C7d's CANCELLED arrives ahead of the enable ACK, then the
+  system is re-enabled and streams 1 and 2 re-created (1 first, the active
+  stream stage D expects); a START handled past `t_start` under a host stall
+  is a fixture miss. (3) **Summed-stall
   excuse over-credits:** stalls during the exposure cannot delay anything,
   so BUSY/ENDED-first use the MEASURED lateness: the overtaken OK's
   `t_trigger − due` is L, and the excuse requires the longest stall reaching
@@ -623,3 +629,49 @@ Fixed in round 8 (UI/docs lens first; the session and firmware/harness lenses fo
   `last+1` the BUSY rule, not the skipped-cycle check. (5) **C4's
   30-ms-after-STOP drop** gets one more `(void)mcuNow(wire)` after the wait
   loop (a capture in flight at STOP can push after an in-pass preemption).
+
+## Review round 9 (2026-10-24) — findings and decisions
+
+Orchestrator lens: capacity accounting is consistent across layers (a graced
+id is waited for, never counted; the session's `1 + siblings` check mirrors
+the controller's allocator); the forced restart runs inline on the op chain;
+`closeTrajectory` settles every STOP/DELETE before the new allocation; no id
+≥ 4 ever reaches the wire. Fixed: the controller throws a typed
+`TrajectoryCapacityError` and the session matches it by class.
+
+- **Session (should-fix, a safety regression from round 8):** the regrow
+  target `runRaw[0].pulseUs` is the REQUESTED marker-0 window, not the pulse
+  the running table's markers carry. The two differ when the windows change
+  between the camera write and the spec build (start arms with `pulse0` then
+  rebuilds after the arming awaits; a restart retimes with the first build
+  then rebuilds). A reconciling replace that then fails without a
+  possibly-live table re-grows the camera to the NEW, longer window while
+  the OLD table plays — the camera exposure exceeds the MCU pulse, unflagged
+  (reproduced). Decision: the session records `runPulseUs`, the Timed pulse
+  the RUNNING table was built with, wherever `runSpec` is set (`runTrajectory`
+  and a landed swap: the retimed `pulse0`, else `appliedPulseUs`), and uses it
+  for `timedStale()`, the regrow target and the clamp check's `want0`; the
+  "unequal windows" check keeps comparing the REQUESTED windows. The round-8
+  brief sentence ("safe: that table plays") is corrected by this one. Test: the
+  reproduced sequence keeps the camera at the running pulse and names the
+  stale state.
+- **Capacity restart that cannot restart:** `restartForCapacity` reports
+  after `restartScanNow`'s checks, as an attempt ("… — restarting the scan"),
+  and the lapsed-clock / "scan restart failed" stop reasons name the capacity
+  restart as a cause everywhere (spec §lifecycle, contract, manual).
+- **Test comment:** the settling-retry test says the landing replace is a
+  user edit; a case where the automatic retry itself lands is added.
+- **UI/docs lens, fixed:** manual layout statements (Auto Vergence in the
+  drawer's SECOND column of four; PID sliders BELOW the button); manual
+  unconfirmed row says "If further changes also fail to get through, the app
+  restarts the scan" and drops its duplicate sentence; manual idle status
+  line (the hover shows the latched reason; refused/stopped are amber; a
+  latched block clears on Start); the run-ended-during-START refusal listed
+  and worded as a refusal ("the controller ended the trajectory run before
+  the scan started"); "Press Start to re-check." skipped when the reason
+  already says how to recover; the Ring View selector named "Ring View"; the
+  spec's identical-spec sentence points at the swap paragraph and names all
+  three exceptions; the manual's capture section says falling-sweep frames
+  are saved unflipped and lists the JSON `pattern` block; the reset button's
+  resting border removed (Principle 5); the `fw-sim-check` header mentions
+  the adjacent-stall allowance.
