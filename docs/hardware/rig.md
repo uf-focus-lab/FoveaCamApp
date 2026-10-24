@@ -275,3 +275,7 @@ offset ping lands). The checks:
 4. **Rig verification:** hardware verification runs the pre-flight and
    playbook passes, exports profiler snapshots as the baseline, and works
    through the remaining hardware-gated checks.
+5. **MirrorLink scan patterns:** [`mirror-link-bench.md`](./mirror-link-bench.md)
+   is the hand-off checklist for the `feat/MirrorLink` branch — build and
+   flash order (firmware 2.2.1), camera pre-flight, the bench test order with
+   the telemetry to watch, and what was not verifiable off-rig.
