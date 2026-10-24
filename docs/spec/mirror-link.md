@@ -369,7 +369,8 @@ pulses cover it) and a GROWING one AFTER the swap (the swapped-in table carries 
 predicted exposure — the pulse clamped to each eye's `exposure_range`; should the camera
 take another value, the next replace swaps the markers onto it). A swap that fails after a
 pre-swap write writes the previous exposure back, so camera and running table agree again
-(not while the new table may be live — §actuation).
+(not while the new table may be live — §actuation). Every such write-back targets the pulse
+the RUNNING table was built for, never the requested window (§actuation, `runPulseUs`).
 
 **Restore** (`restoreTiming`, after `disableHardwareTrigger`): `ExposureMode` first (so a
 Timed exposure is writable again; the generic feature write when the typed setter refuses
@@ -748,16 +749,31 @@ retry reserves another table). Should the running table plus the siblings fill t
 controller's `TRAJECTORY_MAX_TABLES` (checked before an upload and after a failure; the
 controller's own "Trajectory capacity … exceeded" refusal counts too), no edit could land
 any more: the session restarts the CURRENT spec — stop → start at the same period,
-phase-fresh, `closeTrajectory` STOPping and DELETEing every sibling — and reports "live
-edits exhausted the controller's tables — the scan restarts". In the Timed fallback a
-pre-swap exposure shrink is written back only when the new table can never be live: while
-it may be, the shorter exposure is safe under either table and the longer one could overrun
+phase-fresh, `closeTrajectory` STOPping and DELETEing every sibling. It reports "live
+edits exhausted the controller's tables — restarting the scan" only once the restart's own
+checks passed (an attempt): a pending stop takes the stop path, a run that already ended or
+a lapsed clock stops the scan with that reason instead, and a restart that then fails stops
+with "scan restart failed: …". In the Timed fallback a pre-swap exposure shrink is written
+back only when the new table can never be live: while it may be, the shorter exposure is safe under either table and the longer one could overrun
 its pulse. Once a failed swap leaves only the running table possibly live (a failed pair
-swap STOPped the last sibling) the camera grows back to the running table's own marker-0
-pulse — safe, that table is the one playing and its MCU pulses carry it. The clamp check is
-suspended while a sibling may be live or the Timed camera holds an exposure written for
-another pulse than the running table's (the camera deliberately differs from it); the
-identical-spec shortcut is suspended in that second case too, so the swap re-times it, and
+swap STOPped the last sibling) the camera grows back to the pulse the RUNNING table was
+built for — safe, that table is the one playing and its MCU pulses carry it. The session
+records that pulse (`runPulseUs`: the marker-0 pulse the Timed exposure was written for
+when the running table's markers were built — at the start / restart, and on each landed
+swap the re-timed pulse, else the one in force at the build) wherever the running table is
+set; it is NOT the requested marker-0 window (`runRaw[0]`), which can move between the
+camera write and the build (a start arms with the first build's pulse, a restart re-times
+with it, then each builds again — the markers carry the camera's exposure, not the
+request). Should a reconciling replace then fail with no table possibly live (a plain
+error or `maybeLive: false`), the camera stays at the running pulse: no camera write
+happens, `scan.windows` and `exposure_us` both show it, and no `mismatch` reason applies
+(the camera matches the table that plays; the edit that did not land is the re-upload
+warning's — "the scan keeps its previous geometry"); the next landed replace reconciles
+the request. The clamp check compares the camera against `runPulseUs` (the "unequal
+windows" check keeps comparing the REQUESTED windows) and is suspended while a sibling may
+be live or the Timed camera holds an exposure written for another pulse than `runPulseUs`
+(`timedStale`: the camera deliberately differs from the running table); the identical-spec
+shortcut is suspended in that second case too, so the swap re-times it, and
 for a grow-after-swap (a GROWING Timed exposure, written once the swap lands —
 §exposure-windows), since that swap is what carries it. Those are its three exceptions:
 otherwise an identical spec is skipped.

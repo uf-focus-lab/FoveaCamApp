@@ -593,9 +593,18 @@ export default function mirrorLinkSession(
     let trajectory: NodeTrajectory | null = null;
     let trajectoryUnsubs: Array<() => void> = [];
     /** The spec the MCU runs NOW (after the last successful start/replace),
-     *  and the window markers it was built from. */
+     *  and the window markers as REQUESTED when it was built (Timed: its
+     *  markers carry `runPulseUs`'s exposure instead). */
     let runSpec: TrajectorySpec | null = null;
     let runRaw: WindowMarker[] = [];
+    /** The marker-0 pulse (µs) the Timed exposure was written for when
+     *  `runSpec` was built — the exposure its markers carry. NOT
+     *  `runRaw[0].pulseUs`: the windows can move between the camera write and
+     *  the build (a start arms with the first build's pulse, a restart
+     *  re-times with it, then each builds again), and the markers carry the
+     *  camera's exposure, not the request. The clamp check, `timedStale` and
+     *  the failed-swap regrow compare against it (spec §actuation). */
+    let runPulseUs = 0;
     /** The amplitude (°) `runSpec` was built for — a failed replace leaves it
      *  at the value the MCU plays. */
     let runAmp = 0;
@@ -1021,12 +1030,16 @@ export default function mirrorLinkSession(
       built: BuiltScan,
       cancelled: () => boolean,
     ): Promise<void> {
+      // The exposure `built`'s markers carry was written for this pulse (the
+      // caller built right after the camera write; read before any await).
+      const pulseUs = appliedPulseUs;
       const traj = await controllerNode().openTrajectory(built.spec, {
         name: "mirror-link",
       });
       trajectory = traj;
       runSpec = built.spec;
       runRaw = built.raw;
+      runPulseUs = pulseUs;
       runAmp = built.amp;
       runOverrun = built.overrun;
       runMode = built.mode;
@@ -1063,6 +1076,7 @@ export default function mirrorLinkSession(
       trajectory = null;
       runSpec = null;
       runRaw = [];
+      runPulseUs = 0;
       runOverrun = false;
       pendingSpec = null;
       specById.clear();
@@ -1382,16 +1396,18 @@ export default function mirrorLinkSession(
       // swap or a failed pair swap that STOPped the sibling.
       const unconfirmed = siblingIds.size > 0;
       if (timed) {
-        const want0 = runRaw[0]?.pulseUs ?? 0;
-        // Belt and braces: an exposure written for another pulse than the
-        // running table's (`timedStale`) is not a clamp either.
+        // The clamp: the camera against the pulse the RUNNING table was built
+        // for (`runPulseUs`). Belt and braces: an exposure written for another
+        // pulse than that (`timedStale`) is not a clamp either.
         if (
           !unconfirmed &&
           !timedStale() &&
-          (exposureMismatch(applied.L.exposure_us, want0) ||
-            exposureMismatch(applied.R.exposure_us, want0))
+          (exposureMismatch(applied.L.exposure_us, runPulseUs) ||
+            exposureMismatch(applied.R.exposure_us, runPulseUs))
         )
           reasons.push(MISMATCH.timedClamp);
+        // Unequal: the REQUESTED windows against each other.
+        const want0 = runRaw[0]?.pulseUs ?? 0;
         if (runRaw.some((m) => exposureMismatch(want0, m.pulseUs)))
           reasons.push(MISMATCH.timedUnequal);
         if (runOverrun) reasons.push(MISMATCH.timedOverrun);
@@ -1645,10 +1661,12 @@ export default function mirrorLinkSession(
      *  run that ended during the START aborts. `force` restarts the CURRENT
      *  spec even at an unchanged period (live edits exhausted the controller's
      *  tables — `closeTrajectory` STOPs and DELETEs every sibling, the run
-     *  restarts phase-fresh; spec §actuation). Serialized via
+     *  restarts phase-fresh; spec §actuation). `announce` is warned once the
+     *  checks passed and the restart is under way — a stop / abort above it
+     *  is reported by its own path instead. Serialized via
      *  {@link queueScanOp} (or awaited inside a queued op). */
     async function restartScanNow(
-      opts: { force?: boolean } = {},
+      opts: { force?: boolean; announce?: string } = {},
     ): Promise<void> {
       const t = triple;
       if (!scanActive || !t) return;
@@ -1672,6 +1690,7 @@ export default function mirrorLinkSession(
         built.spec.periodUs === runSpec.periodUs
       )
         return replaceNow(); // same period after all (e.g. a no-op write)
+      if (opts.announce) report("mirror-link", opts.announce, "warning");
       cancelReplace();
       await closeTrajectory();
       try {
@@ -1740,14 +1759,17 @@ export default function mirrorLinkSession(
     /** The running table + every possibly-live sibling fill the controller's
      *  tables (or the controller said so): no swap can be uploaded any more,
      *  so the CURRENT spec restarts — stop → start, phase-fresh, the siblings
-     *  STOPped and DELETEd (spec §actuation). */
+     *  STOPped and DELETEd (spec §actuation). Reported once
+     *  `restartScanNow`'s checks pass, as an attempt: a pending stop takes
+     *  the stop path, a dead run or a lapsed clock stops the scan with its own
+     *  reason, and a restart that then fails stops with "scan restart failed:
+     *  …". */
     async function restartForCapacity(): Promise<void> {
-      report(
-        "mirror-link",
-        "live edits exhausted the controller's tables — the scan restarts",
-        "warning",
-      );
-      await restartScanNow({ force: true });
+      await restartScanNow({
+        force: true,
+        announce:
+          "live edits exhausted the controller's tables — restarting the scan",
+      });
     }
 
     /** The controller's own capacity refusal (`allocTrajectoryId`) — defensive:
@@ -1756,12 +1778,11 @@ export default function mirrorLinkSession(
       e instanceof TrajectoryCapacityError;
 
     /** Timed: the camera holds an exposure written for another marker-0 pulse
-     *  than the RUNNING table's (a possibly-live failed shrink kept the shorter
-     *  one) — neither a clamp nor a reason to skip a swap. */
+     *  than the one the RUNNING table was built for (`runPulseUs`; a
+     *  possibly-live failed shrink kept the shorter one) — neither a clamp nor
+     *  a reason to skip a swap. */
     function timedStale(): boolean {
-      return (
-        timedPulseUs() !== null && appliedPulseUs !== (runRaw[0]?.pulseUs ?? 0)
-      );
+      return timedPulseUs() !== null && appliedPulseUs !== runPulseUs;
     }
 
     function cancelReplace(): void {
@@ -1828,6 +1849,9 @@ export default function mirrorLinkSession(
           }
         }
       }
+      // The pulse the exposure `built`'s markers carry is (or, growing, will
+      // be once the swap lands) written for — `runPulseUs` should it land.
+      const builtPulseUs = retimeAfter ? pulse0 : appliedPulseUs;
       // Not while a failed swap's table MAY be live (`siblingIds`): the MCU
       // might run the abandoned geometry, so even the running spec must be
       // swapped in again to settle it (and, Timed, re-time the camera). Nor
@@ -1843,6 +1867,7 @@ export default function mirrorLinkSession(
         // changed (Timed: every marker carries marker 0's pulse, so a falling
         // END edit builds the same spec): the mismatch checks read them.
         runRaw = built.raw;
+        runPulseUs = builtPulseUs; // the same markers, the same exposure
         runOverrun = built.overrun;
         publishScanTelemetry();
         return;
@@ -1906,16 +1931,16 @@ export default function mirrorLinkSession(
         // The camera's exposure back to the RUNNING table's (its MCU pulses
         // carry it) once no other table may be live: the shorter exposure of
         // a pre-swap shrink that never landed, or the one a possibly-live
-        // sibling left that a failed pair swap has now STOPped (growing to the
-        // running table's own pulse is safe — that table is the one playing).
-        // NOT while the new table or a sibling MAY be live: the shorter
-        // exposure is safe under either table, the longer one would overrun
-        // its pulse.
-        const runPulse = runRaw[0]?.pulseUs;
+        // sibling left that a failed pair swap has now STOPped (growing to
+        // `runPulseUs` is safe — the pulse that table's markers were built
+        // for, and that table is the one playing; NEVER the requested
+        // `runRaw[0]`, which may have moved since that build). NOT while the
+        // new table or a sibling MAY be live: the shorter exposure is safe
+        // under either table, the longer one would overrun its pulse.
         const backTo = rep?.maybeLive
           ? null
-          : siblingIds.size === 0 && runPulse !== undefined && timedStale()
-            ? runPulse
+          : siblingIds.size === 0 && timedStale()
+            ? runPulseUs
             : retimedBefore
               ? prevPulseUs
               : null;
@@ -1936,6 +1961,7 @@ export default function mirrorLinkSession(
       }
       runSpec = built.spec;
       runRaw = built.raw;
+      runPulseUs = builtPulseUs;
       runAmp = built.amp;
       runOverrun = built.overrun;
       if (traj.id !== oldId) retireSpec(oldId, oldSpec);
