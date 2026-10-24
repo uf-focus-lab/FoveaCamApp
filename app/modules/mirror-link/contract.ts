@@ -235,8 +235,15 @@ export const mirrorLink = defineContract({
     /** Applied scan timing — non-null exactly while ACTIVE (spec §lifecycle). */
     scan: null as ScanTelemetry | null,
     /** Human-readable reason the last `startScan` was refused (or why the
-     *  override could not be applied); null while active or never refused. */
+     *  override could not be applied), or why a running scan was stopped
+     *  under the operator; null while active or never blocked. Latched until
+     *  the next Start or Stop — never re-evaluated (spec §lifecycle). */
     scan_blocked: null as string | null,
+    /** Which of the two `scan_blocked` is: `refused` (a Start that never
+     *  ran) or `stopped` (a running scan aborted — run end, a failed restart
+     *  / re-apply / flip rebuild / re-upload, the clock lapsed on a period
+     *  change); null exactly when `scan_blocked` is (spec §lifecycle). */
+    scan_blocked_kind: null as "refused" | "stopped" | null,
     /** The vergence loop's status: `off` / `tracking` / `paused: scanning` /
      *  `hold: match low score` / `hold: match stale` / `no calibration`. */
     vergence_status: "off" as string,

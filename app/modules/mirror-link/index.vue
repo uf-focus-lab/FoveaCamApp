@@ -53,7 +53,7 @@ import {
   ringGeometry,
   strokeFor,
 } from "./overlay";
-import { mirrorLink } from "./contract";
+import { mirrorLink, type ScanTelemetry } from "./contract";
 import { SCAN_HZ_RANGE, SHIFT_RANGE_DEG } from "./scan";
 
 const session = useSession(mirrorLink, "mirror-link");
@@ -209,6 +209,15 @@ const trajectoryDetail = computed(() => {
   return s + ".";
 });
 
+/** One eye's applied exposure for the scan hovers (spec §views): on
+ *  TriggerWidth the trigger pulse IS the exposure (the window's length) — the
+ *  scan's mode, or an eye whose `exposure_us` is the contract's TriggerWidth
+ *  0 — and Timed prints the applied ms. */
+const eyeExposure = (t: ScanTelemetry, side: "L" | "R") =>
+  t.exposure_mode === "TriggerWidth" || t.exposure_us[side] === 0
+    ? "exposure = trigger pulse"
+    : `exposure ${ms(t.exposure_us[side])} ms`;
+
 const scanStatus = computed<{ text: string; tone: string; title: string }>(
   () => {
     const t = telemetry.scan;
@@ -243,8 +252,8 @@ const scanStatus = computed<{ text: string; tone: string; title: string }>(
               ? " (Timed fallback: no TriggerWidth exposure on this model)"
               : "") +
             ". " +
-            `Applied exposure L ${ms(t.exposure_us.L)} ms · R ${ms(t.exposure_us.R)} ms, ` +
-            `frame rate L ${t.frame_rate.L.toFixed(1)} Hz · R ${t.frame_rate.R.toFixed(1)} Hz. ` +
+            `Applied: L ${eyeExposure(t, "L")} · R ${eyeExposure(t, "R")}; ` +
+            `max frame rate L ${t.frame_rate.L.toFixed(1)} Hz · R ${t.frame_rate.R.toFixed(1)} Hz. ` +
             stall +
             trajectoryDetail.value,
         };
@@ -263,21 +272,29 @@ const scanStatus = computed<{ text: string; tone: string; title: string }>(
         tone: "ok",
         title:
           (timed
-            ? `Timed fallback: each trigger exposes L ${ms(t.exposure_us.L)} ms · R ${ms(t.exposure_us.R)} ms. `
+            ? `Timed fallback, per trigger: L ${eyeExposure(t, "L")} · R ${eyeExposure(t, "R")}. `
             : "Each trigger pulse is the exposure: every fovea frame covers exactly its window of the path. ") +
           trajectoryDetail.value,
       };
     }
+    // A latched block (spec §lifecycle): a Start refusal or a scan stopped
+    // under the operator — never re-evaluated, so the hover says how to.
     const reason = telemetry.scan_blocked;
+    const stopped = telemetry.scan_blocked_kind === "stopped";
     const triangle = state.scan_mode === "triangle";
     const period = (periodMs.value * (triangle ? 2 : 1)).toFixed(1);
+    if (reason)
+      return {
+        text: stopped ? "idle — stopped" : "idle — refused",
+        tone: "warn",
+        title: `${reason.replace(/\.\s*$/, "")}. Press Start to re-check.`,
+      };
     return {
-      text: reason ? "idle — refused" : "idle",
-      tone: reason ? "warn" : "muted",
+      text: "idle",
+      tone: "muted",
       title:
-        reason ??
         `Start the ${state.scan_mode} scan: the controller runs it and triggers both foveas ` +
-          `${triangle ? "twice" : "once"} per ${period} ms period. Manage Cameras' settings are restored on stop.`,
+        `${triangle ? "twice" : "once"} per ${period} ms period. Manage Cameras' settings are restored on stop.`,
     };
   },
 );
@@ -572,12 +589,8 @@ function ringStatus(side: "L" | "R"): {
   tone: string;
   title: string;
 } {
-  if (!state.ring_reader)
-    return {
-      text: "off",
-      tone: "muted",
-      title: "Turn Ring Reader on in the drawer to decode the emitter.",
-    };
+  // Mounted only while the reader is on (no `off` branch); the strip's
+  // caption uses the same `idle` / `reading…` (spec §views).
   const r = ringActive.value ? telemetry.ring[side] : null;
   if (!r)
     return {
@@ -810,7 +823,6 @@ const statusR = computed(() => ringStatus("R"));
             :payload="stripL.payload.value"
             :readout="telemetry.ring.L"
             :scanning="scanning"
-            :reader="state.ring_reader"
           />
           <RingHistogram
             :title="ROLE.R"
@@ -819,7 +831,6 @@ const statusR = computed(() => ringStatus("R"));
             :payload="stripR.payload.value"
             :readout="telemetry.ring.R"
             :scanning="scanning"
-            :reader="state.ring_reader"
           />
         </template>
       </div>
@@ -1286,9 +1297,9 @@ const statusR = computed(() => ringStatus("R"));
   }
 }
 
-// Auto Vergence: an ORDINARY control (Principles §5) — no solid fill, that is
-// reserved for the primary/destructive scan action. Fixed track so the
-// label swap never moves anything.
+// Auto Vergence: a running toggle that shares Start/Stop Scan's solid fills
+// on purpose (Principles §5 — emphasis is a fill, never a border). Fixed track
+// so the label swap never moves anything.
 .vergence-row {
   display: grid;
   // 10.5em: "Stop Vergence" is 13 characters — a narrower track spills it.

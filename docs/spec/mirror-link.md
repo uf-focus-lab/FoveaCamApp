@@ -115,7 +115,7 @@ ring, and a segmentation row (0 none · 64 byte edge · 128 field edge · 192 le
 255 data start). `telemetry.ring.<eye>.strip` carries `{ polarRows, width, rows }` — the
 renderer needs no other agreement. Each strip is a FRESH buffer (the worker transfers
 emitted frames). Frames flow only while the ring node exists AND the scan runs; otherwise
-the canvas is empty and the caption says why.
+the canvas is empty and the caption says why (`idle` / `reading…`, §views).
 
 ## Scan patterns {#scan-patterns}
 
@@ -194,7 +194,8 @@ serializes on ONE FIFO op chain (`queueScanOp`) — start, stop, the period rest
 live re-upload and the gain writes — so a fast toggle can never interleave a camera apply
 with an in-flight restore, nor a re-upload with a restart.
 
-**Start** — refused, with the reason on `telemetry.scan_blocked` and `false` returned:
+**Start** — refused, with the reason on `telemetry.scan_blocked` (`scan_blocked_kind`
+`refused`) and `false` returned:
 without a leased triple (`no camera triple leased`), without a bound controller (`no
 controller connected`), on firmware below 2.2.0 (`controller firmware >= 2.2.0
 required` — there is no JS fallback any more; it could not trigger anyway), or before the
@@ -259,15 +260,29 @@ type — a dead device throws a plain `Controller not connected`) and at the end
 restart, `traj.state !== "running"` aborts the scan; a replace that threw with the run
 gone reports `live trajectory re-upload ended the run: …`.
 
+**Stopped.** Every abort of a RUNNING scan publishes its reason on `scan_blocked` with
+`scan_blocked_kind` `stopped` (a Start refusal, above, is `refused`; the kind is null
+exactly when `scan_blocked` is) plus a tray warning, and the status line reads `idle —
+stopped` (§views). The reasons: the run ended (`the controller ended the trajectory run —
+scan stopped` — the MCU ended or cancelled it), `controller disconnected — scan stopped`,
+`scan restart failed: …` (a period restart's re-open), `exposure re-apply failed: …` (a
+Timed re-time around a live swap, §exposure-windows), `flip pipe rebuild failed: …`
+(§triangle-flip), `live trajectory re-upload ended the run: …`, and `controller clock
+calibration lapsed — press Start once it recovers` (a period change on a lapsed clock,
+below). Both kinds are LATCHED — never re-evaluated — until the next Start or Stop (a
+successful Start publishes null; Stop clears it unconditionally).
+
 **Period change** — `scan_hz` or `scan_mode` while active changes the trajectory period,
 which `replace` cannot swap: the op chain FIRST re-checks the run — a table that is no
 longer `running` (a detach whose notice is still queued behind the restart) aborts with
-the run-end reason, and an uncalibrated controller clock aborts with `controller clock not
-calibrated` — then stops + closes the table, rebuilds, opens and starts a new one (new
-explicit instant), keeping the camera config (the trigger mode is not re-armed; only a
-Timed exposure is re-written, and only for a new marker-0 pulse) and rebuilding the flip
-pipes when the mode or their tolerance changes. The run's counters keep counting (only a
-fresh `startScan` resets them).
+the run-end reason, and an uncalibrated controller clock aborts with `controller clock
+calibration lapsed — press Start once it recovers` (distinct from the Start refusal
+`controller clock not calibrated yet`: the clock was good when this run started) — then
+stops + closes the table, rebuilds, opens and starts a new one (new explicit instant),
+keeping the camera config (the trigger mode is not re-armed; only a Timed exposure is
+re-written, and only for a new marker-0 pulse) and rebuilding the flip pipes when the mode
+or their tolerance changes. The run's counters keep counting (only a fresh `startScan`
+resets them).
 
 Idle drains a `stopScan` FIRST — before the pacer stops and the idle position input
 closes, so the node's `resumeInputs` hands the DAC back to that input and the mirror
@@ -476,9 +491,14 @@ dim + dashed when only the fit succeeded), the LEADER arc in `--warn` (distinct 
 eye colors), and radial ticks at every field (long) and byte (short) boundary. The arc +
 ticks stay mounted and fade rather than remount — a marginal emitter flips ok↔fail at
 frame rate. Under it a fixed-height, START-aligned mono row reads the decoded text +
-`px/chip` (emphasized), or `idle` / `reading…` / the failure reason (the row is mounted only while the reader is on; with the
-last decode, muted); the full text, the hex and the reading direction ride its `title`.
-Below the center tile's scan row sit the §ring-views stage selector and the two strips.
+`px/chip` (emphasized), or `idle` (the scan is not running) / `reading…` (waiting for its
+first readout) / the failure reason (the row is mounted only while the reader is on, so it
+has no "off" state; with the last decode, muted); the full text, the hex and the reading direction ride its `title`.
+Below the center tile's scan row sit the §ring-views stage selector and the two strips;
+each strip's caption speaks the row's vocabulary — `idle` (scan not running), `reading…`
+(no strip or readout yet), then the decoded text or the failure reason — and has no "off"
+state either (the strips are mounted only while the reader is on and the view is not
+`off`).
 
 The center view binds the intrinsic `undistort:<serial>` pipe (raw convert fallback
 uncalibrated) and is the ONLY steering surface; no display worker, no
@@ -541,21 +561,26 @@ scanning — emphasis is a FILL, never a border, and both pairs clear AA) and
 a compact status span — `mode · hz · period · windows` while active (the period is the
 TRAJECTORY period, T or 2T; each `ScanTelemetry.windows` entry as `start–end` ms within
 it, joined by `+`; a trailing `· timed` on the `Timed` exposure fallback), `idle` /
-`idle — refused` otherwise. Warn-toned on `mismatch`, on a run whose
+`idle — refused` (`scan_blocked_kind` `refused`) / `idle — stopped` (`stopped`, §lifecycle)
+otherwise. Warn-toned on `mismatch`, on a run whose
 `perf.trajectory.pushes` show failures and no OK push, on `perf.trajectory.stalled` (no
 OK push for two periods — a trigger that stops answering mid-run, after good exposures;
-the `title` then says no exposure has completed for two scan periods — or, for a run with no OK push at all, that none has completed this run), or on a refusal. The `title`
+the `title` then says no exposure has completed for two scan periods — or, for a run with no OK push at all, that none has completed this run), or on a refusal or a stop. The `title`
 carries, on a mismatch, the NEUTRAL lead-in "Exposure mismatch — " (not every reason is a
 camera limit: the flip-spacing one is the windows' own geometry) followed by
 `ScanTelemetry.mismatch_reason` with no second colon — or, with no reason, "the cameras
 cannot take the requested window" (ellipse) / "windows" (triangle) — then the `Timed`
-fallback note and the applied per-eye exposure / frame rate; then, while stalled, the stall
+fallback note and the applied per-eye exposure — `exposure = trigger pulse` (the window's
+length) on a TriggerWidth eye (the scan's `exposure_mode`, or a mixed rig's eye whose
+`exposure_us` is the TriggerWidth 0), the applied ms on a Timed one — and the `max frame
+rate` per eye (the camera's readback limit); then, while stalled, the stall
 sentence; then the `perf.trajectory` bookkeeping (pushes ok / timeout / busy / other, last lateness, live re-uploads, and in
 triangle mode flipped / unmatched / `skew_us` per eye — "—" for an eye whose `flipped`
 count is 0, so a never-matched eye does not read as a perfect 0 µs — and
 `flip_tolerance_us`) — or, idle, what Start would run (its period computed
 from `1000 / scan_hz`, doubled for the triangle, then rounded — never from the rounded
-readout), or the blocked reason. The row is a PLAIN div, never a
+readout), or the blocked reason followed by "Press Start to re-check." (the block is
+latched, §lifecycle). The OK-toned `Timed` hover gives the same per-eye exposure. The row is a PLAIN div, never a
 `<label>`/ConfigEntry: a label would forward a status-span click to the button and
 toggle the hardware override; the button's own explanation rides the ROW's `title`
 (a disabled button suppresses hover). The drawer carries FOUR columns (nested
