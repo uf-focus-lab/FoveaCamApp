@@ -526,7 +526,7 @@ Four reviews on ec68dc7. No blockers. Fixed in round 7:
 
 ## Review round 8 (2026-10-24) — findings and decisions
 
-UI/docs lens (others pending below). Fixed in round 8:
+Fixed in round 8 (UI/docs lens first; the session and firmware/harness lenses follow below):
 
 - **Mismatch hover on TriggerWidth cameras** printed "Applied exposure L 0.0
   ms · R 0.0 ms" (`exposure_us` is 0 by contract there). Decision: per eye,
@@ -608,8 +608,15 @@ UI/docs lens (others pending below). Fixed in round 8:
   excuse over-credits:** stalls during the exposure cannot delay anything,
   so BUSY/ENDED-first use the MEASURED lateness: the overtaken OK's
   `t_trigger − due` is L, and the excuse requires the longest stall reaching
-  `due(c+1)` (or `tEnd`) to have started at or before `t_trigger(c) + FALL`;
-  `discardPushes` stops summing over `[busyAt − P, busyAt]`. (4) **Two
+  `due(c+1)` (or `tEnd`) to have started at or before `t_trigger(c) + FALL`
+  (as landed in `overtakeExplained`: a STROBE_TIMEOUT capture's end is
+  extended by the timeout; one adjacent stall chained right behind such a
+  stall is accepted too — the pass that pumped the fall may be preempted
+  before its `Trajectory::tick` — with the 2 ms report threshold of slack at
+  each joint; an event inside the capture itself is explained; a BUSY for
+  the expected crossing itself stays strict; `PushGaps` carries `fall`
+  instead of idle gaps); `discardPushes` no longer sums over
+  `[busyAt − P, busyAt]`. (4) **Two
   legitimate BUSY shapes** are classified: C5's in-flight read accepts a
   BUSY from the SUCCESSOR id for cycle ≥ sc+1 under the BUSY rule (a ≥ P
   stall from before a's fall); `discardPushes(untilLast)` gives a BUSY of
