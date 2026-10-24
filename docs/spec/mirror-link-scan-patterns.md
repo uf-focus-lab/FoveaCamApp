@@ -605,8 +605,9 @@ Fixed in round 8 (UI/docs lens first; the session and firmware/harness lenses fo
   next close marker BUSY with `t_trigger == due`; a host CMD_FRAME in flight
   at a marker phase → BUSY; Enable(false) mid-capture → marker CANCELLED
   then run CANCELLED (NO_MARKER). Both mutants must die. As landed: C7b is
-  two runs (one marker → STROBE_TIMEOUT for cycle 1; then two markers 20 ms
-  apart with cycles = 1 → m1 BUSY ahead of m0's STROBE_TIMEOUT); C7c's host
+  two runs (one marker, cycles = 3 → STROBE_TIMEOUT for cycles 1 and 2; then
+  two markers close together, cycles = 2 → m1 BUSY ahead of m0's
+  STROBE_TIMEOUT in cycles 0 and 1); C7c's host
   frame also FINs; C7d's CANCELLED arrives ahead of the enable ACK, then the
   system is re-enabled and streams 1 and 2 re-created (1 first, the active
   stream stage D expects); a START handled past `t_start` under a host stall
@@ -675,3 +676,33 @@ the controller's allocator); the forced restart runs inline on the op chain;
   are saved unflipped and lists the JSON `pattern` block; the reset button's
   resting border removed (Principle 5); the `fw-sim-check` header mentions
   the adjacent-stall allowance.
+- **Firmware/harness lens (round 9):** the firmware delivers every C7
+  behaviour `serial-protocol.md` promises (eight mutants killed strictly).
+  Harness decisions — (1) C7c's "marker fired after the host frame
+  completed — sim stall" guard is unreachable on correct firmware (every pass
+  that pumps the frame's fall ticks the trajectory first, past the due time)
+  and hid a mutant in which a marker WAITS behind a host frame instead of
+  pushing BUSY: deleted; `expectPush` judges strictly. (2) C7d's
+  `early.size() == 1` check runs AFTER the measured-instant fixture test (a
+  ≥ 50 ms host stall before the burst legitimately yields {OK(c),
+  CANCELLED(c+1)} before the ACK). (3) C3, C5, C6a and C6b START with the
+  measured START + GET burst (`startAhead`, hoisted to the shared fixture
+  scope); a START handled past `t_start` is a fixture miss, not "a skipped
+  crossing". (4) C4's pending-Trigger START check sends Trigger + START in
+  ONE burst (a ≥ 150 ms host stall between them let the Trigger FIN reach
+  `trajectoryOp` first — seen under load), then reads Trigger ACK, START REJ,
+  FIN in order. (5) C7b part ii places m1 AFTER m0's pulse and before its
+  strobe timeout (M1 = 36 ms with a 24 ms pulse and 29 ms timeout) so the
+  documented "a marker due within 5 ms of the previous window's end pushes
+  BUSY" is pinned — the mutant dropping the marker-capture margin
+  (`active.pulse + (fromMarker ? 0 : STROBE_MARGIN_US)`) passed the whole
+  harness before. (6) `overtaken`'s "event inside the capture" excuse
+  requires the reported lateness `t_trigger − due` to be explained by a
+  recorded stall over `[due, t_trigger]` (margin L − 2 ms) before trusting
+  `t_trigger`. (7) Docs: `serial-protocol.md` states the run-level field
+  values (ENDED: cycle = cycles, `t_trigger = t_start + cycles·P`; run
+  CANCELLED: cycle 0, `t_trigger` = the cut instant) and the wire order on
+  disable (the marker's CANCELLED inside the handler ahead of the Enable ACK,
+  the run's on the next pass); `Packet.h`'s field comments say stream and
+  frame_id are set on STROBE_TIMEOUT and CANCELLED, BUSY's `t_trigger` is the
+  due time, and CANCELLED is also run-level.
