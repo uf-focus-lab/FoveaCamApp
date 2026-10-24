@@ -815,6 +815,33 @@ describe("start / stop", () => {
     expect(ctl.triggerOff).toEqual(["SL", "SR"]);
   });
 
+  it("tells a Start refusal from a stop: kind refused / stopped, a start clears both", async () => {
+    const h = await harness();
+    expect(h.tele.scan_blocked_kind).toBeNull();
+    const c = ctl.controller;
+    ctl.controller = null;
+    expect(await h.call("startScan")).toBe(false);
+    await settle();
+    expect(h.tele.scan_blocked).toBe("no controller connected");
+    expect(h.tele.scan_blocked_kind).toBe("refused");
+    ctl.controller = c;
+    expect(await h.call("startScan")).toBe(true);
+    await settle();
+    expect(h.tele.scan_blocked).toBeNull();
+    expect(h.tele.scan_blocked_kind).toBeNull();
+    h.traj().setState("ready"); // the MCU ended the run
+    await settle(30);
+    expect(h.tele.scan).toBeNull();
+    expect(h.tele.scan_blocked).toBe(
+      "the controller ended the trajectory run — scan stopped",
+    );
+    expect(h.tele.scan_blocked_kind).toBe("stopped");
+    await h.call("stopScan");
+    await settle();
+    expect(h.tele.scan_blocked).toBeNull();
+    expect(h.tele.scan_blocked_kind).toBeNull();
+  });
+
   it("falls back to Timed on both eyes when one model lacks TriggerWidth", async () => {
     const h = await harness({
       state: { scan_mode: "triangle", tri_window_sync: false },
@@ -2292,6 +2319,7 @@ describe("lifecycle: round-2 interleavings", () => {
     expect(ctl.trajectories).toHaveLength(1);
     expect(h.tele.scan).toBeNull();
     expect(h.tele.scan_blocked).toBe("controller disconnected — scan stopped");
+    expect(h.tele.scan_blocked_kind).toBe("stopped");
     expect(ctl.triggerOff).toEqual(["SL", "SR"]);
   });
 
@@ -2303,7 +2331,10 @@ describe("lifecycle: round-2 interleavings", () => {
     await settle(30);
     expect(ctl.trajectories).toHaveLength(1);
     expect(h.tele.scan).toBeNull();
-    expect(h.tele.scan_blocked).toBe("controller clock not calibrated");
+    expect(h.tele.scan_blocked).toBe(
+      "controller clock calibration lapsed — press Start once it recovers",
+    );
+    expect(h.tele.scan_blocked_kind).toBe("stopped");
   });
 
   it("a start cancelled while queued never arms the cameras", async () => {

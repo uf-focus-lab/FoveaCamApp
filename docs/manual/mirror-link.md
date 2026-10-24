@@ -179,7 +179,9 @@ cameras actually expose.
    period). Hover it for the trigger bookkeeping.
 6. Adjust anything while it runs. Axis, amplitude, ratio, the windows, aiming
    and the vergence controls take effect without interrupting the scan;
-   changing **Mode** or **Scan Frequency** restarts it on the new period.
+   changing **Mode** or **Scan Frequency** restarts it on the new period — unless
+   the controller's clock link has lapsed meanwhile: the scan then stops (*idle —
+   stopped*) until the clock recovers, and you press **Start Scan** again.
 7. Press **Stop Scan** to end it. The mirrors glide back to the aiming center.
 
 The scan needs a controller with firmware 2.2.0 or later: the pattern runs on
@@ -221,16 +223,29 @@ current settings would run.
 | unequal windows: Timed exposure gives both the rising window's length | On a timed-fallback camera with **Sync Windows** off, the camera takes the rising window's length for both frames; set the windows equal (or turn Sync on) if that is not what you want. |
 | Timed exposure would run into the next trigger | On a timed-fallback camera the exposure the camera can take is longer than a whole sweep (its minimum exposure is above one sweep — the **Scan Frequency** period; a triangle's full period is two sweeps), so a frame would still be exposing when the next trigger arrives — lower **Scan Frequency**. Shortening the windows does not help: the app already keeps a shorter exposure inside its sweep. |
 | Timed exposure clamped to the camera's exposure range | On a timed-fallback camera the window is longer or shorter than the camera can expose — change the window's length. |
-| controller clock calibration lapsed | The controller's clock link stopped answering mid-scan, so the frames can no longer be timed against the path — check the controller's connection. |
-| replacement swap unconfirmed — the mirror may run the previous edit | A live edit did not get through cleanly and the controller may be running either the old or the new path. Make any edit (even back to the same value): the next one that lands settles it. On a timed-fallback camera the exposure stays at the shorter window meanwhile. |
+| controller clock calibration lapsed | The controller's clock link stopped answering mid-scan, so the frames can no longer be timed against the path — check the controller's connection. The scan keeps running meanwhile, but a **Mode** or **Scan Frequency** change stops it until the clock recovers (then press **Start Scan**). |
+| replacement swap unconfirmed — the mirror may run the previous edit | A live edit did not get through cleanly and the controller may be running either the old or the new path. Make any change to the scan's aim or shape (even back to the same value) — steer, verge/shift, amplitude, ratio, axis or windows; a **Mode** or **Scan Frequency** change also settles it. **Gain**, **Ring Reader** and PID edits do not. On a timed-fallback camera the exposure stays at the shorter window meanwhile. |
 
 If **Start Scan** is refused the status line reads *idle — refused* and its
 hover carries the reason: no cameras leased; no controller connected; the
 controller firmware is too old; the controller clock is not calibrated yet —
 wait a moment and press again; a camera rejected the settings (*exposure
 override failed*); or the controller could not start the pattern
-(*trajectory start failed*). If the controller ends the run itself, or
-disconnects, the scan stops and the hover says so.
+(*trajectory start failed*).
+
+If a running scan is stopped under you, the status line reads *idle — stopped*
+(amber) and its hover says why: the controller ended the run or cancelled it;
+the controller disconnected; a **Mode** / **Scan Frequency** restart failed
+(*scan restart failed*); after a live edit, a timed-fallback camera rejected
+its new exposure (*exposure re-apply failed*), the triangle's frame flipping
+could not be rebuilt (*flip pipe rebuild failed*) or the re-upload ended the
+run (*live trajectory re-upload ended the run*); or the controller's clock had lapsed when
+you changed **Mode** or **Scan Frequency** (*controller clock calibration
+lapsed — press Start once it recovers*).
+
+Either message stays put until you press **Start Scan** (which checks again) or
+**Stop Scan** — it is not re-checked on its own, so the hover ends with *Press
+Start to re-check.*
 
 ### Reading the emitter
 
@@ -253,7 +268,8 @@ separately for each eye — and annotates the view:
   fields (gap, leader, length, data, checksum), short ticks between data bytes.
 
 Under each view a one-line readout shows the decoded text and the measured width of one
-emitter slot (`px/chip`). Hover it for the full text, the raw hex and the reading
+emitter slot (`px/chip`); it reads `idle` while the scan is not running and `reading…`
+until the first frame is read (the Ring View strips' captions say the same). Hover it for the full text, the raw hex and the reading
 direction. When a frame
 fails, the line shows why and keeps the last message that did decode, so a good read stays
 on screen:

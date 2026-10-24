@@ -550,8 +550,21 @@ export default function mirrorLinkSession(
       console.error("[mirror-link] scan op failed:", e),
     );
 
-    function publishScanBlocked(reason: string | null): void {
-      s.telemetry({ scan_blocked: reason });
+    /** `scan_blocked` + its kind, always together: a Start refusal is
+     *  `refused`, an abort of a running scan `stopped`; null clears both. */
+    function publishScanBlocked(reason: null): void;
+    function publishScanBlocked(
+      reason: string,
+      kind: "refused" | "stopped",
+    ): void;
+    function publishScanBlocked(
+      reason: string | null,
+      kind: "refused" | "stopped" | null = null,
+    ): void {
+      s.telemetry({
+        scan_blocked: reason,
+        scan_blocked_kind: reason === null ? null : kind,
+      });
     }
 
     /** Local mirror of the published `scan` readout — the runtime doesn't hand
@@ -1477,22 +1490,22 @@ export default function mirrorLinkSession(
     async function startScanNow(): Promise<boolean> {
       if (scanActive) return true;
       if (!scanAllowed || !triple) {
-        publishScanBlocked("no camera triple leased");
+        publishScanBlocked("no camera triple leased", "refused");
         return false;
       }
       const c = activeController();
       if (!c) {
-        publishScanBlocked("no controller connected");
+        publishScanBlocked("no controller connected", "refused");
         return false;
       }
       if (!c.v22Capable) {
-        publishScanBlocked("controller firmware >= 2.2.0 required");
+        publishScanBlocked("controller firmware >= 2.2.0 required", "refused");
         return false;
       }
       // Every trusted timestamp (marker pushes, flip anchors, lateness) rides
       // the MCU↔host offset — no scan on an unpinged or lapsed clock.
       if (!c.clockCalibrated) {
-        publishScanBlocked("controller clock not calibrated yet");
+        publishScanBlocked("controller clock not calibrated yet", "refused");
         return false;
       }
       const t = triple;
@@ -1509,7 +1522,10 @@ export default function mirrorLinkSession(
         appliedPulseUs = pulse0;
       } catch (e) {
         await disarmCameras(t);
-        publishScanBlocked(`exposure override failed: ${errorLine(e)}`);
+        publishScanBlocked(
+          `exposure override failed: ${errorLine(e)}`,
+          "refused",
+        );
         return false;
       }
       // Idled / re-leased / stopped while awaiting — undo, stay out.
@@ -1523,7 +1539,10 @@ export default function mirrorLinkSession(
       } catch (e) {
         await undoStart(t);
         if (!(e instanceof ScanCancelled))
-          publishScanBlocked(`trajectory start failed: ${errorLine(e)}`);
+          publishScanBlocked(
+            `trajectory start failed: ${errorLine(e)}`,
+            "refused",
+          );
         return false;
       }
       if (cancelled()) {
@@ -1536,7 +1555,7 @@ export default function mirrorLinkSession(
       if (!traj || traj.state !== "running") {
         const reason = runEndReason(traj?.state ?? "detached");
         await undoStart(t);
-        publishScanBlocked(reason);
+        publishScanBlocked(reason, "refused");
         report("mirror-link", reason, "warning");
         return false;
       }
@@ -1589,8 +1608,9 @@ export default function mirrorLinkSession(
       }
     }
 
-    /** The run ended under us: stop for good and say why. `traj` (when given)
-     *  must still be THE run — a stale notice for a replaced table is moot. */
+    /** The run ended under us: stop for good and say why (`scan_blocked_kind`
+     *  `stopped`, never a refusal). `traj` (when given) must still be THE run
+     *  — a stale notice for a replaced table is moot. */
     async function abortScanNow(
       reason: string,
       traj?: NodeTrajectory,
@@ -1598,7 +1618,7 @@ export default function mirrorLinkSession(
       if (!scanActive) return;
       if (traj && traj !== trajectory) return;
       await stopScanNow();
-      publishScanBlocked(reason);
+      publishScanBlocked(reason, "stopped");
       report("mirror-link", reason, "warning");
     }
 
@@ -1620,7 +1640,9 @@ export default function mirrorLinkSession(
       if (!live || live.state !== "running")
         return abortScanNow(runEndReason(live?.state ?? "detached"));
       if (!activeController()?.clockCalibrated)
-        return abortScanNow("controller clock not calibrated");
+        return abortScanNow(
+          "controller clock calibration lapsed — press Start once it recovers",
+        );
       let built = buildScan();
       if (
         runSpec &&
@@ -3035,6 +3057,7 @@ export default function mirrorLinkSession(
           "ring",
           "scan",
           "scan_blocked",
+          "scan_blocked_kind",
           "scan_path",
           "scan_path_px",
           "scan_path_closed",

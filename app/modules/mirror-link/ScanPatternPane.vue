@@ -142,7 +142,7 @@ const SYNC_TITLE = `Give the falling sweep the rising sweep's window: ${SYNC_MEA
         v-model="state.scan_mode"
         :options="MODE_OPTIONS"
         class="segmented"
-        aria-label="Scan pattern"
+        aria-label="Mode"
       />
     </div>
     <RangeSlider
@@ -230,13 +230,15 @@ const SYNC_TITLE = `Give the falling sweep the rising sweep's window: ${SYNC_MEA
         <span>{{ windowMs(fallWindow) }}{{ timed ? TIMED_CUE : "" }}</span>
       </DualRangeSlider>
       <!-- A real checkbox (owner's ask), checked by default: the drawer's
-           other on/off controls are selectors, this one is a plain tick. -->
+           other on/off controls are selectors, this one is a plain tick. Named
+           by its <label> ("Sync Windows" — the accessible name holds the
+           visible one); the explanation rides `title` (its description). -->
       <label class="check-row" :title="SYNC_TITLE">
         <span>Sync Windows</span>
         <input
           type="checkbox"
           v-model="state.tri_window_sync"
-          aria-label="Sync the falling window to the rising window"
+          :title="SYNC_TITLE"
         />
       </label>
     </template>

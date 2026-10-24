@@ -21,10 +21,9 @@ const props = defineProps<{
   stage: "polar" | "binary" | "segments";
   payload: FramePayload | null | undefined;
   readout: RingReadout | null;
-  /** Strips only flow while the reader exists AND the scan runs — the empty
-   *  state says which one is missing. */
+  /** Strips only flow while the scan runs (the strip is mounted only while
+   *  the reader is on) — the empty state says which wait it is. */
   scanning: boolean;
-  reader: boolean;
 }>();
 
 const canvas = useTemplateRef<HTMLCanvasElement>("canvas");
@@ -33,12 +32,12 @@ const REDRAW_MS = 100;
 let lastDraw = 0;
 let pending: number | null = null;
 
+/** The caption — the ring row's vocabulary (spec §views): `idle` while the
+ *  scan is not running, `reading…` until its first strip + readout. */
 const status = computed(() => {
-  if (!props.reader) return "reader off";
-  if (!props.scanning) return "scan stopped";
+  if (!props.scanning) return "idle";
   const r = props.readout;
-  if (!props.payload) return "waiting for a frame";
-  if (!r) return "";
+  if (!props.payload || !r) return "reading…";
   return r.ok ? (r.text ?? "") : (r.reason ?? "");
 });
 
