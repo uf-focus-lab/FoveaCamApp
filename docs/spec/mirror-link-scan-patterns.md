@@ -558,3 +558,25 @@ UI/docs lens (others pending below). Fixed in round 8:
   same value)" settles an unconfirmed swap (gain / ring / PID edits do not).
 - **Brief:** round 7's harness items (b)-(f) amended to what landed (summed
   stalls, both falls, init-word anchor, two round trips, wrap rule).
+- **Session lens (round 8):** (1) **table capacity lockout (should-fix):**
+  three unclear swap failures in a row reserve three possibly-live siblings;
+  with the firmware's 4 tables the next replace throws "Trajectory capacity
+  (4 tables) exceeded" and every later edit fails silently while `mismatch`
+  says "unconfirmed" for good. Decision: a failed replace while
+  `1 + siblingIds.size >= TRAJECTORY_MAX_TABLES` forces a stop → start of
+  the CURRENT spec (`restartScanNow` gains a `force` flag; `closeTrajectory`
+  STOPs and DELETEs every sibling) and reports "live edits exhausted the
+  controller's tables — the scan restarts"; the manual's unconfirmed row says
+  the app restarts the scan if it persists. (2) **one automatic settling
+  replace per unconfirmed streak:** the failure branch calls
+  `scheduleReplace()` (throttled) when `siblingIds.size > 0`, at most once
+  per streak (flag cleared on a landed swap, `closeTrajectory`,
+  `resetRunStats`, or a user edit), and never when
+  `1 + siblingIds.size >= TRAJECTORY_MAX_TABLES − 1` (each unclear retry
+  reserves another table; the capacity rule then applies). The same hook
+  runs when `retiredSiblings` empties `siblingIds` while the Timed camera
+  holds the shorter exposure (so the windows are swapped onto the camera's
+  real exposure instead of a false "clamped" reason). (3) `windows` /
+  `exposure_us` carry the same may-be-live caveat as `amp_deg` (spec +
+  contract). (4) Tests pin the reason ORDER (two reasons at once) and the
+  "may run either the previous or the new edit" warning text.
