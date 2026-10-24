@@ -566,7 +566,8 @@ Fixed in round 8 (UI/docs lens first; the session and firmware/harness lenses fo
   `1 + siblingIds.size >= TRAJECTORY_MAX_TABLES` forces a stop → start of
   the CURRENT spec (`restartScanNow` gains a `force` flag; `closeTrajectory`
   STOPs and DELETEs every sibling) and reports "live edits exhausted the
-  controller's tables — the scan restarts"; the manual's unconfirmed row says
+  controller's tables — restarting the scan" (after the restart's own checks
+  pass; round 9); the manual's unconfirmed row says
   the app restarts the scan if it persists. (2) **one automatic settling
   replace per unconfirmed streak:** the failure branch calls
   `scheduleReplace()` (throttled) when `siblingIds.size > 0`, at most once
