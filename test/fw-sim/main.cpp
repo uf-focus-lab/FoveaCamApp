@@ -45,10 +45,15 @@
 // `level <C|L|R> <level>` (probe reply), `ok/err <line>`, `reboot`,
 // `stall <gap_us> <mcu_us>` (one service-loop gap longer than
 // STALL_REPORT_US: the loop was descheduled — host load — for `gap_us`, up
-// to MCU time `mcu_us`, the Global::time domain of SYS_TIMESTAMP; emitted
-// before that iteration's DAC words and pushes, so a driver can tell a late
-// marker, a merged crossing or a coarse DAC step the firmware answered a
-// starved loop with from a firmware fault).
+// to MCU time `mcu_us`, the Global::time domain of SYS_TIMESTAMP; emitted at
+// the start of the iteration AFTER the gap — after its injected strobe
+// edges, before its DAC words, pushes and responses — so a driver can tell a
+// late marker, a merged crossing or a coarse DAC step the firmware answered a
+// starved loop with from a firmware fault. A preemption INSIDE an iteration
+// (say between the strobe pump and Capture::tick) is reported by the next
+// one, i.e. after the pushes the preempted iteration sent: a driver that
+// needs it sends a request after the push and reads the stall lines once the
+// answer is in — the iteration answering it reports first).
 
 #include <algorithm>
 #include <cctype>

@@ -67,11 +67,16 @@
 // of ms, the firmware answers exactly as it should — a late marker, missed
 // crossings merged into one BUSY push, an ENDED overtaking the last capture's
 // OK push — and those answers are told from faults only by the sim's own
-// `stall <gap_us> <mcu_us>` lines: a timing/identity failure is a fixture
-// miss (re-run) only when a recorded stall at least as long as the margin
-// the check gives overlaps its window, else a firmware fault. Host-side
-// stalls (this process descheduled) are handled by measuring the instants
-// that matter on the MCU clock instead (the swap instant, the strobe rises).
+// `stall <gap_us> <mcu_us>` lines: a timing failure is a fixture miss
+// (re-run) only when a recorded stall at least as long as the margin the
+// check gives overlaps its window, else a firmware fault. A push that is not
+// the one expected is classified by KIND (checkPush): a skipped crossing
+// needs a stall of ~a period, a BUSY or an ENDED ahead of an OK push the
+// idle gap before it in stalls, a STROBE_TIMEOUT the timeout's slack; a
+// repeated or backward (cycle, marker) or a wrong table id is a firmware
+// fault whatever the sim did. Host-side stalls (this process descheduled)
+// are handled by measuring the instants that matter on the MCU clock instead
+// (the swap instant, the strobe rises).
 // A sim starved for longer than the re-arm budget absorbs fails the run as a
 // fixture failure ("host missed the window"), not as a firmware fault.
 
@@ -185,9 +190,17 @@ struct Sim {
     }
   }
 
+  // A request round trip on the pty (set by main: a GET SYS_TIMESTAMP that
+  // skips any other response). A stall line is emitted at the START of the
+  // loop iteration after the gap — so a preemption INSIDE one iteration (say
+  // between the strobe pump and Capture::tick) is reported only after the
+  // pushes that iteration sent. The iteration that answers a request sent
+  // after a push has arrived is a later one, and it prints its stall line
+  // before the answer goes out; callers sync before reading `stalls`.
+  std::function<void()> sync;
+
   // The longest recorded loop stall of at least `margin` us overlapping the
-  // MCU interval [lo, hi], or 0. Pumps first: a stall line is emitted when
-  // the loop resumes, before anything it then sends on the pty.
+  // MCU interval [lo, hi], or 0. Pumps first (call sync() before: see above).
   uint64_t stalledFor(uint64_t lo, uint64_t hi, uint64_t margin) {
     pump(5);
     uint64_t worst = 0;
@@ -195,6 +208,17 @@ struct Sim {
       if (st.to - st.from >= margin && st.from <= hi && st.to >= lo)
         worst = std::max(worst, st.to - st.from);
     return worst;
+  }
+
+  // The recorded stall time inside [lo, hi], summed over every stall. Pumps
+  // first, as stalledFor.
+  uint64_t stalledTotal(uint64_t lo, uint64_t hi) {
+    pump(5);
+    uint64_t sum = 0;
+    for (const Stall &st : stalls)
+      if (st.from < hi && st.to > lo)
+        sum += std::min(st.to, hi) - std::max(st.from, lo);
+    return sum;
   }
 
   void ctl(const std::string &cmd) {
@@ -727,68 +751,233 @@ static void retryOnce(const char *stage, Body body, Recover recover) {
   }
 }
 
-// A timing/identity check whose failure a starved SIM can produce with the
-// firmware right (a marker fired late, crossings merged into a BUSY push, an
-// ENDED overtaking the last capture's OK push — see the header). It fails as
-// a fixture miss only when the sim recorded a loop stall at least `margin` us
-// long overlapping the MCU window [lo, hi] the check is about; otherwise it
-// is a firmware fault, as strict as CHECK. margin = UINT64_MAX: always strict.
+// The sim's `stall` report threshold (STALL_REPORT_US in fw-sim/main.cpp): a
+// loop gap shorter than this leaves no line.
+constexpr uint64_t STALL_REPORT_US = 2'000;
+
+// Whether the sim's recorded loop stalls explain a failure over the MCU
+// window [lo, hi]: the longest stall of at least `margin` us overlapping it
+// or, `summed`, the stall time inside it when that adds up to `margin` (a
+// BUSY or an ENDED overtaking an OK push takes a late fire AND a late
+// completion: two stalls). 0 = no. margin = UINT64_MAX: never. Two request
+// round trips first (Sim::sync) — the first can still be read by the loop
+// iteration that sent the push being checked, when the sim is preempted
+// between the two — so a stall inside that iteration is on record.
+static uint64_t stallExplains(Sim &sim, uint64_t lo, uint64_t hi,
+                              uint64_t margin, bool summed = false) {
+  if (margin == UINT64_MAX)
+    return 0;
+  if (sim.sync) {
+    try {
+      sim.sync();
+      sim.sync();
+    } catch (const std::runtime_error &) {
+      // classify on what is on record
+    }
+  }
+  if (!summed)
+    return sim.stalledFor(lo, hi, margin);
+  const uint64_t sum = sim.stalledTotal(lo, hi);
+  return sum >= margin ? sum : 0;
+}
+
+// A timing check whose failure a starved SIM can produce with the firmware
+// right (a marker fired late, a coarse DAC step — see the header). It fails
+// as a fixture miss only when the sim's recorded stalls explain it
+// (stallExplains: one stall at least `margin` us long overlapping the MCU
+// window [lo, hi] the check is about, or `summed` stall time inside it);
+// otherwise it is a firmware fault, as strict as CHECK. margin = UINT64_MAX:
+// always strict.
 static void checkTimed(Sim &sim, bool ok, const std::string &what,
-                       uint64_t lo, uint64_t hi, uint64_t margin) {
+                       uint64_t lo, uint64_t hi, uint64_t margin,
+                       bool summed = false) {
   if (ok)
     return;
-  if (const uint64_t gap = sim.stalledFor(lo, hi, margin))
+  if (const uint64_t gap = stallExplains(sim, lo, hi, margin, summed))
     throw FixtureMiss(what + " — the sim loop stalled " +
-                      std::to_string(gap) + " us inside the window (margin " +
+                      (summed ? "a total of " : "") + std::to_string(gap) +
+                      " us inside the window (margin " +
                       std::to_string(margin) + " us)");
   throw std::runtime_error("CHECK failed: " + what);
 }
 #define CHECK_TIMED(SIM, COND, MSG, LO, HI, MARGIN)                            \
   checkTimed(SIM, bool(COND), std::string(MSG) + " (" #COND ")", LO, HI, MARGIN)
 
+// A stage's marker schedule, for classifying a push that is not the one the
+// stage expects next by what a starved sim CAN do with the firmware right
+// (checkPush, discardPushes). Each gap is the shortest stretch of its kind in
+// the stage's schedule, us; UINT64_MAX (the default) keeps that kind strict.
+struct PushGaps {
+  uint64_t period = UINT64_MAX;  // the table period
+  uint64_t marker = UINT64_MAX;  // a capture's end -> the next marker phase
+  uint64_t end = UINT64_MAX;     // the last capture's end -> the run's end
+  uint64_t timeout = UINT64_MAX; // the strobe timeout's slack past the fall
+};
+
+// A crossing is skipped only when no loop iteration ran for a whole period;
+// 1/8 of it is slack for the pass bodies around a gap measured start to start.
+static uint64_t skipMargin(const PushGaps &g) {
+  return g.period == UINT64_MAX ? UINT64_MAX : g.period - g.period / 8;
+}
+
+// The stall time an idle gap takes summed over two stalls: the gap, less the
+// two unreported (< STALL_REPORT_US) loop gaps it may also span.
+static uint64_t summedMargin(uint64_t gap) {
+  if (gap == UINT64_MAX)
+    return gap;
+  return std::max<uint64_t>(gap - std::min(gap, 2 * STALL_REPORT_US), 1);
+}
+
+static std::string describePush(const Cmd::TrajectoryFrame &f) {
+  return "status " + std::to_string(f.status) + " id " + std::to_string(f.id) +
+         " marker " + std::to_string(f.marker) + " cycle " +
+         std::to_string(f.cycle);
+}
+
+// `f` must be the marker push a stage expects next: OK, table `id`, (cycle,
+// marker), that crossing due at MCU time `due`. A starved sim (firmware
+// right) answers that crossing with only:
+//   - a STROBE_TIMEOUT of it: one stall of the timeout's slack over
+//     [due - P, due + P] (between the edge pump and Capture::tick);
+//   - a BUSY of it or of a crossing up to one cycle on, ahead of its push
+//     (that crossing met this capture still busy; Trajectory::tick runs
+//     before Capture::tick): the stalls over [due, the BUSY's phase] add up
+//     to the inter-marker idle gap;
+//   - ENDED ahead of the run's last capture push: the stalls over [due, the
+//     run's end] add up to the end gap;
+//   - any later crossing (this one skipped): no loop iteration for ~a period,
+//     one stall of skipMargin over [due, due + P].
+// A repeated or backward (cycle, marker), a wrong table id, a CANCELLED push
+// or a malformed ENDED is a firmware fault whatever the sim did.
+static void checkPush(Sim &sim, const Cmd::TrajectoryFrame &f, uint8_t id,
+                      uint8_t marker, uint32_t cycle, uint64_t due,
+                      const PushGaps &g, const std::string &what) {
+  using TF = Cmd::TrajectoryFrame;
+  const int64_t want = (int64_t(cycle) << 8) | marker;
+  const int64_t got = (int64_t(f.cycle) << 8) | f.marker;
+  if (f.status == TF::OK && f.id == id && got == want)
+    return;
+  const std::string desc = what + ": push identity/status (got " +
+                           describePush(f) + ", want status 0 id " +
+                           std::to_string(id) + " marker " +
+                           std::to_string(marker) + " cycle " +
+                           std::to_string(cycle) + ")";
+  std::fprintf(stderr, "%s\n", desc.c_str());
+  auto fault = [&](const char *kind) {
+    throw std::runtime_error("CHECK failed: " + desc + " — " + kind);
+  };
+  const uint64_t P = g.period == UINT64_MAX ? 0 : g.period;
+  if (f.id != id)
+    fault("wrong table id");
+  if (f.status == TF::ENDED) {
+    if (f.marker != TF::NO_MARKER)
+      fault("an ENDED push with a marker");
+    if (f.cycle == uint64_t(cycle) + 1)
+      checkTimed(sim, false, desc + " — ENDED overtook the last capture's push",
+                 due, f.result.t_trigger, summedMargin(g.end), true);
+    if (f.cycle > uint64_t(cycle) + 1)
+      checkTimed(sim, false, desc + " — ENDED past a skipped crossing", due,
+                 due + P, skipMargin(g));
+    fault("ENDED before the expected crossing's cycle");
+  }
+  if (f.marker == TF::NO_MARKER || f.status == TF::CANCELLED)
+    fault("not a marker capture or BUSY push");
+  if (got < want)
+    fault("a repeated or backward (cycle, marker)");
+  if (f.status == TF::BUSY && f.cycle <= uint64_t(cycle) + 1)
+    checkTimed(sim, false, desc + " — a BUSY ahead of this crossing's push",
+               due, f.result.t_trigger, summedMargin(g.marker), true);
+  if (got > want)
+    checkTimed(sim, false, desc + " — a skipped crossing", due, due + P,
+               skipMargin(g));
+  if (f.status == TF::STROBE_TIMEOUT)
+    checkTimed(sim, false, desc + " — a strobe timeout", due - std::min(due, P),
+               due + P, g.timeout);
+  fault("unknown status");
+}
+
 // Drops the trajectory pushes of cycles no stage inspects — C4's endless run,
 // the cycles a fixture re-arm skips — so none stands in for a push a stage
 // expects later (Wire::recv queues them). Queued pushes first, then off the
 // wire: up to and including the push of cycle `last` when `untilLast` (a
-// table with ONE marker), else whatever arrives within `waitMs`. Each must be
-// a marker push (any status) of table `id` for a cycle in [first, last], in
-// order; a stray one is a firmware fault unless a stall of `margin` us over
-// the MCU window [lo, hi] explains it (checkTimed). Returns the count.
+// table with ONE marker) and then, after a request round trip, every queued
+// push of a cycle <= `last` (a starved sim pushes BUSY(c) before OK(c - 1):
+// Trajectory::tick runs before Capture::tick), else whatever arrives within
+// `waitMs`. Each must be a marker push (any status) of table `id` for a cycle
+// in [first, last], every (cycle, marker) once, the capture pushes in order
+// and the BUSY pushes in order. A capture's push behind a later crossing's
+// BUSY needs the stalls of the idle gap (`g.marker`, summed over the period
+// before that BUSY), a cycle past `last` (`last` skipped) a stall of ~a
+// period over the MCU window [lo, hi] (checkTimed); anything else is a
+// firmware fault. Returns the count.
 static unsigned discardPushes(Wire &wire, uint8_t id, uint32_t first,
                               uint32_t last, bool untilLast, int waitMs,
                               const std::string &what, uint64_t lo = 0,
                               uint64_t hi = UINT64_MAX,
-                              uint64_t margin = UINT64_MAX) {
+                              const PushGaps &g = PushGaps{}) {
+  using TF = Cmd::TrajectoryFrame;
   const auto deadline = Clock::now() + std::chrono::milliseconds(waitMs);
   unsigned n = 0;
-  int64_t prev = -1; // (cycle, marker) of the last push dropped
+  // (cycle, marker) of every push dropped, the last capture push and the
+  // last BUSY (and that BUSY's crossing time).
+  std::vector<int64_t> keys;
+  int64_t prevCapture = -1, prevBusy = -1;
+  uint64_t busyAt = 0;
+  bool reached = false; // untilLast: the push of cycle `last` was dropped
   while (true) {
-    const int left =
-        int(std::chrono::duration_cast<std::chrono::milliseconds>(
-                deadline - Clock::now())
-                .count());
     Cmd::TrajectoryFrame f;
-    if (!nextPush(wire, std::max(left, 0), f)) {
-      CHECK(!untilLast, what + ": the push of cycle " + std::to_string(last) +
-                            " arrives");
-      return n;
+    if (reached) {
+      if (wire.pushes.empty() || wire.pushes.front().cycle > last)
+        return n;
+      f = wire.pushes.front();
+      wire.pushes.pop_front();
+    } else {
+      const int left =
+          int(std::chrono::duration_cast<std::chrono::milliseconds>(
+                  deadline - Clock::now())
+                  .count());
+      if (!nextPush(wire, std::max(left, 0), f)) {
+        CHECK(!untilLast, what + ": the push of cycle " +
+                              std::to_string(last) + " arrives");
+        return n;
+      }
     }
     const int64_t key = (int64_t(f.cycle) << 8) | f.marker;
-    checkTimed(*wire.sim,
-               f.id == id && f.marker != Cmd::TrajectoryFrame::NO_MARKER &&
-                   f.cycle >= first && f.cycle <= last && key > prev,
-               what + ": dropped push identity (got id " +
-                   std::to_string(f.id) + " marker " +
-                   std::to_string(f.marker) + " cycle " +
-                   std::to_string(f.cycle) + " status " +
-                   std::to_string(f.status) + ", want id " +
-                   std::to_string(id) + " cycles " + std::to_string(first) +
-                   ".." + std::to_string(last) + " in order)",
-               lo, hi, margin);
-    prev = key;
+    const std::string desc = what + ": dropped push (got " + describePush(f) +
+                             ", want id " + std::to_string(id) + " cycles " +
+                             std::to_string(first) + ".." +
+                             std::to_string(last) + ")";
+    CHECK(f.id == id && f.marker != TF::NO_MARKER && f.cycle >= first,
+          desc + " — a wrong table id, a non-marker push or a cycle before "
+                 "the range");
+    CHECK(std::find(keys.begin(), keys.end(), key) == keys.end(),
+          desc + " — a repeated (cycle, marker)");
+    if (f.cycle > last)
+      checkTimed(*wire.sim, false, desc + " — cycle " + std::to_string(last) +
+                                       " skipped",
+                 lo, hi, skipMargin(g));
+    CHECK(key > prevCapture, desc + " — behind a later capture's push");
+    if (f.status == TF::BUSY) {
+      CHECK(key > prevBusy, desc + " — behind a later crossing's BUSY");
+      prevBusy = key;
+      busyAt = f.result.t_trigger;
+    } else {
+      if (key < prevBusy &&
+          !stallExplains(*wire.sim,
+                         busyAt - std::min(busyAt, g.period), busyAt,
+                         summedMargin(g.marker), true))
+        throw std::runtime_error("CHECK failed: " + desc +
+                                 " — a capture push behind a later "
+                                 "crossing's BUSY with no sim stall to "
+                                 "explain it");
+      prevCapture = key;
+    }
+    keys.push_back(key);
     n++;
-    if (untilLast && f.cycle == last)
-      return n;
+    if (untilLast && !reached && f.cycle == last) {
+      reached = true;
+      (void)mcuNow(wire); // what the sim pushed before the answer is queued
+    }
   }
 }
 
@@ -838,6 +1027,14 @@ int main() {
 
     Wire wire;
     wire.sim = &sim;
+    // Sim::sync: one GET SYS_TIMESTAMP round trip; a stale response of the
+    // failing step ahead of its answer is skipped (pushes are queued).
+    sim.sync = [&wire] {
+      const uint16_t s = wire.next();
+      wire.send({Protocol::Method::GET, Protocol::Property::SYS_TIMESTAMP, s});
+      while (wire.recv(2000).header().sequence != s) {
+      }
+    };
     wire.fd = ::open(ptyPath.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
     CHECK(wire.fd >= 0, "open pty slave");
     termios tty{};
@@ -1292,28 +1489,18 @@ int main() {
 
       uint32_t lastFrameId = 0;
       uint64_t worstLate = 0;
-      // Stall margins of the push checks (checkTimed): the shortest idle
-      // stretch between a capture's end (trigger + 2.5 ms) and the next
-      // event (the next marker 117.5 ms later, ENDED 77.5 ms later) — a
-      // shorter sim stall cannot turn a capture into a BUSY push or let
-      // ENDED overtake the last OK push — and, for a STROBE_TIMEOUT, the
-      // timeout's slack past the strobe fall.
-      constexpr uint64_t PUSH_GAP = 77'500, TIMEOUT_SLACK = 22'500;
+      // The push schedule (checkPush): a capture ends 2.5 ms after its
+      // trigger, the next marker is 117.5 ms later and the run's end 77.5 ms
+      // later; the strobe timeout sits 22.5 ms past the fall.
+      PushGaps gaps;
+      gaps.period = PERIOD;
+      gaps.marker = 117'500;
+      gaps.end = 77'500;
+      gaps.timeout = 22'500;
       for (uint32_t k = 0; k < CYCLES; k++) {
         const auto f = recvTrajectoryFrame(wire, 2000);
         const uint64_t due = tStart + uint64_t(k) * PERIOD + MARK_AT;
-        if (f.status != Cmd::TrajectoryFrame::OK || f.cycle != k)
-          std::fprintf(stderr,
-                       "C3 marker: got status %u cycle %u, want OK cycle %u\n",
-                       unsigned(f.status), unsigned(f.cycle), k);
-        CHECK_TIMED(sim, f.status == Cmd::TrajectoryFrame::OK,
-                    "marker capture OK", due - PERIOD, due + PERIOD,
-                    f.status == Cmd::TrajectoryFrame::STROBE_TIMEOUT
-                        ? TIMEOUT_SLACK
-                        : PUSH_GAP);
-        CHECK_TIMED(sim, f.id == TID && f.marker == 0 && f.cycle == k,
-                    "marker push identity (id, marker, cycle)", due - PERIOD,
-                    due + PERIOD, PUSH_GAP);
+        checkPush(sim, f, TID, 0, k, due, gaps, "C3 marker");
         CHECK(f.result.stream == TID, "FrameResult.stream = trajectory id");
         CHECK(f.result.frame_id > lastFrameId, "frame_id monotonic");
         lastFrameId = f.result.frame_id;
@@ -1370,14 +1557,13 @@ int main() {
         CHECK(f.result.left.ch[1] == 5000 && f.result.right.ch[0] == 8000,
               "marker frame: constant channels exact");
       }
+      // Every marker push is in: nothing a starved sim does puts anything
+      // but ENDED next (an ENDED overtaking the last OK failed above).
       const auto end = recvTrajectoryFrame(wire, 2000);
-      const uint64_t tEnd = tStart + uint64_t(CYCLES) * PERIOD;
-      CHECK_TIMED(sim,
-                  end.status == Cmd::TrajectoryFrame::ENDED &&
-                      end.marker == Cmd::TrajectoryFrame::NO_MARKER &&
-                      end.cycle == CYCLES,
-                  "ENDED push after the last cycle", tEnd - PERIOD, tEnd,
-                  PUSH_GAP);
+      CHECK(end.status == Cmd::TrajectoryFrame::ENDED && end.id == TID &&
+                end.marker == Cmd::TrajectoryFrame::NO_MARKER &&
+                end.cycle == CYCLES,
+            "ENDED push after the last cycle (got " + describePush(end) + ")");
       CHECK(end.result.t_trigger == tStart + uint64_t(CYCLES) * PERIOD,
             "ENDED carries the run's end time");
       (void)mcuNow(wire); // anything pushed after ENDED is queued by now
@@ -1473,19 +1659,37 @@ int main() {
                     .find("trajectory owns the trigger lines") !=
                 std::string::npos,
             "legacy Trigger refused while a trajectory runs");
+      // STOP mid-run once the run has driven more than 10 ramp words, or
+      // after 1 s of MCU time: a starved sim's loop runs less often, not on
+      // a different clock, so a sim that writes fewer than 10 words in a
+      // second of playback is a fault, however loaded the host.
       sleepMs(70);
+      auto ranWords = [&] {
+        drain(sim);
+        return inBand(dacValues(sim, 'L', runMark), 1000, 3400).size();
+      };
+      while (ranWords() <= 10 && mcuNow(wire) < runFrom + 1'000'000)
+        sleepMs(5);
       const auto stop = trajectoryRef(Cmd::Trajectory::STOP, TID);
       expectOk(trajectoryOp(wire, &stop, sizeof(stop)), "STOP");
-      // Its marker pushes are not inspected here: drop them (the queued
-      // ones, and a capture STOP left in flight — pulse + strobe margin,
-      // 25 ms — within 50 ms), each a marker push of TID for a cycle the run
-      // reached by the STOP.
-      discardPushes(wire, TID, 0,
-                    uint32_t((mcuNow(wire) - runFrom) / PERIOD), false, 50,
-                    "C4 endless run");
+      // Its marker pushes are not inspected here: drop them, each a marker
+      // push of TID for a cycle the run reached by the STOP. A capture STOP
+      // left in flight completes by pulse + strobe margin (25 ms) on the MCU
+      // clock: once a GET answers past that, its push is queued.
+      const uint64_t stoppedBy = mcuNow(wire);
+      while (mcuNow(wire) < stoppedBy + 30'000)
+        sleepMs(1);
+      {
+        PushGaps endless;
+        endless.period = PERIOD;
+        endless.marker = 117'500;
+        discardPushes(wire, TID, 0, uint32_t((stoppedBy - runFrom) / PERIOD),
+                      false, 0, "C4 endless run", runFrom, stoppedBy, endless);
+      }
       drain(sim);
       const auto ran = inBand(dacValues(sim, 'L', runMark), 1000, 3400);
-      CHECK(ran.size() > 10, "endless run drove the DAC");
+      CHECK(ran.size() > 10, "endless run drove the DAC within 1 s of MCU "
+                             "time");
       const uint16_t held = ran.back();
       mark = sim.lines.size();
       sleepMs(100);
@@ -1541,11 +1745,16 @@ int main() {
                      "START burst timestamp");
         tHandled = payloadAs<System::Timestamp>(ack).microseconds;
       }
+      // From the reset's DAC init words on: the burst's START was handled
+      // right before them, in the same handle() pass. A word ahead of them
+      // is the HOLD's own (a 1 Hz refresh re-committing the held position
+      // between `mark` and the burst), not the new run's.
+      const size_t burstAt = sim.indexOf("dac cs=LR 280001", mark);
       std::vector<uint16_t> fresh;
       for (int i = 0; i < 200 && fresh.empty(); i++) {
         sleepMs(1);
         drain(sim);
-        fresh = inBand(dacValues(sim, 'L', mark), 1000, 3400);
+        fresh = inBand(dacValues(sim, 'L', burstAt), 1000, 3400);
       }
       CHECK(!fresh.empty(), "START after STOP drives the DAC");
       if (fresh.front() != 1000)
@@ -1563,10 +1772,25 @@ int main() {
       CHECK_TIMED(sim, fresh.front() == 1000,
                   "a fresh START's first DAC word is phase 0", tHandled,
                   re.t_start, re.t_start - tHandled);
-      for (int i = 0; i < 4; i++) // the marker's OK push, then ENDED
-        if (recvTrajectoryFrame(wire, 2000).status ==
-            Cmd::TrajectoryFrame::ENDED)
-          break;
+      // Exactly the one marker's OK push, then ENDED (the endless run's
+      // pushes were all dropped above). C3's schedule: the capture ends
+      // 2.5 ms after the trigger, 77.5 ms before the run's end.
+      {
+        PushGaps one;
+        one.period = PERIOD;
+        one.marker = 117'500;
+        one.end = 77'500;
+        one.timeout = 22'500;
+        checkPush(sim, recvTrajectoryFrame(wire, 2000), TID, 0, 0,
+                  re.t_start + MARK_AT, one, "C4 fresh START marker");
+        const auto end = recvTrajectoryFrame(wire, 2000);
+        CHECK(end.status == Cmd::TrajectoryFrame::ENDED && end.id == TID &&
+                  end.marker == Cmd::TrajectoryFrame::NO_MARKER &&
+                  end.cycle == 1 &&
+                  end.result.t_trigger == re.t_start + PERIOD,
+              "C4 fresh START: ENDED after its one cycle (got " +
+                  describePush(end) + ")");
+      }
 
       // HOLD is not running: Actuate works again (ACK, then FIN after the
       // settle time) — the host may re-aim after a scan — and becomes the
@@ -1696,8 +1920,11 @@ int main() {
       sleepMs(1200);
       drain(sim);
       {
+        // From the reset's init words on (a 1 Hz refresh between `mark` and
+        // the burst still re-commits the stream's position).
         bool wrote[2][4] = {}; // [L, R][channel] got a per-channel word
-        for (size_t i = mark; i < sim.lines.size(); i++) {
+        for (size_t i = sim.indexOf("dac cs=LR 280001", mark);
+             i < sim.lines.size(); i++) {
           DacWord w;
           if (!parseDac(sim.lines[i], w) || !carriesValue(w))
             continue;
@@ -1859,15 +2086,18 @@ int main() {
           cycle = uint32_t((now - T - from) / P) + 1;
         }
       };
-      // Stall margin of the push identity checks (checkTimed): the shortest
-      // idle stretch, in the running stage's schedule, between a capture's
-      // end and the next marker phase or the run's end. A shorter sim stall
-      // cannot turn a capture into a BUSY push, merge two crossings or let
-      // ENDED overtake an OK push. Set per stage. A STROBE_TIMEOUT takes a
-      // stall between the edge pump and Capture::tick as long as the
-      // timeout's slack past the injected fall: 25 ms in every C5/C6 shape.
-      uint64_t pushGap = 0;
-      constexpr uint64_t TIMEOUT_SLACK = 25'000;
+      // The running stage's push schedule (checkPush): the shortest idle
+      // stretch between a capture's end and the next marker phase, and
+      // between the last capture's end and the run's end — set per stage
+      // (pushGaps). The strobe timeout's slack past the injected fall is
+      // 25 ms in every C5/C6 shape.
+      PushGaps gaps;
+      gaps.period = P;
+      gaps.timeout = 25'000;
+      auto pushGaps = [&](uint64_t marker, uint64_t end) {
+        gaps.marker = marker;
+        gaps.end = end;
+      };
       // One marker push on the ORIGINAL phase clock: identity, never early,
       // on phase, and the exposure-averaged position is the ramp over the
       // window with ch1 from the table(s) that drove it.
@@ -1876,23 +2106,9 @@ int main() {
                              uint8_t marker, uint32_t cycle, uint64_t tStart,
                              uint32_t at, const std::string &what,
                              uint16_t ch1Lo, uint16_t ch1Hi) {
-        if (f.status != Cmd::TrajectoryFrame::OK || f.id != id ||
-            f.marker != marker || f.cycle != cycle)
-          std::fprintf(stderr,
-                       "%s: got status %u id %u marker %u cycle %u, want OK "
-                       "id %u marker %u cycle %u\n",
-                       what.c_str(), unsigned(f.status), unsigned(f.id),
-                       unsigned(f.marker), unsigned(f.cycle), unsigned(id),
-                       unsigned(marker), unsigned(cycle));
         const uint64_t due = tStart + uint64_t(cycle) * P + at;
-        CHECK_TIMED(sim, f.status == Cmd::TrajectoryFrame::OK,
-                    what + ": capture OK", due - P, due + P,
-                    f.status == Cmd::TrajectoryFrame::STROBE_TIMEOUT
-                        ? TIMEOUT_SLACK
-                        : pushGap);
-        CHECK_TIMED(sim, f.id == id && f.marker == marker && f.cycle == cycle,
-                    what + ": push identity — no missed or doubled cycle",
-                    due - P, due + P, pushGap);
+        checkPush(sim, f, id, marker, cycle, due, gaps,
+                  what + " (no missed or doubled cycle)");
         CHECK(f.result.t_trigger >= due, what + ": never fires early");
         if (f.result.t_trigger - due >= LATE_MAX)
           std::fprintf(stderr, "%s: fired +%llu us after its phase\n",
@@ -2012,49 +2228,52 @@ int main() {
       };
       auto expectEnded = [&](uint8_t id, uint32_t cycles, uint64_t tStart,
                              const std::string &stage) {
+        // Every marker push is in (an ENDED overtaking the last one failed
+        // checkMarker): a starved sim puts nothing but ENDED next.
         const auto end = recvTrajectoryFrame(wire, 2000);
         const uint64_t tEnd = tStart + uint64_t(cycles) * P;
-        if (end.status != Cmd::TrajectoryFrame::ENDED)
-          std::fprintf(stderr,
-                       "%s: got status %u id %u marker %u cycle %u, want "
-                       "ENDED\n",
-                       stage.c_str(), unsigned(end.status), unsigned(end.id),
-                       unsigned(end.marker), unsigned(end.cycle));
-        CHECK_TIMED(sim,
-                    end.status == Cmd::TrajectoryFrame::ENDED &&
-                        end.id == id &&
-                        end.marker == Cmd::TrajectoryFrame::NO_MARKER &&
-                        end.cycle == cycles,
-                    stage + ": b's budget (from the original t_start) ends "
-                            "the run",
-                    tEnd - P, tEnd, pushGap);
+        CHECK(end.status == Cmd::TrajectoryFrame::ENDED && end.id == id &&
+                  end.marker == Cmd::TrajectoryFrame::NO_MARKER &&
+                  end.cycle == cycles,
+              stage + ": b's budget (from the original t_start) ends the run "
+                      "(got " + describePush(end) + ")");
         CHECK(end.result.t_trigger == tEnd,
               stage + ": ENDED at t_start + cycles x period (original clock)");
       };
       // DAC continuity across a swap (sim lines [runMark, swapMark) were
-      // emitted before it): in band, advancing through the swap, one wrap
-      // per cycle, b's table afterwards. Returns the wrap count. The run
-      // spans [tStart, tStart + cycles x P] on the MCU clock: the shape
-      // checks leave a sim stall of up to RAMP_STALL harmless (below), and a
-      // longer one recorded over the run makes their failure a fixture miss.
-      // So does one of SWAP_TO_WRAP (the latest swap phase used, 89 ms, to
-      // the wrap) for the advancing check: a stall from just after the
-      // drain at swapMark across the wrap puts a post-wrap word first.
+      // emitted before it, the swap handled at MCU time tSwap, in the same
+      // cycle as the drain at swapMark): in band, advancing through the
+      // swap, one wrap per cycle, b's table afterwards. Returns the wrap
+      // count. The run spans [tStart, tStart + cycles x P] on the MCU clock:
+      // the shape checks leave a sim stall of up to RAMP_STALL harmless
+      // (below), and a longer one recorded over the run makes their failure
+      // a fixture miss; a missing wrap takes a skipped cycle (no loop
+      // iteration for ~a period: skipMargin). The advancing check compares
+      // b's FIRST word (ch0 precedes ch1 = CH1_B in each write) with a's
+      // last before the drain — the words between are a's own — and only a
+      // stall of SWAP_TO_WRAP (the latest swap phase used, 89 ms, to the
+      // wrap) over [tSwap, tSwap + P] lets that first word be a post-wrap
+      // one.
       constexpr uint64_t RAMP_STALL = 48'000, SWAP_TO_WRAP = 30'000;
-      auto checkRamp = [&](size_t runMark, size_t swapMark, unsigned cycles,
-                           uint64_t tStart, const std::string &stage) {
+      auto checkRamp = [&](size_t runMark, size_t swapMark, uint64_t tSwap,
+                           unsigned cycles, uint64_t tStart,
+                           const std::string &stage) {
         drain(sim);
         const uint64_t tEnd = tStart + uint64_t(cycles) * P;
         const auto before =
             inBand(dacValues(sim, 'L', runMark, swapMark), BAND_LO, BAND_HI);
         CHECK(!before.empty(), stage + ": a drove the DAC before the swap");
-        const auto after =
-            inBand(dacValues(sim, 'L', swapMark), BAND_LO, BAND_HI);
-        CHECK(!after.empty(), stage + ": the DAC is driven after the swap");
-        CHECK_TIMED(sim, after.front() >= before.back(),
+        const auto ch1 = dacValues(sim, 'L', swapMark);
+        const auto firstB = std::find(ch1.begin(), ch1.end(), CH1_B);
+        CHECK(firstB != ch1.end() && firstB != ch1.begin(),
+              stage + ": b's table plays after the swap");
+        const uint16_t bFirst = *(firstB - 1);
+        CHECK(bFirst >= BAND_LO && bFirst <= BAND_HI,
+              stage + ": b's first write is on the ramp");
+        CHECK_TIMED(sim, bFirst >= before.back(),
                     stage + ": the ramp keeps advancing across the swap (no "
                             "phase reset)",
-                    tStart, tEnd, SWAP_TO_WRAP);
+                    tSwap, tSwap + P, SWAP_TO_WRAP);
         // Every decreasing run is a full wrap (high -> low): it starts at
         // phase >= 70 ms (ch0 >= 16500) and lands at phase <= 50 ms (ch0 <=
         // 15500). A phase reset at a swap before phase 70 ms (every swap here
@@ -2097,12 +2316,12 @@ int main() {
                          unsigned(st.second));
           std::fprintf(stderr, "\n");
         }
+        // An extra wrap is a phase jump whatever the sim did; a missing one
+        // takes a skipped cycle.
         CHECK_TIMED(sim, steps.size() == cycles,
                     stage + ": one wrap per cycle (no extra phase jump)",
-                    tStart, tEnd, RAMP_STALL);
-        const auto ch1 = dacValues(sim, 'L', swapMark);
-        const auto firstB = std::find(ch1.begin(), ch1.end(), CH1_B);
-        CHECK(firstB != ch1.end(), stage + ": b's table plays after the swap");
+                    tStart, tEnd,
+                    steps.size() < cycles ? skipMargin(gaps) : UINT64_MAX);
         CHECK(std::find(firstB, ch1.end(), CH1_A) == ch1.end(),
               stage + ": a never plays again after b took over");
         return unsigned(steps.size());
@@ -2184,7 +2403,7 @@ int main() {
         upload(TC, P / 2, CH1_C, {{AT_A, PULSE}}); // different period
         strobes(FALL);
         // b's last capture ends at phase 85 ms, the run at 120 ms.
-        pushGap = 35'000;
+        pushGaps(80'000, 35'000); // b's capture end -> its next marker / end
 
         const size_t runMark = sim.lines.size();
         const uint64_t T = mcuNow(wire) + 50'000;
@@ -2230,7 +2449,7 @@ int main() {
           if (cycle > seen + 1) // re-armed: drop a's pushes for the skipped
             discardPushes(wire, TA, seen + 1, cycle - 1, true, 2000,
                           "C5 re-arm", T + uint64_t(seen) * P,
-                          T + uint64_t(cycle) * P, pushGap);
+                          T + uint64_t(cycle) * P, gaps);
           seen = cycle - 1;
           drain(sim); // every edge of cycle - 1's capture (its push is in)
           cycleMark = sim.lines.size();
@@ -2279,23 +2498,48 @@ int main() {
                             std::to_string(sw.t - cycleT) +
                             " us, past b's marker phase — host stall");
         const auto inflight = recvTrajectoryFrame(wire, 2000);
-        // The window read sits after the rises and before the send, so the
-        // capture started before the measured swap instant — else the push
-        // is not the straddling capture this scenario needs (fixture).
-        if (inflight.status == Cmd::TrajectoryFrame::OK &&
-            inflight.id == TA && inflight.cycle == sc &&
-            (inflight.result.t_trigger >= sw.t ||
-             inflight.result.t_exposure >= sw.t))
-          throw FixtureMiss("C5: a's capture (trigger T" +
-                            std::to_string(inflight.result.t_trigger - T) +
-                            ", exposure T" +
-                            std::to_string(inflight.result.t_exposure - T) +
-                            " us) did not start before the swap (T" +
-                            std::to_string(sw.t - T) + " us)");
         // Its exposure STRADDLES the swap: the rise latched a's position, the
-        // fall b's (same ramp; ch1 averages a's and b's).
-        c5Marker(inflight, TA, sc, T, "a's in-flight swap cycle",
-                 (CH1_A + CH1_B) / 2, (CH1_A + CH1_B) / 2);
+        // fall b's (same ramp; ch1 averages a's and b's) — unless the sim's
+        // loop, starved, pumped both falls (the finish latch: the last fall
+        // wins) before the Trajectory::tick that first drove b: then both
+        // latches read a. The sim's stdout has the order (the strobe pump,
+        // the DAC words and the push come from one thread, in that order),
+        // and every line of it is out before the push.
+        drain(sim);
+        size_t fallL = SIZE_MAX, fallR = SIZE_MAX, firstB = SIZE_MAX;
+        for (size_t i = cycleMark; i < sim.lines.size(); i++) {
+          const std::string &line = sim.lines[i];
+          if (fallL == SIZE_MAX && line == "strobe L 1")
+            fallL = i;
+          if (fallR == SIZE_MAX && line == "strobe R 1")
+            fallR = i;
+          DacWord w;
+          if (firstB == SIZE_MAX && i >= swapMark && parseDac(line, w) &&
+              carriesValue(w) && w.left && w.value == CH1_B)
+            firstB = i;
+        }
+        const bool aOnly = fallL < firstB && fallR < firstB;
+        const uint16_t ch1 = aOnly ? CH1_A : (CH1_A + CH1_B) / 2;
+        c5Marker(inflight, TA, sc, T, "a's in-flight swap cycle", ch1, ch1);
+        // The swap went out only after risen() saw both injected rises, and
+        // t_exposure is the rise ISR's micros() sample: the capture's
+        // trigger and exposure start precede the measured swap instant on
+        // correct firmware, whatever the host or the sim did.
+        CHECK(inflight.result.t_trigger < sw.t &&
+                  inflight.result.t_exposure < sw.t,
+              "C5 a's capture (trigger T" +
+                  std::to_string(inflight.result.t_trigger - T) +
+                  ", exposure T" +
+                  std::to_string(inflight.result.t_exposure - T) +
+                  " us) started before the swap (T" +
+                  std::to_string(sw.t - T) + " us)");
+        if (aOnly)
+          throw FixtureMiss("C5: both of a's strobe falls were pumped before "
+                            "b first drove the DAC (the swap was handled at "
+                            "swap-cycle phase " +
+                            std::to_string(sw.t - cycleT) +
+                            " us, the next loop pass late) — the exposure "
+                            "did not straddle the swap");
 
         // b's markers continue the SAME cycle count on the same clock; b's
         // marker 0 does NOT fire again in the swap cycle (a's marker 0 had).
@@ -2312,7 +2556,7 @@ int main() {
         }
         expectEnded(TB, cyclesB, T, "C5");
         const unsigned wraps =
-            checkRamp(runMark, swapMark, cyclesB, T, "C5");
+            checkRamp(runMark, swapMark, sw.t, cyclesB, T, "C5");
         CHECK(!hasValue(dacValues(sim, 'L', runMark), CH1_C),
               "C5 the REJected table c never played");
         cleanup("C5");
@@ -2347,8 +2591,9 @@ int main() {
         upload(TA, P, CH1_A, {{A_AT, PULSE6}});
         upload(TB, P, CH1_B, {{B_AT, PULSE6}});
         strobes(FALL6);
-        // a's capture ends at 84 ms, b's next marker is at 130 ms.
-        pushGap = 46'000;
+        // a's capture ends at 84 ms, b's next marker is at 130 ms; b's
+        // capture ends at 14 ms, the run at 120 ms.
+        pushGaps(46'000, 106'000);
         const size_t runMark = sim.lines.size();
         const uint64_t T = mcuNow(wire) + 50'000;
         auto st = startOp(TA, T, 0); // a: forever
@@ -2365,7 +2610,7 @@ int main() {
                           discardPushes(wire, TA, seen + 1, cycle - 1, true,
                                         2000, "C6a re-arm",
                                         T + uint64_t(seen) * P,
-                                        T + uint64_t(cycle) * P, pushGap);
+                                        T + uint64_t(cycle) * P, gaps);
                         seen = cycle - 1;
                       });
         const uint32_t cycles = CYCLES6 + (sc - 1); // b's budget
@@ -2374,8 +2619,9 @@ int main() {
         const size_t swapMark = sim.lines.size();
         // Handled at/after a's swap-cycle marker phase, a's marker may have
         // fired first (its push then precedes the ACK): a host stall.
-        swapIdle(startOp(TB, T, cycles), "C6a", cycleT + A_AT,
-                 "a's swap-cycle marker phase");
+        const uint64_t tSwap =
+            swapIdle(startOp(TB, T, cycles), "C6a", cycleT + A_AT,
+                     "a's swap-cycle marker phase");
         const auto first = recvTrajectoryFrame(wire, 2000);
         if (!(first.cycle == sc + 1 && first.result.t_trigger >= cycleT + P))
           std::fprintf(stderr,
@@ -2394,7 +2640,7 @@ int main() {
           checkMarker(recvTrajectoryFrame(wire, 2000), TB, 0, k, T, B_AT,
                       "C6a b", CH1_B, CH1_B);
         expectEnded(TB, cycles, T, "C6a");
-        checkRamp(runMark, swapMark, cycles, T, "C6a");
+        checkRamp(runMark, swapMark, tSwap, cycles, T, "C6a");
         cleanup("C6a");
       }, recover);
       // C6b — b with MORE markers than a. a = {m0 @10 ms}, b = {m0 @10 ms,
@@ -2411,7 +2657,7 @@ int main() {
         strobes(FALL6);
         // m0's capture ends at 14 ms, m1 is at 60 ms; m1's ends at 64 ms, the
         // run at 120 ms.
-        pushGap = 46'000;
+        pushGaps(46'000, 56'000);
         const size_t runMark = sim.lines.size();
         const uint64_t T = mcuNow(wire) + 50'000;
         auto st = startOp(TA, T, 0); // a: forever
@@ -2431,7 +2677,7 @@ int main() {
                           discardPushes(wire, TA, seen + 1, cycle - 1, true,
                                         2000, "C6b re-arm",
                                         T + uint64_t(seen) * P,
-                                        T + uint64_t(cycle) * P, pushGap);
+                                        T + uint64_t(cycle) * P, gaps);
                         checkMarker(recvTrajectoryFrame(wire, 2000), TA, 0,
                                     cycle, T, M0, "C6b a", CH1_A, CH1_A);
                         seen = cycle;
@@ -2442,8 +2688,8 @@ int main() {
         const size_t swapMark = sim.lines.size();
         // Handled at/after b's extra marker phase, its crossing is behind
         // the window and it first fires next cycle: a host stall.
-        swapIdle(startOp(TB, T, cycles), "C6b", cycleT + M1,
-                 "b's extra marker phase");
+        const uint64_t tSwap = swapIdle(startOp(TB, T, cycles), "C6b",
+                                        cycleT + M1, "b's extra marker phase");
         checkMarker(recvTrajectoryFrame(wire, 2000), TB, 1, sc, T, M1,
                     "C6b b's extra marker 1 in the swap cycle", CH1_B, CH1_B);
         for (uint32_t k = sc + 1; k < cycles; k++) {
@@ -2453,7 +2699,7 @@ int main() {
                       "C6b b marker 1", CH1_B, CH1_B);
         }
         expectEnded(TB, cycles, T, "C6b");
-        checkRamp(runMark, swapMark, cycles, T, "C6b");
+        checkRamp(runMark, swapMark, tSwap, cycles, T, "C6b");
         cleanup("C6b");
       }, recover);
       // C6c — the two remaining documented swap guarantees
@@ -2472,9 +2718,9 @@ int main() {
         upload(TA, P, CH1_A, {});
         upload(TB, P, CH1_B, {{B_AT, PULSE6}});
         strobes(FALL6);
-        // armed: b's capture ends at 14 ms, the run at 120 ms (spent: no
-        // capture at all).
-        pushGap = 106'000;
+        // armed: b's capture ends at 14 ms, the run at 120 ms, its next
+        // marker phase at 130 ms (spent: no capture at all).
+        pushGaps(116'000, 106'000);
         // L's in-band (ch0) values from b's first write on — ch0 precedes
         // ch1 = CH1_B in each write — after checking a's ch1 never returns.
         auto afterB = [&](size_t from, size_t to, const std::string &what) {
@@ -2504,8 +2750,8 @@ int main() {
         // a has no marker: no push may precede the ACK. The pre-position
         // check below samples up to T - 30 ms; a swap handled within 15 ms
         // of t_start leaves it nothing to see (host stall).
-        swapIdle(startOp(TB, T, 1), "C6c armed", T - 15'000,
-                 "t_start - 15 ms");
+        const uint64_t tSwap = swapIdle(startOp(TB, T, 1), "C6c armed",
+                                        T - 15'000, "t_start - 15 ms");
         // Sampled well before t_start: the drain below also takes the words
         // emitted while it runs.
         const uint64_t armedNow = waitMcu(T - 30'000);
@@ -2523,7 +2769,7 @@ int main() {
         checkMarker(recvTrajectoryFrame(wire, 2000), TB, 0, 0, T, B_AT,
                     "C6c armed b cycle 0", CH1_B, CH1_B);
         expectEnded(TB, 1, T, "C6c armed");
-        checkRamp(runMark, swapMark, 1, T, "C6c armed");
+        checkRamp(runMark, swapMark, tSwap, 1, T, "C6c armed");
         cleanup("C6c armed");
 
         // spent
