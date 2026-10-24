@@ -52,10 +52,10 @@
 //      0 pushes exactly OK(cycle 0), OK(cycle 1), ENDED (the crossing at
 //      t_start fires; the final tick fires nothing); strobes disarmed
 //      mid-run -> STROBE_TIMEOUT (cycle identity, t_exposure 0) and a marker
-//      due inside that capture's timeout -> BUSY at its due time; a host
-//      CMD_FRAME in flight at a marker phase -> BUSY; Enable(false)
-//      mid-capture -> the marker's CANCELLED, then the run's CANCELLED
-//      (NO_MARKER); re-enabled with the streams re-created.
+//      due after that capture's pulse but inside its 5 ms strobe margin ->
+//      BUSY at its due time; a host CMD_FRAME in flight at a marker phase ->
+//      BUSY; Enable(false) mid-capture -> the marker's CANCELLED, then the
+//      run's CANCELLED (NO_MARKER); re-enabled with the streams re-created.
 //   D. Pipelining (runs between 6 and 7): N requests in
 //      flight answered in seq order at ~one round trip; seq=0 UPDATEs
 //      interleaved silently (latest wins); requests behind a pending
@@ -83,11 +83,12 @@
 // one stall from that capture's MEASURED end (its trigger + the exposure) to
 // the BUSY's phase or the run's end — or one adjacent stall chained right
 // behind a stall from that end (the pass that pumped the fall preempted
-// before its trajectory tick; overtakeExplained) — a STROBE_TIMEOUT the
+// before its trajectory tick; overtakeExplained), the measured trigger
+// trusted only when a stall explains its lateness — a STROBE_TIMEOUT the
 // timeout's slack; a repeated or backward (cycle, marker) or a wrong table
 // id is a firmware fault whatever the sim did. Host-side stalls (this process descheduled)
 // are handled by measuring the instants that matter on the MCU clock instead
-// (the swap instant, the strobe rises).
+// (a START's or a swap's handling instant, the strobe rises).
 // A sim starved for longer than the re-arm budget absorbs fails the run as a
 // fixture failure ("host missed the window"), not as a firmware fault.
 
@@ -909,7 +910,9 @@ constexpr uint8_t NO_TABLE = 0xFF;
 //     crossing met this capture still busy; Trajectory::tick runs before
 //     Capture::tick), or ENDED ahead of the run's last capture push: the
 //     capture's push (read off the wire) is behind a run event that
-//     overtakeExplained() explains — from the capture's MEASURED trigger;
+//     overtakeExplained() explains — from the capture's MEASURED trigger,
+//     whose lateness past `due` a stall of it less STALL_REPORT_US over
+//     [due, t_trigger] must explain first (else a late fire is a fault);
 //     `succ` (the swap's new table) may push that BUSY for cycle >= `cycle`
 //     + 1 (a stall from before the in-flight capture's end);
 //   - any later crossing (this one skipped): no loop iteration for ~a period,
@@ -938,11 +941,26 @@ static void checkPush(Wire &wire, const Cmd::TrajectoryFrame &f, uint8_t id,
     throw std::runtime_error("CHECK failed: " + desc + " — " + kind);
   };
   // The expected capture's push came in behind run event `at` (the BUSY's
-  // due time, the ENDED's end time): a fixture miss iff overtakeExplained.
+  // due time, the ENDED's end time): a fixture miss iff overtakeExplained —
+  // which reckons from the capture's REPORTED trigger, so that is trusted
+  // only once its lateness L = t_trigger - due is itself explained: a
+  // starved sim fires late only behind a loop gap over [due, t_trigger] of
+  // at least L less the unreported slack (STALL_REPORT_US). Unexplained, a
+  // marker fired late enough to let a later run event overtake its push
+  // (e.g. L >= P - fall: the next crossing "inside" the capture) is a
+  // firmware fault.
   auto overtaken = [&](uint64_t at, const char *kind) {
     const auto cap = findCapturePush(wire, id, marker, cycle, 2000);
     if (!cap)
       return; // never pushed: classified as a skipped crossing below
+    const uint64_t tTrig = cap->result.t_trigger;
+    const uint64_t late = tTrig > due ? tTrig - due : 0;
+    if (late > STALL_REPORT_US &&
+        !stallExplains(sim, due, tTrig, late - STALL_REPORT_US))
+      fault((std::string(kind) + " behind a capture that fired " +
+             std::to_string(late) + " us late with no sim stall over [due, "
+                                    "t_trigger] to explain it")
+                .c_str());
     if (const uint64_t gap = overtakeExplained(sim, *cap, at, g))
       throw FixtureMiss(desc + " — " + kind + " (the capture triggered at "
                         "due+" + std::to_string(cap->result.t_trigger - due) +
@@ -1107,6 +1125,94 @@ static void recoverTrajectories(Wire &wire, std::initializer_list<uint8_t> ids) 
     pending.erase(it);
   }
   flushWire(wire);
+}
+
+// A CMD_TRAJECTORY START with a GET SYS_TIMESTAMP behind it in ONE burst:
+// the sim's loop handles both in the same iteration, so the GET's answer is
+// the MCU instant the START was handled (`t`) — measured, not inferred from
+// a reading the host took before a send it may have been descheduled ahead
+// of. Reads raw until both ACKs; trajectory pushes that arrive before the
+// START's ACK are returned (`early`), later ones queued for
+// recvTrajectoryFrame. Nothing may be queued before: every earlier push was
+// consumed (or dropped as skipped) by the stage. Used for every START whose
+// timing the stage depends on: a swap (C5/C6, the swap instant) and a fresh
+// run's START ahead of its t_start (startAhead).
+struct MeasuredStart {
+  uint64_t t = 0;
+  std::vector<Cmd::TrajectoryFrame> early;
+};
+static MeasuredStart startMeasured(Wire &wire, const Cmd::TrajectoryStart &st,
+                                   const std::string &stage) {
+  CHECK(wire.pushes.empty(),
+        stage + ": no unexpected trajectory push before the START");
+  std::vector<uint8_t> burst;
+  const uint16_t sStart = wire.next();
+  appendFrame(wire,
+              setPacket(Protocol::Property::CMD_TRAJECTORY, sStart, &st,
+                        sizeof(st)),
+              burst);
+  const uint16_t sNow = wire.next();
+  appendFrame(wire,
+              {Protocol::Method::GET, Protocol::Property::SYS_TIMESTAMP, sNow},
+              burst);
+  sendBurst(wire, burst);
+  MeasuredStart out;
+  bool acked = false, timed = false;
+  while (!acked || !timed) {
+    auto pkt = wire.recv(2000, true);
+    const auto h = pkt.validate();
+    if (Protocol::method(h) == Protocol::Method::SYN) {
+      if (Protocol::property(h) == Protocol::Property::LOG)
+        continue;
+      CHECK(Protocol::property(h) == Protocol::Property::CMD_TRAJECTORY,
+            stage + ": only LOG / trajectory pushes arrive unsolicited");
+      const auto f = payloadAs<Cmd::TrajectoryFrame>(pkt);
+      if (acked)
+        wire.pushes.push_back(f);
+      else
+        out.early.push_back(f);
+      continue;
+    }
+    if (!acked) {
+      CHECK(pkt.header().sequence == sStart,
+            stage + ": the START answers first");
+      if (Protocol::method(h) != Protocol::Method::ACK)
+        throw std::runtime_error("CHECK failed: " + stage +
+                                 " START ACKed (got " + payloadStr(pkt) + ")");
+      acked = true;
+      continue;
+    }
+    expectHeader(pkt, Protocol::Method::ACK, Protocol::Property::SYS_TIMESTAMP,
+                 sNow, "START instant ACK");
+    out.t = payloadAs<System::Timestamp>(pkt).microseconds;
+    timed = true;
+  }
+  for (const auto &f : out.early)
+    std::fprintf(stderr,
+                 "%s: push before the START ACK: id %u marker %u cycle %u "
+                 "status %u t_trigger %llu (START at %llu)\n",
+                 stage.c_str(), unsigned(f.id), unsigned(f.marker),
+                 unsigned(f.cycle), unsigned(f.status),
+                 static_cast<unsigned long long>(f.result.t_trigger),
+                 static_cast<unsigned long long>(out.t));
+  return out;
+}
+
+// A fresh run's START with t_start ahead (no run playing). Handled at/after
+// t_start it joins its own run in progress and the crossings between t_start
+// and that instant never fire — a host stall between the reading t_start was
+// computed from and the send, measured (startMeasured), not a firmware fault
+// (not "a skipped crossing"): a fixture miss. Returns the instant it was
+// handled.
+static uint64_t startAhead(Wire &wire, const Cmd::TrajectoryStart &st,
+                           const std::string &what) {
+  const auto sw = startMeasured(wire, st, what);
+  CHECK(sw.early.empty(), what + ": no push before the START ACK");
+  if (sw.t >= st.t_start)
+    throw FixtureMiss(what + ": START handled " +
+                      std::to_string(sw.t - st.t_start) +
+                      " us past its t_start — host stall");
+  return sw.t;
 }
 
 int main() {
@@ -1565,7 +1671,7 @@ int main() {
       const uint64_t tStart = mcuNow(wire) + 100'000;
       st.t_start = tStart;
       st.cycles = CYCLES;
-      expectOk(trajectoryOp(wire, &st, sizeof(st)), "START");
+      startAhead(wire, st, "C3 START"); // handled past t_start: fixture miss
       // Armed (pre-positioned, before t_start): the trajectory owns the DAC.
       uint16_t s = wire.next();
       streamOp(wire, Cmd::MirrorStream::UPDATE, 1, R0, R0, s);
@@ -1706,7 +1812,11 @@ int main() {
 
       // A pending legacy Trigger holds every Line3 HIGH until its FIN: a
       // START meanwhile is refused (a marker's pulse would be cut by that
-      // FIN), and works once the FIN is out.
+      // FIN), and works once the FIN is out. Trigger + START in ONE burst:
+      // the sim's loop handles both in the same iteration, so the START
+      // meets the Trigger pending however long the host is descheduled (two
+      // separate writes 150 ms apart let the FIN go out first) — the wire
+      // order is then the Trigger ACK, the START REJ, the FIN.
       uint16_t s = 0;
       Cmd::TrajectoryStart st{};
       st.op = Cmd::Trajectory::START;
@@ -1715,16 +1825,27 @@ int main() {
       st.cycles = 0;
       Cmd::Trigger trig{};
       trig.duration = 150'000;
-      s = wire.next();
-      wire.send(setPacket(Protocol::Property::CMD_TRIGGER, s, &trig,
-                          sizeof(trig)));
-      expectAck(wire, Protocol::Property::CMD_TRIGGER, s, "legacy Trigger");
-      CHECK(expectRejected(trajectoryOp(wire, &st, sizeof(st)),
-                           "START while a Trigger is pending") ==
-                "A trigger is pending (legacy Trigger) — wait for its FIN",
-            "START refused while a legacy Trigger is pending");
-      expectHeader(wire.recv(), Protocol::Method::FIN,
-                   Protocol::Property::CMD_TRIGGER, s, "legacy Trigger FIN");
+      {
+        std::vector<uint8_t> burst;
+        s = wire.next();
+        appendFrame(wire,
+                    setPacket(Protocol::Property::CMD_TRIGGER, s, &trig,
+                              sizeof(trig)),
+                    burst);
+        const uint16_t sStart = wire.next();
+        appendFrame(wire,
+                    setPacket(Protocol::Property::CMD_TRAJECTORY, sStart, &st,
+                              sizeof(st)),
+                    burst);
+        sendBurst(wire, burst);
+        expectAck(wire, Protocol::Property::CMD_TRIGGER, s, "legacy Trigger");
+        CHECK(expectRej(wire, Protocol::Property::CMD_TRAJECTORY, sStart,
+                        "START while a Trigger is pending") ==
+                  "A trigger is pending (legacy Trigger) — wait for its FIN",
+              "START refused while a legacy Trigger is pending");
+        expectHeader(wire.recv(), Protocol::Method::FIN,
+                     Protocol::Property::CMD_TRIGGER, s, "legacy Trigger FIN");
+      }
 
       // Endless run from now, then STOP mid-run.
       const uint64_t runFrom = mcuNow(wire); // <= the run's t_start ("now")
@@ -2230,77 +2351,6 @@ int main() {
         CHECK(f.result.left.ch[1] >= ch1Lo && f.result.left.ch[1] <= ch1Hi,
               what + ": latched the table(s) driving its exposure");
       };
-      // The swap START with a GET SYS_TIMESTAMP behind it in ONE burst: the
-      // sim's loop handles both in the same iteration, so the GET's answer
-      // is the MCU instant the swap was handled (`t`) — measured, not
-      // inferred from a reading the host took before a send it may have been
-      // descheduled ahead of. Reads raw until both ACKs; trajectory pushes
-      // that arrive before the swap's ACK are returned (`early`), later ones
-      // queued for recvTrajectoryFrame. Nothing may be queued before: every
-      // earlier push was consumed (or dropped as skipped) by the stage.
-      struct SwapAck {
-        uint64_t t = 0;
-        std::vector<Cmd::TrajectoryFrame> early;
-      };
-      auto swapStart = [&](const Cmd::TrajectoryStart &st,
-                           const std::string &stage) {
-        CHECK(wire.pushes.empty(),
-              stage + ": no unexpected trajectory push before the swap");
-        std::vector<uint8_t> burst;
-        const uint16_t sSwap = wire.next();
-        appendFrame(wire,
-                    setPacket(Protocol::Property::CMD_TRAJECTORY, sSwap, &st,
-                              sizeof(st)),
-                    burst);
-        const uint16_t sNow = wire.next();
-        appendFrame(wire,
-                    {Protocol::Method::GET, Protocol::Property::SYS_TIMESTAMP,
-                     sNow},
-                    burst);
-        sendBurst(wire, burst);
-        SwapAck out;
-        bool acked = false, timed = false;
-        while (!acked || !timed) {
-          auto pkt = wire.recv(2000, true);
-          const auto h = pkt.validate();
-          if (Protocol::method(h) == Protocol::Method::SYN) {
-            if (Protocol::property(h) == Protocol::Property::LOG)
-              continue;
-            CHECK(Protocol::property(h) == Protocol::Property::CMD_TRAJECTORY,
-                  stage + ": only LOG / trajectory pushes arrive unsolicited");
-            const auto f = payloadAs<Cmd::TrajectoryFrame>(pkt);
-            if (acked)
-              wire.pushes.push_back(f);
-            else
-              out.early.push_back(f);
-            continue;
-          }
-          if (!acked) {
-            CHECK(pkt.header().sequence == sSwap,
-                  stage + ": the swap answers first");
-            if (Protocol::method(h) != Protocol::Method::ACK)
-              throw std::runtime_error("CHECK failed: " + stage +
-                                       " swap START ACKed (got " +
-                                       payloadStr(pkt) + ")");
-            acked = true;
-            continue;
-          }
-          expectHeader(pkt, Protocol::Method::ACK,
-                       Protocol::Property::SYS_TIMESTAMP, sNow,
-                       "swap instant ACK");
-          out.t = payloadAs<System::Timestamp>(pkt).microseconds;
-          timed = true;
-        }
-        for (const auto &f : out.early)
-          std::fprintf(stderr,
-                       "%s: push before the swap ACK: id %u marker %u cycle "
-                       "%u status %u t_trigger %llu (swap at %llu)\n",
-                       stage.c_str(), unsigned(f.id), unsigned(f.marker),
-                       unsigned(f.cycle), unsigned(f.status),
-                       static_cast<unsigned long long>(f.result.t_trigger),
-                       static_cast<unsigned long long>(out.t));
-        return out;
-      };
       // A swap that lands with no capture in flight (C6). Handled at/after
       // `limit` — the MCU time from which the scenario stops being the one
       // designed (a's next marker may have fired first, b's marker phase
@@ -2309,7 +2359,7 @@ int main() {
       auto swapIdle = [&](const Cmd::TrajectoryStart &st,
                           const std::string &stage, uint64_t limit,
                           const char *limitWhat) {
-        const auto sw = swapStart(st, stage);
+        const auto sw = startMeasured(wire, st, stage);
         if (sw.t >= limit)
           throw FixtureMiss(stage + ": the swap was handled " +
                             std::to_string(sw.t - limit) + " us past " +
@@ -2501,7 +2551,7 @@ int main() {
         const size_t runMark = sim.lines.size();
         const uint64_t T = mcuNow(wire) + 50'000;
         auto st = startOp(TA, T, 0); // a: forever
-        expectOk(trajectoryOp(wire, &st, sizeof(st)), "C5 START a");
+        startAhead(wire, st, "C5 START a");
         c5Marker(recvTrajectoryFrame(wire, 2000), TA, 0, T, "a cycle 0", CH1_A,
                  CH1_A);
 
@@ -2572,7 +2622,7 @@ int main() {
         const size_t swapMark = sim.lines.size();
 
         st = startOp(TB, T, cyclesB);
-        const auto sw = swapStart(st, "C5");
+        const auto sw = startMeasured(wire, st, "C5");
         // a's capture can only complete (and push) once its strobe falls,
         // FALL after a trigger at/after its due phase: a push before the ACK
         // of a swap handled earlier is a firmware fault. Handled later, the
@@ -2692,8 +2742,7 @@ int main() {
         // capture ends at 14 ms, the run at 120 ms.
         const size_t runMark = sim.lines.size();
         const uint64_t T = mcuNow(wire) + 50'000;
-        auto st = startOp(TA, T, 0); // a: forever
-        expectOk(trajectoryOp(wire, &st, sizeof(st)), "C6a START a");
+        startAhead(wire, startOp(TA, T, 0), "C6a START a"); // a: forever
         checkMarker(recvTrajectoryFrame(wire, 2000), TA, 0, 0, T, A_AT,
                     "C6a a cycle 0", CH1_A, CH1_A);
         uint32_t sc = 1;   // the swap cycle
@@ -2763,8 +2812,7 @@ int main() {
         // run at 120 ms.
         const size_t runMark = sim.lines.size();
         const uint64_t T = mcuNow(wire) + 50'000;
-        auto st = startOp(TA, T, 0); // a: forever
-        expectOk(trajectoryOp(wire, &st, sizeof(st)), "C6b START a");
+        startAhead(wire, startOp(TA, T, 0), "C6b START a"); // a: forever
         checkMarker(recvTrajectoryFrame(wire, 2000), TA, 0, 0, T, M0,
                     "C6b a", CH1_A, CH1_A);
         uint32_t sc = 1;   // the swap cycle
@@ -2935,9 +2983,10 @@ int main() {
       //   C7b — strobes disarmed mid-run (after cycle 0's capture): each
       //         later capture pushes STROBE_TIMEOUT with its cycle identity
       //         and t_exposure = 0; then, still without strobes, a second
-      //         marker due before the first one's timeout (pulse + 5 ms
-      //         after its trigger) pushes BUSY with t_trigger = its due
-      //         time — every cycle, ahead of the timeout's push.
+      //         marker due after the first one's pulse but before its
+      //         timeout (pulse + 5 ms after its trigger) pushes BUSY with
+      //         t_trigger = its due time — every cycle, ahead of the
+      //         timeout's push.
       //   C7c — a host CMD_FRAME in flight at a marker phase: that marker
       //         pushes BUSY (its due time), the frame FINs.
       //   C7d — Enable(false) mid-capture: the marker capture's CANCELLED
@@ -2946,20 +2995,6 @@ int main() {
       //         re-created as stage 6 / C4 left them for the stages after.
       {
         using TF = Cmd::TrajectoryFrame;
-        // A START with t_start ahead: handled at/after t_start it joins its
-        // own run in progress and the offset-0 crossings of cycle 0 never
-        // fire — a host stall, measured (swapStart: START + GET in one
-        // burst), not a firmware fault.
-        auto startAhead = [&](const Cmd::TrajectoryStart &st,
-                              const std::string &what) {
-          const auto sw = swapStart(st, what);
-          CHECK(sw.early.empty(), what + ": no push before the START ACK");
-          if (sw.t >= st.t_start)
-            throw FixtureMiss(what + ": START handled " +
-                              std::to_string(sw.t - st.t_start) +
-                              " us past its t_start — host stall");
-          return sw.t;
-        };
         // `f` must be (status, table a, marker, cycle). With the firmware
         // right a starved sim changes that only by merging or skipping
         // crossings — a loop stall of at least `margin` over [lo, hi]: a
@@ -2987,7 +3022,7 @@ int main() {
           upload(TA, P, CH1_A, {{0, PULSE6}});
           strobes(FALL6);
           const uint64_t T = mcuNow(wire) + 50'000;
-          startAhead(startOp(TA, T, CYCLES7), "C7a START");
+          startAhead(wire, startOp(TA, T, CYCLES7), "C7a START");
           for (uint32_t k = 0; k < CYCLES7; k++)
             checkMarker(recvTrajectoryFrame(wire, 2000), TA, 0, k, T, 0,
                         "C7a offset-0 marker cycle " + std::to_string(k),
@@ -3020,7 +3055,7 @@ int main() {
           // at its timeout (phase >= 39 ms), 81 ms before the run's end and
           // 91 ms before the next cycle's 10 ms: merging or skipping
           // crossings takes a stall of MERGE.
-          constexpr uint32_t M0 = 10'000, M1 = 30'000, CYCLES7 = 3;
+          constexpr uint32_t M0 = 10'000, M1 = 36'000, CYCLES7 = 3;
           constexpr uint64_t MERGE = 75'000;
           uint32_t lastFrame = 0;
           // `f` must be marker `marker`'s STROBE_TIMEOUT push for cycle `k`
@@ -3048,7 +3083,8 @@ int main() {
           upload(TA, P, CH1_A, {{M0, PULSE6}});
           strobes(FALL6);
           uint64_t T = mcuNow(wire) + 50'000;
-          startAhead(startOp(TA, T, CYCLES7), "C7b START (one marker)");
+          startAhead(wire, startOp(TA, T, CYCLES7),
+                     "C7b START (one marker)");
           const auto ok = recvTrajectoryFrame(wire, 2000);
           checkMarker(ok, TA, 0, 0, T, M0, "C7b cycle 0 (strobes armed)",
                       CH1_A, CH1_A);
@@ -3069,13 +3105,20 @@ int main() {
           expectEnded(TA, CYCLES7, T, "C7b (one marker)");
           CHECK(wire.pushes.empty(), "C7b: no push after ENDED");
 
-          // (ii) Two markers 20 ms apart, closer than pulse + 5 ms (29 ms),
-          //     still no strobes: m0's capture holds the engine until its
-          //     timeout, so m1 pushes BUSY at its due time — every cycle,
-          //     ahead of m0's STROBE_TIMEOUT.
+          // (ii) Two markers 26 ms apart, still no strobes: m1 is due AFTER
+          //     m0's pulse (24 ms) has ended but inside its strobe margin
+          //     (timeout at pulse + 5 ms = 29 ms after the trigger) — "a
+          //     next marker due within 5 ms of the previous marker's window
+          //     end pushes BUSY" (serial-protocol.md §trajectory). m0's
+          //     capture holds the engine until that timeout, so m1 pushes
+          //     BUSY at its due time — every cycle, ahead of m0's
+          //     STROBE_TIMEOUT. Load-robust: the timeout is only seen by a
+          //     Capture::tick at phase >= 39 ms, and every pass runs its
+          //     Trajectory::tick (which takes m1's 36 ms crossing) first.
           upload(TA, P, CH1_A, {{M0, PULSE6}, {M1, PULSE6}});
           T = mcuNow(wire) + 50'000;
-          startAhead(startOp(TA, T, CYCLES7 - 1), "C7b START (two markers)");
+          startAhead(wire, startOp(TA, T, CYCLES7 - 1),
+                     "C7b START (two markers)");
           for (uint32_t k = 0; k + 1 < CYCLES7; k++) {
             const uint64_t base = T + uint64_t(k) * P;
             const std::string c = " cycle " + std::to_string(k);
@@ -3110,7 +3153,7 @@ int main() {
           upload(TA, P, CH1_A, {{AT, PULSE7}});
           strobes(FALL7);
           const uint64_t T = mcuNow(wire) + 50'000;
-          startAhead(startOp(TA, T, 0), "C7c START");
+          startAhead(wire, startOp(TA, T, 0), "C7c START");
           uint32_t c = 0, next = 0; // next: the first cycle not consumed
           fixtureWindow(T, c, AT - FALL7 + 5'000, AT - 5'000,
                         "C7c: the host frame is sent before the marker phase, "
@@ -3139,15 +3182,12 @@ int main() {
                               std::to_string(tf - due) +
                               " us past the marker phase — host stall");
           const auto f = recvTrajectoryFrame(wire, 2000);
-          // A crossing tick the sim delayed past the frame's end fires the
-          // marker normally (after the frame completed): its trigger is then
-          // past the frame's fall.
-          if (f.status == TF::OK && f.id == TA && f.marker == 0 &&
-              f.cycle == c && f.result.t_trigger + 1'000 >= tf + FALL7)
-            throw FixtureMiss("C7c: the marker fired " +
-                              std::to_string(f.result.t_trigger - due) +
-                              " us late, after the host frame completed — sim "
-                              "stall");
+          // No "the marker fired after the frame completed" excuse: every
+          // pass that pumps the frame's fall runs Trajectory::tick before
+          // Capture::tick, and the frame triggered before `due`, so the
+          // first tick at/after `due` meets a busy engine whatever the sim's
+          // stalls — an OK here is a marker that WAITED behind the host
+          // frame (a firmware fault). Only a skipped crossing is load.
           expectPush(f, TF::BUSY, 0, c,
                      "C7c the marker crossing a host CMD_FRAME's exposure "
                      "pushes BUSY",
@@ -3211,7 +3251,7 @@ int main() {
           upload(TA, P, CH1_A, {{AT, PULSE7}});
           strobes(FALL7);
           const uint64_t T = mcuNow(wire) + 50'000;
-          startAhead(startOp(TA, T, 0), "C7d START"); // forever
+          startAhead(wire, startOp(TA, T, 0), "C7d START"); // forever
           uint32_t c = 0, next = 0; // next: the first cycle not consumed
           size_t cycleMark = 0;     // sim lines from here on: cycle c's
           auto risen = [&] {        // both injected rises (as C5)
@@ -3300,18 +3340,24 @@ int main() {
                                static_cast<long long>(due),
                            static_cast<long long>(tOff) -
                                static_cast<long long>(due));
+          // Completed first: its strobe fell before the disable was handled
+          // (the host stalled past the window). Tested BEFORE the count: a
+          // host stall of >= 50 ms before the burst also lets cycle c + 1's
+          // marker fire first, and correct firmware then sends {OK(c),
+          // CANCELLED(c + 1)} ahead of the ACK.
+          if (!early.empty()) {
+            const TF &first = early.front();
+            if (first.status == TF::OK && first.id == TA && first.marker == 0 &&
+                first.cycle == c && tOff >= first.result.t_trigger + FALL7)
+              throw FixtureMiss("C7d: the capture completed before the "
+                                "disable (handled at due+" +
+                                std::to_string(tOff - due) +
+                                " us) — host stall");
+          }
           CHECK(early.size() == 1,
                 "C7d: exactly the marker capture's push precedes the "
                 "disable ACK");
           const TF &cap = early.front();
-          // Completed first: its strobe fell before the disable was handled
-          // (the host stalled past the window).
-          if (cap.status == TF::OK && cap.id == TA && cap.marker == 0 &&
-              cap.cycle == c && tOff >= cap.result.t_trigger + FALL7)
-            throw FixtureMiss("C7d: the capture completed before the disable "
-                              "(handled at due+" +
-                              std::to_string(tOff - due) +
-                              " us) — host stall");
           CHECK(cap.status == TF::CANCELLED && cap.id == TA &&
                     cap.marker == 0 && cap.cycle == c,
                 "C7d: Enable(false) mid-capture pushes the marker's CANCELLED "

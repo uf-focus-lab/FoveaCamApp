@@ -365,13 +365,26 @@ DATA chunks carry at most `Trajectory::CHUNK_SAMPLES = (COBS::MaxPacketSize − 
 5) / 20 = 12` samples, so a full chunk (249 bytes) fits one COBS frame.
 
 Push: `SYN CMD_TRAJECTORY`, seq 0, payload `TrajectoryFrame` (44 bytes):
-`u8 id, u8 marker, u32 cycle, u8 status, FrameResult result`. `status`: `OK` 0,
-`STROBE_TIMEOUT` 1, `BUSY` 2 (capture engine busy at the marker phase — no
-trigger; `result.t_trigger` = the marker's due time), `CANCELLED` 3 (system
-disabled), `ENDED` 4 (finite run done). Run-level pushes (`ENDED`, and `CANCELLED`
-when the run itself is cut) use `marker = 0xFF` (`NO_MARKER`). `result` is the
-CMD_FRAME FIN payload with `result.stream` = the trajectory id and `frame_id` the
-firmware-monotonic counter shared with CMD_FRAME.
+`u8 id, u8 marker, u32 cycle, u8 status, FrameResult result`. `result` is the
+CMD_FRAME FIN payload with `result.stream` = the trajectory id on EVERY push, and
+`frame_id` the firmware-monotonic counter shared with CMD_FRAME on every push of a
+capture (any status but `BUSY` and the run-level ones). `status`:
+
+- `OK` 0 — the marker's capture completed: the full FIN result.
+- `STROBE_TIMEOUT` 1 — no complete strobe within `pulse + 5 ms` of the trigger:
+  `t_trigger` (the edge), `t_exposure` (the strobe rise if one was latched, else
+  0), `stream` and `frame_id`; the positions are zero.
+- `BUSY` 2 — the capture engine was busy at the marker phase, no trigger:
+  `t_trigger` = the marker's DUE time (`t_start + cycle × period + t_offset`),
+  `frame_id` 0, the rest zero.
+- `CANCELLED` 3 — the system was disabled. Marker-level (`marker` = its index,
+  `cycle` its cycle): the in-flight capture was cut; the fields as for
+  `STROBE_TIMEOUT`. Run-level (`marker = 0xFF`, `NO_MARKER`): the run itself was
+  cut — `cycle` 0, `t_trigger` = the MCU time of the loop pass that cut it (the
+  pass after the disable), `frame_id` 0, the rest zero.
+- `ENDED` 4 — a finite run completed (run-level, `marker = 0xFF`): `cycle` =
+  the run's `cycles`, `t_trigger = t_start + cycles × period` exactly (the
+  original `t_start`, whatever swaps happened), `frame_id` 0, the rest zero.
 
 ### Limits (`firmware/include/Trajectory.h`, one place)
 
@@ -420,8 +433,11 @@ Teensy DMAMEM, 80 KB, first-fit), `MAX_MARKERS = 8` per table.
   `CMD_FRAME` is still accepted: it cannot re-point the DAC, so it exposes at
   the trajectory's current position (and reports it), and any marker crossing
   while it is in flight pushes `BUSY`. `DELETE` stops a running table first;
-  deleting a free id is a no-op ACK. `System::Enable(false)` halts the run (`CANCELLED` push) and cancels
-  an in-flight marker capture (`CANCELLED`); uploaded tables survive.
+  deleting a free id is a no-op ACK. `System::Enable(false)` cancels an in-flight
+  marker capture and halts the run, in that wire order: the capture's
+  marker-level `CANCELLED` push goes out INSIDE the disable handler, ahead of the
+  Enable ACK; the run's `CANCELLED` (`NO_MARKER`) follows on the next loop pass,
+  after the ACK. Uploaded tables survive.
 - **Atomic swap (v2.2.1).** `START {id = b, t_start, cycles}` while table `a` runs
   (armed or playing) is ACCEPTED iff `b ≠ a`, `b` is committed, `b.period ==
   a.period` and `t_start == a`'s recorded `t_start` exactly (µs; `t_start = 0`,
