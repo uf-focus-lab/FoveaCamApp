@@ -103,7 +103,8 @@ selects a per-eye histogram of the reader's own intermediates, drawn in the CENT
 of the main view, directly under the scan row — the column is shorter than L/R by their
 PosViews, and the rings belong under the wide tile they were measured from. The strips
 take the tile's own width (4:1, so 7.5vw each at a 30vw tile), and the stage selector sits
-on its own layout-stable row above them. The ring worker builds a DEBUG STRIP only while
+on its own layout-stable row above them, named by its visible label (`aria-label="Ring
+View"`). The ring worker builds a DEBUG STRIP only while
 it is not `off` (pushed with `enabled` via `sendParams`), so the views cost nothing when
 closed.
 
@@ -229,7 +230,9 @@ after teardown began is ignored (§gain).
 
 **Commit.** After the START await the session re-checks, then commits: a run that is no
 longer `running` (a run-level CANCELLED push or a detach during the await — the state
-listener ignores the run until the commit) is undone and refused with the run-end reason.
+listener ignores the run until the commit) is undone and refused — worded as a refusal,
+the scan never ran: `the controller ended the trajectory run before the scan started`
+(`controller disconnected before the scan started` for a detach).
 Only then `scanActive` turns true and `scan` publishes. Edits that landed while the start
 awaited (the watches do not re-upload or restart an inactive scan) are reconciled right
 there: `buildScan()` against the started spec — a new mode or period queues the restart;
@@ -265,11 +268,12 @@ gone reports `live trajectory re-upload ended the run: …`.
 exactly when `scan_blocked` is) plus a tray warning, and the status line reads `idle —
 stopped` (§views). The reasons: the run ended (`the controller ended the trajectory run —
 scan stopped` — the MCU ended or cancelled it), `controller disconnected — scan stopped`,
-`scan restart failed: …` (a period restart's re-open), `exposure re-apply failed: …` (a
+`scan restart failed: …` (the re-open of a period restart or of the capacity restart —
+live edits exhausted the controller's tables, §actuation), `exposure re-apply failed: …` (a
 Timed re-time around a live swap, §exposure-windows), `flip pipe rebuild failed: …`
 (§triangle-flip), `live trajectory re-upload ended the run: …`, and `controller clock
-calibration lapsed — press Start once it recovers` (a period change on a lapsed clock,
-below). Both kinds are LATCHED — never re-evaluated — until the next Start or Stop (a
+calibration lapsed — press Start once it recovers` (a period change or the capacity
+restart on a lapsed clock, below). Both kinds are LATCHED — never re-evaluated — until the next Start or Stop (a
 successful Start publishes null; Stop clears it unconditionally).
 
 **Period change** — `scan_hz` or `scan_mode` while active changes the trajectory period,
@@ -581,7 +585,8 @@ count is 0, so a never-matched eye does not read as a perfect 0 µs — and
 `flip_tolerance_us`) — or, idle, what Start would run (its period computed
 from `1000 / scan_hz`, doubled for the triangle, then rounded — never from the rounded
 readout), or the blocked reason followed by "Press Start to re-check." (the block is
-latched, §lifecycle). The OK-toned `Timed` hover gives the same per-eye exposure. The row is a PLAIN div, never a
+latched, §lifecycle) — the suffix is skipped when the reason already says how to recover
+(contains "press Start": the lapsed-clock stop). The OK-toned `Timed` hover gives the same per-eye exposure. The row is a PLAIN div, never a
 `<label>`/ConfigEntry: a label would forward a status-span click to the button and
 toggle the hardware override; the button's own explanation rides the ROW's `title`
 (a disabled button suppresses hover). The drawer carries FOUR columns (nested
@@ -699,8 +704,9 @@ while scanning arms a throttle timer: at most ONE `NodeTrajectory.replace(spec)`
 so the latest geometry wins, and at most ONE replace op queued at a time — while one waits,
 further edits only mark it pending (it builds the latest spec when it runs), so a replace
 slower than the throttle never stacks an op per steer event (the node coalesces in-flight
-swaps too; the throttle keeps the wire sane). An identical spec is skipped (not while a
-failed swap's table may be live — §actuation). A replace that throws with the run still
+swaps too; the throttle keeps the wire sane). An identical spec is skipped (exceptions — a failed
+swap's table may be live, a stale Timed exposure, a grow-after-swap — in the swap paragraph
+below). A replace that throws with the run still
 going keeps the previous geometry (one warning per run) — unless the failed swap's table may
 be live, in which case `mismatch` names the unconfirmed swap (§actuation); a run
 that is not `running` once the replace settles — `TrajectoryReplaceError.running ===
@@ -751,7 +757,10 @@ swap STOPped the last sibling) the camera grows back to the running table's own 
 pulse — safe, that table is the one playing and its MCU pulses carry it. The clamp check is
 suspended while a sibling may be live or the Timed camera holds an exposure written for
 another pulse than the running table's (the camera deliberately differs from it); the
-identical-spec shortcut is suspended in that second case too, so the swap re-times it.
+identical-spec shortcut is suspended in that second case too, so the swap re-times it, and
+for a grow-after-swap (a GROWING Timed exposure, written once the swap lands —
+§exposure-windows), since that swap is what carries it. Those are its three exceptions:
+otherwise an identical spec is skipped.
 
 **`perf.trajectory`** (`TrajectoryTelemetry`, published with `perf` at the
 `VOLT_TELEMETRY_INTERVAL_MS` throttle; counters reset per scan): `running` (scan active and

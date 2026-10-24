@@ -287,7 +287,11 @@ const scanStatus = computed<{ text: string; tone: string; title: string }>(
       return {
         text: stopped ? "idle — stopped" : "idle — refused",
         tone: "warn",
-        title: `${reason.replace(/\.\s*$/, "")}. Press Start to re-check.`,
+        // A reason that already says how to recover (the lapsed-clock stop:
+        // "… — press Start once it recovers") needs no second instruction.
+        title: /press Start/i.test(reason)
+          ? reason
+          : `${reason.replace(/\.\s*$/, "")}. Press Start to re-check.`,
       };
     return {
       text: "idle",
@@ -812,7 +816,7 @@ const statusR = computed(() => ringStatus("R"));
             :options="RING_VIEW_OPTIONS"
             :disabled="!state.ring_reader"
             class="ring-stage"
-            aria-label="Ring histogram stage"
+            aria-label="Ring View"
           />
         </div>
         <template v-if="ringViewOn">
@@ -1277,12 +1281,14 @@ const statusR = computed(() => ringStatus("R"));
     }
   }
 
+  // Borderless at rest (Principles §5): a faint wash that darkens on hover
+  // and strengthens on press; the focus ring is the only outline.
   .reset {
     min-width: 3ch;
     cursor: pointer;
-    border: 1px solid var(--tint-4);
+    border: none;
     border-radius: 4px;
-    background: var(--tint-1);
+    background: var(--tint-2);
     color: inherit;
     font: inherit;
     text-transform: none;
@@ -1293,6 +1299,13 @@ const statusR = computed(() => ringStatus("R"));
     &:hover {
       background: var(--tint-3);
       opacity: 1;
+    }
+    &:active {
+      background: var(--tint-4);
+    }
+    &:focus-visible {
+      outline: 2px solid var(--accent-bright);
+      outline-offset: 2px;
     }
   }
 }

@@ -247,7 +247,9 @@ export const mirrorLink = defineContract({
     /** Which of the two `scan_blocked` is: `refused` (a Start that never
      *  ran) or `stopped` (a running scan aborted — run end, a failed restart
      *  / re-apply / flip rebuild / re-upload, the clock lapsed on a period
-     *  change); null exactly when `scan_blocked` is (spec §lifecycle). */
+     *  change or on the capacity restart — live edits exhausted the
+     *  controller's tables); null exactly when `scan_blocked` is (spec
+     *  §lifecycle). */
     scan_blocked_kind: null as "refused" | "stopped" | null,
     /** The vergence loop's status: `off` / `tracking` / `paused: scanning` /
      *  `hold: match low score` / `hold: match stale` / `no calibration`. */

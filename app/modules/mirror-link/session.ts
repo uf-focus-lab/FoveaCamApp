@@ -1562,10 +1562,14 @@ export default function mirrorLinkSession(
         return false;
       }
       // The run may have ended during the START await (a CANCELLED push, a
-      // detach) — the state listener ignores it before the commit.
+      // detach) — the state listener ignores it before the commit. A refusal,
+      // so it reads as one: the scan never ran (spec §lifecycle Commit).
       const traj = trajectory;
       if (!traj || traj.state !== "running") {
-        const reason = runEndReason(traj?.state ?? "detached");
+        const reason =
+          (traj?.state ?? "detached") === "detached"
+            ? "controller disconnected before the scan started"
+            : "the controller ended the trajectory run before the scan started";
         await undoStart(t);
         publishScanBlocked(reason, "refused");
         report("mirror-link", reason, "warning");

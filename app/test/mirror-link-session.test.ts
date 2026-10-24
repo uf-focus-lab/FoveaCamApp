@@ -2345,7 +2345,7 @@ describe("lifecycle: a run ending during an await", () => {
     expect(await started).toBe(false);
     await settle();
     expect(h.tele.scan_blocked).toBe(
-      "the controller ended the trajectory run — scan stopped",
+      "the controller ended the trajectory run before the scan started",
     );
     expect(h.tele.scan ?? null).toBeNull();
     expect(h.traj().closes).toBe(1);

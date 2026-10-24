@@ -81,9 +81,11 @@
 // the one expected is classified by KIND (checkPush): a skipped crossing
 // needs a stall of ~a period, a BUSY or an ENDED ahead of a capture's push
 // one stall from that capture's MEASURED end (its trigger + the exposure) to
-// the BUSY's phase or the run's end, a STROBE_TIMEOUT the timeout's slack; a
-// repeated or backward (cycle, marker) or a wrong table id is a firmware
-// fault whatever the sim did. Host-side stalls (this process descheduled)
+// the BUSY's phase or the run's end — or one adjacent stall chained right
+// behind a stall from that end (the pass that pumped the fall preempted
+// before its trajectory tick; overtakeExplained) — a STROBE_TIMEOUT the
+// timeout's slack; a repeated or backward (cycle, marker) or a wrong table
+// id is a firmware fault whatever the sim did. Host-side stalls (this process descheduled)
 // are handled by measuring the instants that matter on the MCU clock instead
 // (the swap instant, the strobe rises).
 // A sim starved for longer than the re-arm budget absorbs fails the run as a

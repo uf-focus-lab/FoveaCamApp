@@ -83,7 +83,7 @@ where each fovea is aimed.
 
 ### To converge automatically
 
-**Auto Vergence** (the drawer's middle column) is the same loop Disparity Scope uses:
+**Auto Vergence** (the drawer's second column) is the same loop Disparity Scope uses:
 it finds each fovea's view inside the wide view and drives the mirrors until the two
 agree on whatever you steered at. It is a *loop*, not a one-shot — leave it on and it
 keeps up as the rig drifts.
@@ -106,7 +106,7 @@ Moving **Verge Distance** or **Vertical Shift** yourself while the loop runs is 
 the loop takes your value as its new starting point and carries on from there. Steering
 somewhere new re-aims it at the new spot.
 
-**The PID sliders** above the button are the same three groups Disparity Scope has —
+**The PID sliders** below the button are the same three groups Disparity Scope has —
 **Pan** (how the pair is centred on the target), **Depth** (the convergence distance) and
 **Vertical** (the toe between the eyes) — each with **Kp** how hard it corrects, **Ki** how
 it removes the last bit of standing error and **Kd** damping if it overshoots. **Min Match
@@ -181,7 +181,10 @@ cameras actually expose.
    and the vergence controls take effect without interrupting the scan;
    changing **Mode** or **Scan Frequency** restarts it on the new period — unless
    the controller's clock link has lapsed meanwhile: the scan then stops (*idle —
-   stopped*) until the clock recovers, and you press **Start Scan** again.
+   stopped*) until the clock recovers, and you press **Start Scan** again. The
+   app also restarts the scan on its own when live edits have used up the
+   controller's pattern tables (see *replacement swap unconfirmed* below); that
+   restart stops the scan the same way on a lapsed clock.
 7. Press **Stop Scan** to end it. The mirrors glide back to the aiming center.
 
 The scan needs a controller with firmware 2.2.0 or later: the pattern runs on
@@ -212,8 +215,10 @@ to a fixed exposure as long as the first window; the status line then ends in
 `· timed`. The status line turns amber when the cameras stop answering the
 trigger (no exposure has completed for two scan periods — also mid-run, after
 good frames, e.g. a trigger cable coming loose), or when the scan cannot run exactly as set — its hover starts with
-*Exposure mismatch —* and names why. Hover it while idle to see what the
-current settings would run.
+*Exposure mismatch —* and names why. It is also amber while idle after a
+refused start or a stopped scan (*idle — refused*, *idle — stopped*, below).
+Hover it while idle to see what the current settings would run — or, while one
+of those messages stands, its reason.
 
 | Amber reason | What it means, what to do |
 |---|---|
@@ -223,29 +228,35 @@ current settings would run.
 | unequal windows: Timed exposure gives both the rising window's length | On a timed-fallback camera with **Sync Windows** off, the camera takes the rising window's length for both frames; set the windows equal (or turn Sync on) if that is not what you want. |
 | Timed exposure would run into the next trigger | On a timed-fallback camera the exposure the camera can take is longer than a whole sweep (its minimum exposure is above one sweep — the **Scan Frequency** period; a triangle's full period is two sweeps), so a frame would still be exposing when the next trigger arrives — lower **Scan Frequency**. Shortening the windows does not help: the app already keeps a shorter exposure inside its sweep. |
 | Timed exposure clamped to the camera's exposure range | On a timed-fallback camera the window is longer or shorter than the camera can expose — change the window's length. |
-| controller clock calibration lapsed | The controller's clock link stopped answering mid-scan, so the frames can no longer be timed against the path — check the controller's connection. The scan keeps running meanwhile, but a **Mode** or **Scan Frequency** change stops it until the clock recovers (then press **Start Scan**). |
-| replacement swap unconfirmed — the mirror may run the previous edit | A live edit did not get through cleanly and the controller may be running either the old or the new path. The app retries once on its own; otherwise make any change to the scan's aim or shape (even back to the same value) — steer, verge/shift, amplitude, ratio, axis or windows; a **Mode** or **Scan Frequency** change also settles it. **Gain**, **Ring Reader** and PID edits do not. The next change that lands settles it, and so does a retry that fails after stopping the uncertain path. On a timed-fallback camera the exposure stays at the shorter window meanwhile. If it persists, the app restarts the scan. |
+| controller clock calibration lapsed | The controller's clock link stopped answering mid-scan, so the frames can no longer be timed against the path — check the controller's connection. The scan keeps running meanwhile, but a **Mode** or **Scan Frequency** change — or the app's own restart when live edits used up the controller's pattern tables — stops it until the clock recovers (then press **Start Scan**). |
+| replacement swap unconfirmed — the mirror may run the previous edit | A live edit did not get through cleanly and the controller may be running either the old or the new path. The app retries once on its own; otherwise make any change to the scan's aim or shape (even back to the same value) — steer, verge/shift, amplitude, ratio, axis or windows; a **Mode** or **Scan Frequency** change also settles it. **Gain**, **Ring Reader** and PID edits do not. A retry that fails after stopping the uncertain path settles it too. On a timed-fallback camera the exposure stays at the shorter window meanwhile. If further changes also fail to get through, the app restarts the scan. |
 
 If **Start Scan** is refused the status line reads *idle — refused* and its
 hover carries the reason: no cameras leased; no controller connected; the
 controller firmware is too old; the controller clock is not calibrated yet —
 wait a moment and press again; a camera rejected the settings (*exposure
-override failed*); or the controller could not start the pattern
-(*trajectory start failed*).
+override failed*); the controller could not start the pattern
+(*trajectory start failed*); or the controller ended the pattern, or
+disconnected, while it was being started (*the controller ended the trajectory
+run before the scan started*, *controller disconnected before the scan
+started*).
 
 If a running scan is stopped under you, the status line reads *idle — stopped*
 (amber) and its hover says why: the controller ended the run or cancelled it;
-the controller disconnected; a **Mode** / **Scan Frequency** restart failed
-(*scan restart failed*); after a live edit, a timed-fallback camera rejected
+the controller disconnected; a **Mode** / **Scan Frequency** restart, or the
+app's own restart when live edits used up the controller's pattern tables,
+failed (*scan restart failed*); after a live edit, a timed-fallback camera rejected
 its new exposure (*exposure re-apply failed*), the triangle's frame flipping
 could not be rebuilt (*flip pipe rebuild failed*) or the re-upload ended the
 run (*live trajectory re-upload ended the run*); or the controller's clock had lapsed when
-you changed **Mode** or **Scan Frequency** (*controller clock calibration
-lapsed — press Start once it recovers*).
+you changed **Mode** or **Scan Frequency**, or when the app restarted the scan
+because live edits used up the controller's pattern tables (*controller clock
+calibration lapsed — press Start once it recovers*).
 
-Either message stays put until you press **Start Scan** (which checks again) or
-**Stop Scan** — it is not re-checked on its own, so the hover ends with *Press
-Start to re-check.*
+Either message stays put until you press **Start Scan**, which checks again
+(**Stop Scan** is not offered while idle) — it is not re-checked on its own, so
+the hover ends with *Press Start to re-check.* (unless the reason already says
+when to press Start).
 
 ### Reading the emitter
 
@@ -336,10 +347,14 @@ right fovea frames and the wide view — and opens the capture preview window, w
 
 The fovea images are saved exactly as the camera saw them: **not** straightened against a
 mirror position, because a frame that integrated a stretch of the scan has no single one. That
-raw ring is what an offline decoder needs.
+raw ring is what an offline decoder needs. For the same reason a **Triangle** frame from the
+return sweep is saved — and recorded — **unflipped**, even though the views show it flipped
+upside down.
 
 The JSON carries the app's state at that moment under `mirror_link`: the scan timing (or
-null if you were not scanning), what the **Ring Reader** last made of each eye — the circle
+null if you were not scanning), the scan pattern the path is built from (`pattern`: `mode`,
+`axis_deg`, `amp_deg`, `ratio` and the exposure `windows`), what the **Ring Reader** last
+made of each eye — the circle
 it fitted, the chip width, the failure reason — the vertical shift, the verge distance,
 the baseline, and where you were aiming. So a frame that failed to decode on the rig can
 be re-analyzed later with everything the reader saw attached to it.
