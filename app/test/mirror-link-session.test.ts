@@ -1458,6 +1458,160 @@ describe("failed replace: the routed new id is scored against ITS spec", () => {
     );
   });
 
+  /** Park the FIRST arming reconfigure of eye R until the gate opens — an
+   *  edit made meanwhile lands between the camera write and the spec build. */
+  function parkFirstReconfigure(h: {
+    triple: { leases: Record<string, any> };
+  }) {
+    const g = gate();
+    const lease = h.triple.leases.R;
+    const inner = lease.reconfigure;
+    let parked = false;
+    lease.reconfigure = async (fn: () => void) => {
+      if (!parked) {
+        parked = true;
+        await g.p;
+      }
+      return inner(fn);
+    };
+    return g;
+  }
+
+  for (const [what, err] of [
+    ["a plain error", () => Promise.resolve(new Error("upload REJ"))],
+    ["a never-live replacement", () => replaceErrorWith(7, false)],
+  ] as const)
+    it(`Timed: an edit during the arming, then the commit's replace fails (${what}) → the camera keeps the RUNNING table's pulse`, async () => {
+      const h = await harness({ state: { scan_mode: "triangle" } });
+      h.triple.leases.R.camera.modes.splice(1); // R: Timed only
+      await h.setState("tri_window_rise", [0.1, 0.6]); // synced: 50 ms both
+      const g = parkFirstReconfigure(h);
+      const started = h.call<boolean>("startScan");
+      await settle();
+      // Armed for 50 ms; the windows grow to 80 ms before the spec is built.
+      await h.setState("tri_window_rise", [0.1, 0.9]);
+      ctl.replaceError = await err();
+      g.open();
+      expect(await started).toBe(true);
+      await vi.advanceTimersByTimeAsync(0);
+      await settle(30);
+      // The table that runs was built on the 50 ms camera; the reconciling
+      // replace (growing to 80 ms) failed and nothing else may be live.
+      expect(h.traj().replaceCalls).toBe(1);
+      expect(h.traj().spec.markers!.map((m) => m.pulseUs)).toEqual([
+        50_000, 50_000,
+      ]);
+      expect(h.triple.leases.L.camera.exposure).toBe(50_000);
+      expect(h.triple.leases.R.camera.exposure).toBe(50_000);
+      expect(h.tele.scan.exposure_us).toEqual({ L: 50_000, R: 50_000 });
+      expect(h.tele.scan.windows.map((w: any) => w.pulse_us)).toEqual([
+        50_000, 50_000,
+      ]);
+      // The camera matches the running pulse: no clamp, no other reason —
+      // the failed edit is the re-upload warning's.
+      expect(h.tele.scan.mismatch).toBe(false);
+      expect(
+        ctl.reports.some((r) =>
+          r.includes("the scan keeps its previous geometry"),
+        ),
+      ).toBe(true);
+      // Nothing is stale: an edit back to the running 50 ms builds the
+      // running spec and swaps nothing.
+      ctl.replaceError = null;
+      perfNow += 200;
+      await h.setState("tri_window_rise", [0.1, 0.6]);
+      await vi.advanceTimersByTimeAsync(200);
+      await settle();
+      expect(h.traj().replaceCalls).toBe(1);
+      expect(h.tele.scan.mismatch).toBe(false);
+      // The next landed replace reconciles everything.
+      perfNow += 200;
+      await h.setState("tri_window_rise", [0.1, 0.9]);
+      await vi.advanceTimersByTimeAsync(200);
+      await settle();
+      expect(h.traj().replaced).toHaveLength(1);
+      expect(h.traj().spec.markers!.map((m) => m.pulseUs)).toEqual([
+        80_000, 80_000,
+      ]);
+      expect(h.triple.leases.L.camera.exposure).toBe(80_000);
+      expect(h.triple.leases.R.camera.exposure).toBe(80_000);
+      expect(h.tele.scan.exposure_us).toEqual({ L: 80_000, R: 80_000 });
+      expect(h.tele.scan.mismatch).toBe(false);
+    });
+
+  it("Timed: after an edit during the arming, a STOPped sibling's regrow goes to the RUNNING table's pulse, never the requested window", async () => {
+    const h = await harness({ state: { scan_mode: "triangle" } });
+    h.triple.leases.R.camera.modes.splice(1); // R: Timed only
+    await h.setState("tri_window_rise", [0.1, 0.6]); // synced: 50 ms both
+    const g = parkFirstReconfigure(h);
+    const started = h.call<boolean>("startScan");
+    await settle();
+    await h.setState("tri_window_rise", [0.1, 0.9]); // asks 80 ms
+    ctl.replaceError = new Error("upload REJ");
+    g.open();
+    expect(await started).toBe(true);
+    await vi.advanceTimersByTimeAsync(0);
+    await settle(30);
+    expect(h.triple.leases.L.camera.exposure).toBe(50_000);
+    // Shrink to 30 ms: the camera first, then a swap that MAY have landed.
+    ctl.replaceError = await replaceErrorWith(7, true);
+    perfNow += 200;
+    await h.setState("tri_window_rise", [0.1, 0.4]);
+    await vi.advanceTimersByTimeAsync(0);
+    await settle();
+    expect(h.traj().replaceCalls).toBe(2);
+    expect(h.triple.leases.L.camera.exposure).toBe(30_000);
+    // The settling retry falls to the pair: sibling 7 STOPped, the START
+    // fails — the 50 ms table plays alone, so the camera grows back to 50 ms
+    // (not to the 80 ms the windows asked for when that table was built).
+    const { TrajectoryReplaceError } = await import("@orchestrator/controller");
+    ctl.replaceError = new (TrajectoryReplaceError as unknown as new (
+      m: string,
+      r: boolean,
+      c?: unknown,
+      rep?: { id: number; maybeLive: boolean } | null,
+      sibs?: readonly number[],
+    ) => Error)("pair START REJ", true, undefined, null, [7]);
+    perfNow += 200;
+    await vi.advanceTimersByTimeAsync(200);
+    await settle();
+    expect(h.traj().replaceCalls).toBe(3);
+    expect(h.traj().spec.markers!.map((m) => m.pulseUs)).toEqual([
+      50_000, 50_000,
+    ]);
+    expect(h.triple.leases.L.camera.exposure).toBe(50_000);
+    expect(h.triple.leases.R.camera.exposure).toBe(50_000);
+    expect(h.tele.scan.exposure_us).toEqual({ L: 50_000, R: 50_000 });
+    expect(h.tele.scan.mismatch).toBe(false);
+  });
+
+  it("Timed: an edit during a restart's re-time, then a plain failed replace → the camera keeps the RUNNING table's pulse", async () => {
+    const h = await harness({ state: { scan_mode: "triangle" } });
+    h.triple.leases.R.camera.modes.splice(1); // R: Timed only
+    await h.setState("tri_window_rise", [0.1, 0.6]); // 50 ms at 10 Hz
+    await h.call("startScan");
+    await settle();
+    expect(h.triple.leases.L.camera.exposure).toBe(50_000);
+    // 20 Hz: the restart re-times for 25 ms; the windows grow to 40 ms while
+    // that write is in flight, before the new spec is built.
+    const g = parkFirstReconfigure(h);
+    await h.setState("scan_hz", 20);
+    await h.setState("tri_window_rise", [0.1, 0.9]);
+    ctl.replaceError = new Error("upload REJ");
+    g.open();
+    perfNow += 200;
+    await vi.advanceTimersByTimeAsync(200);
+    await settle(40);
+    expect(ctl.trajectories).toHaveLength(2);
+    expect(h.traj().spec.markers!.map((m) => m.pulseUs)).toEqual([
+      25_000, 25_000,
+    ]);
+    expect(h.traj().replaceCalls).toBe(1);
+    expect(h.triple.leases.L.camera.exposure).toBe(25_000);
+    expect(h.triple.leases.R.camera.exposure).toBe(25_000);
+    expect(h.tele.scan.mismatch).toBe(false);
+  });
+
   it("reason order: the unconfirmed swap comes LAST, after a Timed reason", async () => {
     const h = await harness({
       state: { scan_mode: "triangle", tri_window_sync: false },
@@ -1540,7 +1694,7 @@ describe("failed replace: the routed new id is scored against ITS spec", () => {
     expect(
       ctl.reports.filter((r) =>
         r.includes(
-          "live edits exhausted the controller's tables — the scan restarts",
+          "live edits exhausted the controller's tables — restarting the scan",
         ),
       ),
     ).toHaveLength(1);
@@ -1574,6 +1728,28 @@ describe("failed replace: the routed new id is scored against ITS spec", () => {
       ctl.reports.some((r) => r.includes("exhausted the controller's tables")),
     ).toBe(true);
     expect(ctl.reports.some((r) => r.includes("re-upload failed"))).toBe(false);
+  });
+
+  it("capacity: a restart its checks stop (lapsed clock) reports the stop reason, never the restart", async () => {
+    const h = await harness();
+    await h.call("startScan");
+    const { TrajectoryCapacityError } =
+      await import("@orchestrator/controller");
+    ctl.replaceError =
+      new (TrajectoryCapacityError as unknown as new () => Error)();
+    ctl.controller!.clockCalibrated = false;
+    await h.setState("scan_amp", 0.9);
+    await vi.advanceTimersByTimeAsync(0);
+    await settle(30);
+    expect(ctl.trajectories).toHaveLength(1);
+    expect(h.tele.scan).toBeNull();
+    expect(h.tele.scan_blocked).toBe(
+      "controller clock calibration lapsed — press Start once it recovers",
+    );
+    expect(h.tele.scan_blocked_kind).toBe("stopped");
+    expect(
+      ctl.reports.some((r) => r.includes("exhausted the controller's tables")),
+    ).toBe(false);
   });
 
   it("settling: one automatic replace per unconfirmed streak (re-armed by a user edit)", async () => {
@@ -1615,13 +1791,56 @@ describe("failed replace: the routed new id is scored against ITS spec", () => {
     await vi.advanceTimersByTimeAsync(1000);
     await settle();
     expect(h.traj().replaceCalls).toBe(4);
-    // The settling retry that lands clears the state.
+    // A user edit's replace that lands clears the state.
     ctl.replaceError = null;
     await h.setState("scan_amp", 0.8);
     await vi.advanceTimersByTimeAsync(0);
     await settle();
     expect(h.traj().replaced).toHaveLength(1);
     expect(h.tele.scan.mismatch).toBe(false);
+  });
+
+  it("settling: the automatic retry itself lands → settled, and a later streak gets its own retry", async () => {
+    const h = await harness();
+    await h.call("startScan");
+    ctl.replaceError = await replaceErrorWith(7, true);
+    await h.setState("scan_amp", 0.9);
+    await vi.advanceTimersByTimeAsync(0);
+    await settle();
+    expect(h.traj().replaceCalls).toBe(1);
+    expect(h.tele.scan.mismatch).toBe(true);
+    // The controller recovers before the throttle elapses — no user edit.
+    ctl.replaceError = null;
+    perfNow += 200;
+    await vi.advanceTimersByTimeAsync(200);
+    await settle();
+    expect(h.traj().replaceCalls).toBe(2);
+    expect(h.traj().replaced).toHaveLength(1);
+    expect(h.traj().spec.samples).toEqual(h.traj().replaced[0]!.samples);
+    expect(h.tele.scan.amp_deg).toBe(0.9);
+    expect(h.tele.scan.mismatch).toBe(false);
+    // Nothing more goes out on its own.
+    perfNow += 1000;
+    await vi.advanceTimersByTimeAsync(1000);
+    await settle();
+    expect(h.traj().replaceCalls).toBe(2);
+    // The landing ended the streak: a later unclear failure gets ITS retry.
+    ctl.replaceError = await replaceErrorWith(9, true);
+    await h.setState("scan_amp", 1.0);
+    await vi.advanceTimersByTimeAsync(0);
+    await settle();
+    expect(h.traj().replaceCalls).toBe(3);
+    perfNow += 200;
+    await vi.advanceTimersByTimeAsync(200);
+    await settle();
+    expect(h.traj().replaceCalls).toBe(4);
+    perfNow += 1000;
+    await vi.advanceTimersByTimeAsync(1000);
+    await settle();
+    expect(h.traj().replaceCalls).toBe(4);
+    expect(h.tele.scan.mismatch_reason).toBe(
+      "replacement swap unconfirmed — the mirror may run the previous edit",
+    );
   });
 
   it("settling: never when the retry could leave no table free", async () => {
