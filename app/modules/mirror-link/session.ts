@@ -43,6 +43,7 @@ import {
 } from "@orchestrator/fovea-pipeline";
 import {
   activeController,
+  TRAJECTORY_MAX_TABLES,
   TrajectoryReplaceError,
   type TrajectoryFrameOutcome,
   type TrajectorySpec,
@@ -662,6 +663,11 @@ export default function mirrorLinkSession(
      *  the unconfirmed swap and an edit back to the running geometry still
      *  swaps. */
     const siblingIds = new Set<number>();
+    /** This unconfirmed streak already scheduled its ONE automatic settling
+     *  replace (`scheduleSettle`): cleared by a landed swap, the run's table
+     *  closing, a new run, or a user edit (which re-arms one retry after the
+     *  next failure) — spec §actuation. */
+    let settleScheduled = false;
 
     /** A failed swap left its NEW table id routed (`TrajectoryReplaceError.
      *  replacement`): score its pushes against the spec IT carries — for the
@@ -841,6 +847,7 @@ export default function mirrorLinkSession(
       flipSkewUs = { L: 0, R: 0 };
       flipWindow = [];
       warnedNoOk = warnedUnmatched = warnedReplace = warnedMismatch = false;
+      settleScheduled = false;
     }
 
     function trajectoryPerf(): TrajectoryTelemetry {
@@ -1059,6 +1066,7 @@ export default function mirrorLinkSession(
       pendingSpec = null;
       specById.clear();
       siblingIds.clear();
+      settleScheduled = false;
       for (const u of trajectoryUnsubs.splice(0)) u();
       if (!traj) return;
       try {
@@ -1370,12 +1378,15 @@ export default function mirrorLinkSession(
       // A failed swap's table may be live: the MCU may run the abandoned
       // geometry (Timed: the camera deliberately keeps the shorter exposure,
       // so the clamp check would misreport it). Settled by the next landed
-      // swap.
+      // swap or a failed pair swap that STOPped the sibling.
       const unconfirmed = siblingIds.size > 0;
       if (timed) {
         const want0 = runRaw[0]?.pulseUs ?? 0;
+        // Belt and braces: an exposure written for another pulse than the
+        // running table's (`timedStale`) is not a clamp either.
         if (
           !unconfirmed &&
+          !timedStale() &&
           (exposureMismatch(applied.L.exposure_us, want0) ||
             exposureMismatch(applied.R.exposure_us, want0))
         )
@@ -1626,9 +1637,14 @@ export default function mirrorLinkSession(
      *  swap it, so stop → rebuild → start, keeping the camera config (only a
      *  Timed exposure is re-written, and only for a new pulse). A stop /
      *  teardown requested meanwhile takes the stop path instead of a START; a
-     *  run that ended during the START aborts. Serialized via
-     *  {@link queueScanOp}. */
-    async function restartScanNow(): Promise<void> {
+     *  run that ended during the START aborts. `force` restarts the CURRENT
+     *  spec even at an unchanged period (live edits exhausted the controller's
+     *  tables — `closeTrajectory` STOPs and DELETEs every sibling, the run
+     *  restarts phase-fresh; spec §actuation). Serialized via
+     *  {@link queueScanOp} (or awaited inside a queued op). */
+    async function restartScanNow(
+      opts: { force?: boolean } = {},
+    ): Promise<void> {
       const t = triple;
       if (!scanActive || !t) return;
       const cancelled = (): boolean =>
@@ -1645,6 +1661,7 @@ export default function mirrorLinkSession(
         );
       let built = buildScan();
       if (
+        !opts.force &&
         runSpec &&
         built.mode === runMode &&
         built.spec.periodUs === runSpec.periodUs
@@ -1678,8 +1695,11 @@ export default function mirrorLinkSession(
     let lastReplaceAt = -Infinity;
 
     /** Called by every geometry change: (re)arm the throttle timer; the spec is
-     *  built when the op RUNS, so whatever arrived meanwhile wins. */
-    function scheduleReplace(): void {
+     *  built when the op RUNS, so whatever arrived meanwhile wins. Any call but
+     *  the automatic settling one (`settle`) is an edit: it re-arms the
+     *  streak's one settling retry. */
+    function scheduleReplace(settle = false): void {
+      if (!settle) settleScheduled = false;
       if (!scanActive) return;
       replacePending = true;
       if (replaceTimer || replaceQueued) return; // the queued op will see it
@@ -1700,6 +1720,46 @@ export default function mirrorLinkSession(
       }, wait);
     }
 
+    /** ONE automatic settling replace per unconfirmed streak (spec
+     *  §actuation): the throttled replace re-sends the current geometry so a
+     *  possibly-live sibling is settled without waiting for an edit — never
+     *  once the retry could leave no table free (each unclear retry reserves
+     *  another; the capacity restart then applies). */
+    function scheduleSettle(): void {
+      if (settleScheduled || siblingIds.size === 0) return;
+      if (1 + siblingIds.size >= TRAJECTORY_MAX_TABLES - 1) return;
+      settleScheduled = true;
+      scheduleReplace(true);
+    }
+
+    /** The running table + every possibly-live sibling fill the controller's
+     *  tables (or the controller said so): no swap can be uploaded any more,
+     *  so the CURRENT spec restarts — stop → start, phase-fresh, the siblings
+     *  STOPped and DELETEd (spec §actuation). */
+    async function restartForCapacity(): Promise<void> {
+      report(
+        "mirror-link",
+        "live edits exhausted the controller's tables — the scan restarts",
+        "warning",
+      );
+      await restartScanNow({ force: true });
+    }
+
+    /** The controller's own capacity refusal (`allocateTrajectoryId`; no typed
+     *  error carries it). */
+    const isCapacityError = (e: unknown): boolean =>
+      e instanceof Error &&
+      /Trajectory capacity \(\d+ tables\) exceeded/.test(e.message);
+
+    /** Timed: the camera holds an exposure written for another marker-0 pulse
+     *  than the RUNNING table's (a possibly-live failed shrink kept the shorter
+     *  one) — neither a clamp nor a reason to skip a swap. */
+    function timedStale(): boolean {
+      return (
+        timedPulseUs() !== null && appliedPulseUs !== (runRaw[0]?.pulseUs ?? 0)
+      );
+    }
+
     function cancelReplace(): void {
       if (replaceTimer) clearTimeout(replaceTimer);
       replaceTimer = null;
@@ -1718,7 +1778,11 @@ export default function mirrorLinkSession(
      *  exposure is safe under either). Once the swap settles (success or
      *  failure) a run that is no longer `running` aborts the scan; a failure
      *  that left it running keeps the old geometry (warned once) — or, when
-     *  the new table may be live, an unconfirmed one (`mismatch` says so). */
+     *  the new table may be live, an unconfirmed one (`mismatch` says so; ONE
+     *  automatic settling replace per streak, `scheduleSettle`). Once no
+     *  table is left for a swap (the running one + the possibly-live
+     *  siblings fill `TRAJECTORY_MAX_TABLES`, or the controller refused for
+     *  capacity) the current spec restarts (`restartForCapacity`). */
     async function replaceNow(): Promise<void> {
       const traj = trajectory;
       const t = triple;
@@ -1727,6 +1791,11 @@ export default function mirrorLinkSession(
       let built = buildScan();
       if (built.mode !== runMode || built.spec.periodUs !== runSpec.periodUs)
         return;
+      // No table left for the swap (the running one + every possibly-live
+      // sibling): restart instead of letting the upload hit the capacity.
+      if (1 + siblingIds.size >= TRAJECTORY_MAX_TABLES)
+        return restartForCapacity();
+      const stale = timedStale();
       const pulse0 = built.raw[0]?.pulseUs ?? 0;
       const prevPulseUs = appliedPulseUs;
       let retimedBefore = false;
@@ -1757,8 +1826,15 @@ export default function mirrorLinkSession(
       }
       // Not while a failed swap's table MAY be live (`siblingIds`): the MCU
       // might run the abandoned geometry, so even the running spec must be
-      // swapped in again to settle it (and, Timed, re-time the camera).
-      if (sameSpec(built.spec, runSpec) && siblingIds.size === 0) {
+      // swapped in again to settle it (and, Timed, re-time the camera). Nor
+      // while the Timed camera holds a stale exposure (`timedStale`) or must
+      // grow after the swap: the swap is what re-times it.
+      if (
+        sameSpec(built.spec, runSpec) &&
+        siblingIds.size === 0 &&
+        !stale &&
+        !retimeAfter
+      ) {
         // Nothing for the MCU — but the REQUESTED windows may still have
         // changed (Timed: every marker carries marker 0's pulse, so a falling
         // END edit builds the same spec): the mismatch checks read them.
@@ -1796,19 +1872,6 @@ export default function mirrorLinkSession(
         return;
       }
       if (failed) {
-        if (!warnedReplace) {
-          warnedReplace = true;
-          const rep0 =
-            error instanceof TrajectoryReplaceError ? error.replacement : null;
-          report(
-            "mirror-link",
-            `live trajectory re-upload failed: ${errorLine(error)} — ` +
-              (rep0?.maybeLive
-                ? "the mirror may run either the previous or the new edit until the next edit lands"
-                : "the scan keeps its previous geometry"),
-            "warning",
-          );
-        }
         const rep =
           error instanceof TrajectoryReplaceError ? error.replacement : null;
         rememberFailedReplacement(rep, built.spec);
@@ -1818,13 +1881,43 @@ export default function mirrorLinkSession(
             const e = specById.get(sid);
             if (e && siblingIds.delete(sid)) retireSpec(sid, e.spec);
           }
-        // The camera took the shorter exposure of a swap that never landed:
-        // back to the running table's (its MCU pulses still carry it). NOT
-        // while the new table MAY be live: the shorter exposure is safe under
-        // either table, the longer one would overrun its pulse.
-        if (retimedBefore && !rep?.maybeLive)
+        // Every table is taken (or the controller refused for capacity): no
+        // edit could ever land — restart the current spec (spec §actuation).
+        if (
+          isCapacityError(error) ||
+          1 + siblingIds.size >= TRAJECTORY_MAX_TABLES
+        )
+          return restartForCapacity();
+        if (!warnedReplace) {
+          warnedReplace = true;
+          report(
+            "mirror-link",
+            `live trajectory re-upload failed: ${errorLine(error)} — ` +
+              (rep?.maybeLive
+                ? "the mirror may run either the previous or the new edit until the next edit lands"
+                : "the scan keeps its previous geometry"),
+            "warning",
+          );
+        }
+        // The camera's exposure back to the RUNNING table's (its MCU pulses
+        // carry it) once no other table may be live: the shorter exposure of
+        // a pre-swap shrink that never landed, or the one a possibly-live
+        // sibling left that a failed pair swap has now STOPped (growing to the
+        // running table's own pulse is safe — that table is the one playing).
+        // NOT while the new table or a sibling MAY be live: the shorter
+        // exposure is safe under either table, the longer one would overrun
+        // its pulse.
+        const runPulse = runRaw[0]?.pulseUs;
+        const backTo = rep?.maybeLive
+          ? null
+          : siblingIds.size === 0 && runPulse !== undefined && timedStale()
+            ? runPulse
+            : retimedBefore
+              ? prevPulseUs
+              : null;
+        if (backTo !== null)
           try {
-            await retimeIfNeeded(t, prevPulseUs);
+            await retimeIfNeeded(t, backTo);
           } catch (e) {
             await abortScanNow(
               `exposure re-apply failed: ${errorLine(e)}`,
@@ -1832,6 +1925,8 @@ export default function mirrorLinkSession(
             );
             return;
           }
+        // A sibling may be live: one automatic settling retry per streak.
+        scheduleSettle();
         publishScanTelemetry();
         return;
       }
@@ -1841,6 +1936,7 @@ export default function mirrorLinkSession(
       runOverrun = built.overrun;
       if (traj.id !== oldId) retireSpec(oldId, oldSpec);
       retireSiblingSpecs();
+      settleScheduled = false; // the streak is over
       rememberSpec(traj.id, built.spec);
       reuploads++;
       // A growing Timed exposure: the MCU pulses are longer now — only now may
