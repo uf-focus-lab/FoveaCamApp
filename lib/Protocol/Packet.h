@@ -303,24 +303,38 @@ static_assert(offsetof(TrajectoryMark, pulse) == 8);
 static_assert(offsetof(TrajectoryStart, t_start) == 2);
 static_assert(offsetof(TrajectoryStart, cycles) == 10);
 
-// SYN CMD_TRAJECTORY push payload: one per marker firing (plus one ENDED push
-// when a finite run completes). `result` is the same exposure-averaged
-// FrameResult CMD_FRAME's FIN carries, with result.stream = the trajectory id
-// and result.frame_id the firmware-monotonic capture counter shared with
-// CMD_FRAME. Only meaningful when status == OK; on a failure status the
-// timestamps that were latched are kept and the rest is zero.
+// SYN CMD_TRAJECTORY push payload: one per marker crossing (a capture's
+// completion, or BUSY), plus one run-level push (marker = NO_MARKER) when the
+// run ends (ENDED) or is cut (CANCELLED). `result` is the same
+// exposure-averaged FrameResult CMD_FRAME's FIN carries, with result.stream =
+// the trajectory id on EVERY push and result.frame_id the firmware-monotonic
+// capture counter shared with CMD_FRAME on every capture's push (OK,
+// STROBE_TIMEOUT, marker-level CANCELLED; 0 on BUSY and the run-level
+// pushes). The full result only when status == OK; STROBE_TIMEOUT and a
+// marker's CANCELLED keep stream, frame_id and the timestamps latched
+// (t_trigger; t_exposure if a strobe rose, else 0), the positions zero; BUSY,
+// ENDED and the run's CANCELLED carry stream and t_trigger only (see Status).
+// Spec: docs/spec/serial-protocol.md §trajectory.
 PACKED(TrajectoryFrame) {
   typedef enum Status : uint8_t {
     OK = 0,
     STROBE_TIMEOUT = 1, // no complete strobe within pulse + margin
-    BUSY = 2,      // capture engine busy at the marker phase — not triggered
-    CANCELLED = 3, // in-flight capture cancelled (System::Enable(false))
-    ENDED = 4,     // finite run completed (marker = NO_MARKER, cycle = cycles)
+    // Capture engine busy at the marker phase — not triggered; t_trigger =
+    // the marker's DUE time (t_start + cycle x period + t_offset).
+    BUSY = 2,
+    // System::Enable(false). Marker-level: that in-flight capture was cut
+    // (pushed inside the disable handler, ahead of its ACK). Run-level
+    // (marker = NO_MARKER, cycle 0): the run itself was cut, t_trigger = the
+    // MCU time of the loop pass that cut it (after the ACK).
+    CANCELLED = 3,
+    // Finite run completed: marker = NO_MARKER, cycle = cycles, t_trigger =
+    // t_start + cycles x period.
+    ENDED = 4,
   } Status;
   static constexpr uint8_t NO_MARKER = 0xFF;
   uint8_t id;
   uint8_t marker;
-  uint32_t cycle; // 0-based cycle index the marker fired in
+  uint32_t cycle; // crossing cycle, 0-based (ENDED: cycles; run CANCELLED: 0)
   uint8_t status; // Status
   FrameResult result;
 };
