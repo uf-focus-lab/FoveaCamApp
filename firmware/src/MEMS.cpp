@@ -267,25 +267,6 @@ void enable() {
   stagedMask = Device::NONE;
 };
 
-void refresh() {
-  // Periodic config re-assertion: re-send ONLY the idempotent setup words a
-  // glitched SPI frame could have
-  // silently cleared — all DAC channels powered, internal reference on,
-  // software LDAC. Deliberately NO RESET (0x280001 zeroes every output → the
-  // mirror would jump) and NO value/bias write, so refresh NEVER moves the
-  // mirror and is safe mid-capture. Broadcast to both mirrors; 3 frames,
-  // ~7.3 us at 10 MHz.
-  static constexpr uint32_t words[] = {
-      // 0x20000F ENABLE ALL DAC Channels
-      frame(CMD::DAC_POWER, CH::NONE, 0b1111),
-      // 0x380001 ENABLE INTERNAL REFERENCE
-      frame(CMD::INT_REF_SETUP, CH::NONE, 1),
-      // 0x300000 ENABLE SOFTWARE LDAC
-      frame(CMD::LDAC_SETUP, CH::NONE, 0),
-  };
-  broadcast(words, sizeof(words) / sizeof(words[0]));
-};
-
 void disable() {
   INFO("MEMS Disable");
   // Set V_BIAS to Neutral (all channels, write + update)

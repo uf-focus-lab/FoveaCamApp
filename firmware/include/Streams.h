@@ -47,21 +47,13 @@ uint8_t active();
 void snapshot(MirrorPosition &left, MirrorPosition &right);
 
 // Marks the active stream dirty so tick() re-commits its (possibly unchanged)
-// target to the DAC on the next loop. Used after a MEMS re-init/refresh
-// (SYS_RESET MEMS recovery, periodic housekeeping) so the mirror reloads the
-// live targets. No-op when no stream is active. While a trajectory owns (or
+// target to the DAC on the next loop. Used after a MEMS re-init (SYS_RESET
+// MEMS recovery) so the mirror reloads the live targets. No-op when no stream is active. While a trajectory owns (or
 // holds) the DAC, re-commits the driven position instead.
 void touch();
 // A MEMS re-init parked the DAC at V_BIAS: forget the last-written record
 // (claim() seeds V_BIAS until the next write). Call BEFORE touch().
 void noteReinit();
-
-// Call every loop() tick, BEFORE tick(): periodic config re-assertion. While
-// the system is enabled,
-// re-sends the idempotent MEMS setup words at ~1 Hz (never a RESET or a value
-// write, so the mirror never moves) and touch()es the active stream so the
-// next tick() re-commits live targets. Cadence is off Global::time.
-void housekeeping();
 
 // Call every loop() tick: writes the active stream's target to the MEMS DAC,
 // skipping the SPI write when the target hasn't changed since the last tick.
@@ -131,8 +123,8 @@ void drive(const MirrorPosition &left, const MirrorPosition &right);
 void release();
 // Command::Actuate wrote the DAC directly (never while a trajectory runs):
 // records it as the DAC's last written value and, under HOLD, makes it the
-// hold position (the 1 Hz refresh and snapshot() then use it instead of
-// snapping back to the trajectory's last position).
+// hold position (a MEMS recovery's touch() and snapshot() then use it instead
+// of snapping back to the trajectory's last position).
 void noteActuate(const MirrorPosition &left, const MirrorPosition &right);
 
 } // namespace Streams

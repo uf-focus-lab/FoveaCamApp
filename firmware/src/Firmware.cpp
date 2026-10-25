@@ -30,7 +30,6 @@ void tick(); // Non-blocking Actuate/Trigger completion (Protocol.cpp)
 
 void loop() {
   Global::time.update();
-  Streams::housekeeping(); // M1 periodic MEMS config re-assertion (~1 Hz)
   Streams::tick();
   Trajectory::tick(); // v2.2.0: DAC playback + marker triggers
   Capture::tick();

@@ -221,17 +221,25 @@ EXPLICIT:
   (per mirror 3× `WRITE_IREG` A/B/D + 1× `APPLY_IREG` C — see
   `hardware/rig.md` § MEMS bus).
 
-## periodic MEMS config re-assertion {#mems-refresh}
+## MEMS config re-assertion {#mems-refresh}
 
-While the system is enabled, `loop()` calls `Streams::housekeeping()` which — at
-~1 Hz, cadenced off `Global::time` — re-sends the three IDEMPOTENT AD5664R setup
-words (`DAC_POWER 0b1111`, `INT_REF_SETUP 1`, `LDAC_SETUP 0`) to BOTH mirrors via
-`MEMS::refresh()` — the same word on both DAC buses in lockstep, 3 frames
-(~7.3 µs at the default 10 MHz SCLK). It NEVER sends a RESET (that would zero the outputs) and NEVER a
-value/bias write, so the mirror does not move — safe mid-capture. Each refresh
-`touch()`es the active stream so targets re-commit within one tick. This converts a
-corrupted-word DAC wedge from permanent into a ≤1 s glitch. No re-assertion
-happens while disabled.
+None periodic. The V0.1 board's dedicated MEMS SPI buses are bench-verified for
+signal integrity, so the firmware never re-sends DAC configuration on its own:
+while enabled and idle, the DAC sees no traffic. The only re-commit path is
+recovery — `SYS_RESET` type `MEMS` re-runs the full `MEMS::enable()` train and
+`Streams::touch()` re-commits the current DAC owner's targets (the active
+stream, or a trajectory's driven/held position) on the next tick.
+
+::: details History
+Protocol 2.1.0 to 2.2.1 on the old board: while enabled, `loop()` called
+`Streams::housekeeping()`, which at ~1 Hz (cadenced off `Global::time`) re-sent
+the three idempotent AD5664R setup words (`DAC_POWER 0b1111`, `INT_REF_SETUP 1`,
+`LDAC_SETUP 0`) to both mirrors via `MEMS::refresh()` — 3 lockstep frames, no
+RESET and no value/bias write, so the mirror never moved — then `touch()`ed the
+DAC owner so targets re-committed within one tick. It turned a corrupted-SPI-word
+DAC wedge from permanent into a ≤1 s glitch. Retired on the V0.1 board; the
+host never observed it, so the protocol version did not change.
+:::
 
 ## disable {#disable}
 
@@ -417,8 +425,8 @@ Teensy DMAMEM, 80 KB, first-fit), `MAX_MARKERS = 8` per table.
 - A finite run ends holding phase 0 and pushes `ENDED`. `STOP` holds the last
   position (the last DAC write: a `STOP`/`DELETE` handled in the same loop
   iteration as its `START`, before the run's first drive, holds where the mirror
-  already was). After either, the mirror stays put (`Owner::HOLD`, surviving the
-  1 Hz MEMS refresh) until the next stream write — UPDATE, an applied keyframe,
+  already was). After either, the mirror stays put (`Owner::HOLD`; a MEMS recovery
+  re-commits the held position) until the next stream write — UPDATE, an applied keyframe,
   a CREATE that takes the DAC, or a CMD_FRAME activation — takes the DAC back.
 - While a trajectory runs (armed or playing) it owns the DAC: `CMD_STREAM UPDATE`,
   `CMD_SCHEDULE` and (v2.2.1) `Command::Actuate` are REJected (`A trajectory owns
@@ -426,7 +434,7 @@ Teensy DMAMEM, 80 KB, first-fit), `MAX_MARKERS = 8` per table.
   lines: the legacy `Command::Trigger` REJs `A trajectory owns the trigger lines
   (STOP it first)`. Both work again once the run is over (`HOLD` after STOP/ENDED
   is not running — an Actuate there writes the DAC and, from v2.2.1, becomes the
-  hold position, which the 1 Hz refresh re-commits). Conversely (v2.2.1), `START`
+  hold position, which a MEMS recovery re-commits). Conversely (v2.2.1), `START`
   REJs `A trigger is pending (legacy Trigger) — wait for its FIN` while a legacy
   `Command::Trigger` is pending: its
   FIN would drop the trigger lines mid-way through a marker's pulse. A host

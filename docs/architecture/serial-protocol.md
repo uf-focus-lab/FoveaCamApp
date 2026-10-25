@@ -28,9 +28,9 @@ decoded back to volts via `dac2volt`), `Trigger`, `Reset`.
 place (full re-init incl. RESET) without a reboot or an enable-rail cycle, then
 re-commits the active stream's targets, so a wedged right-fovea mirror
 recovers without dropping the session — the host's "recover mirror" button.
-REJects while disabled. The firmware ALSO re-asserts the idempotent MEMS
-config words at ~1 Hz on its own while enabled, turning a corrupted-word DAC
-wedge into a ≤1 s glitch.
+REJects while disabled. There is no periodic re-assertion: the V0.1 board's
+MEMS buses are bench-verified, so recovery is host-triggered only
+(spec § mems-refresh).
 
 ## 3. v2 surface — streams and synced frames
 

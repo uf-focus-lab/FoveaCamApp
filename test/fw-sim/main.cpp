@@ -446,7 +446,6 @@ int main(int argc, char **argv) {
                 static_cast<unsigned long long>(pass - lastPass),
                 static_cast<unsigned long long>(Global::time.now()));
     lastPass = pass;
-    Streams::housekeeping(); // M1 periodic MEMS config re-assertion (~1 Hz)
     Streams::tick();
     Trajectory::tick(); // v2.2.0: DAC playback + marker triggers
     Capture::tick();

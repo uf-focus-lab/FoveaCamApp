@@ -305,8 +305,8 @@ HANDLE_SET(Command::Actuate) {
   MEMS::set(MEMS::Device::LEFT, payload.left);
   MEMS::set(MEMS::Device::RIGHT, payload.right);
   MEMS::apply();
-  // v2.2.1: in HOLD this is the new hold position (no snap-back at the 1 Hz
-  // refresh). spec: docs/spec/serial-protocol.md#trajectory
+  // v2.2.1: in HOLD this is the new hold position (a MEMS recovery's
+  // re-commit never snaps back). spec: docs/spec/serial-protocol.md#trajectory
   Streams::noteActuate(payload.left, payload.right);
   actuate.start(seq, payload, Global::time.now() + payload.settle_time);
   auto packet = Create::ACK(seq);

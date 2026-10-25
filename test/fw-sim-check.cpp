@@ -31,11 +31,12 @@
 //      mid-ramp frame reports them); stale/UPDATE-clears semantics;
 //      CMD_TRAJECTORY upload/commit/start -> periodic DAC playback + marker
 //      SYN pushes with sane timestamps; Actuate / legacy Trigger REJ while
-//      a run plays, START REJ while a legacy Trigger is pending; an Actuate
-//      in HOLD moves the hold position (past the 1 Hz refresh); STOP holds
-//      position; a START + MEMS reset burst still starts at phase 0; START +
-//      STOP in one loop iteration holds the DAC's actual position, and right
-//      after a MEMS reset holds V_BIAS; DAC returns to the streams.
+//      a run plays, START REJ while a legacy Trigger is pending; HOLD writes
+//      nothing for 1.5 s; an Actuate in HOLD moves the hold position (a MEMS
+//      recovery re-commits it); STOP holds position; a START + MEMS reset
+//      burst still starts at phase 0; START + STOP in one loop iteration
+//      holds the DAC's actual position, and right after a MEMS reset holds
+//      V_BIAS; DAC returns to the streams.
 //   C5 (v2.2.1): CMD_TRAJECTORY atomic swap — START b at a's t_start while a
 //      runs (same period) switches tables in place: mismatched period /
 //      t_start / a itself REJ with a still running; a's in-flight capture
@@ -563,6 +564,15 @@ static std::vector<uint16_t> inBand(const std::vector<uint16_t> &v,
 // next cycle's). One more round trip — answered by a later pass, whose tick
 // drives the current phase first — puts that phase's word in the drain.
 static void drain(Sim &sim) { sim.pump(5); }
+
+// DAC words of any kind (config or value) in sim lines [from, end).
+static size_t dacWordCount(const Sim &sim, size_t from) {
+  size_t n = 0;
+  DacWord w;
+  for (size_t i = from; i < sim.lines.size(); i++)
+    n += parseDac(sim.lines[i], w);
+  return n;
+}
 
 static void sleepMs(int ms) { ::poll(nullptr, 0, ms); }
 
@@ -1776,8 +1786,8 @@ int main() {
       // elsewhere; the wrap segment 115.2 -> 120 ms descends over several
       // ticks), the final drop to the phase-0 hold included. Not "above
       // 3000, then below 1500": a loaded host's sparse ticks can leave a
-      // cycle with no word in its top 3 ms. Repeats (the 1 Hz refresh
-      // re-commits an unchanged word) are dropped first.
+      // cycle with no word in its top 3 ms. Repeated words are dropped
+      // first.
       std::vector<uint16_t> steps = band;
       steps.erase(std::unique(steps.begin(), steps.end()), steps.end());
       unsigned wraps = 0;
@@ -1794,21 +1804,58 @@ int main() {
                   static_cast<unsigned long long>(worstLate));
     }, [&] { recoverTrajectories(wire, {TID}); });
 
-    // C4 — HOLD after the run (survives the 1 Hz refresh), START refused
+    // C4 — HOLD after the run (no DAC write), START refused
     //      while a legacy Trigger is pending, STOP mid-run holds the last
     //      position, START + MEMS reset burst starts at phase 0, an Actuate
     //      moves the hold, START + STOP burst holds the DAC's position,
     //      control returns to the streams, DELETE
     {
-      // After ENDED the mirror holds phase 0 across a MEMS refresh: stream 1's
-      // target (L ch1 = 22000) is NOT re-committed.
-      size_t mark = sim.lines.size();
-      sleepMs(1200);
+      // A MEMS recovery (SYS_RESET MEMS) re-inits the DAC and re-commits the
+      // current owner's position; returns the index of its RESET word once
+      // every channel of both mirrors has been re-committed after it.
+      auto recoverMems = [&](const std::string &label) {
+        const size_t from = sim.lines.size();
+        System::Reset rst{};
+        rst.type = System::Reset::MEMS;
+        const uint16_t sReset = wire.next();
+        wire.send(setPacket(Protocol::Property::SYS_RESET, sReset, &rst,
+                            sizeof(rst)));
+        expectAck(wire, Protocol::Property::SYS_RESET, sReset,
+                  (label + ": MEMS recovery").c_str());
+        const size_t at = sim.indexOf("dac cs=LR 280001", from);
+        bool all = false;
+        for (int i = 0; i < 200 && !all; i++) {
+          drain(sim);
+          bool wrote[2][4] = {};
+          for (size_t k = at; k < sim.lines.size(); k++) {
+            DacWord w;
+            if (!parseDac(sim.lines[k], w) || !carriesValue(w))
+              continue;
+            wrote[0][w.addr] |= w.left;
+            wrote[1][w.addr] |= w.right;
+          }
+          all = true;
+          for (const auto &side : wrote)
+            for (bool ch : side)
+              all = all && ch;
+          if (!all)
+            sleepMs(1);
+        }
+        CHECK(all, label + ": MEMS recovery re-commits every channel of both "
+                           "mirrors");
+        return at;
+      };
+
+      // After ENDED the mirror holds phase 0 with no DAC write at all: stream
+      // 1's target (L ch1 = 22000) is never re-committed.
+      (void)mcuNow(wire);
       drain(sim);
-      auto v = dacValues(sim, 'L', mark);
-      for (auto x : inBand(v, 1000, 3400))
-        CHECK(x == 1000, "HOLD keeps the final trajectory position");
-      CHECK(!hasValue(v, 22000), "HOLD: the stream target is not re-committed");
+      size_t mark = sim.lines.size();
+      sleepMs(1500);
+      drain(sim);
+      CHECK(dacWordCount(sim, mark) == 0,
+            "HOLD after ENDED: no DAC write for 1.5 s");
+      std::vector<uint16_t> v;
 
       // A pending legacy Trigger holds every Line3 HIGH until its FIN: a
       // START meanwhile is refused (a marker's pulse would be cut by that
@@ -1920,7 +1967,7 @@ int main() {
       // A fresh START after the mid-run STOP: the FIRST DAC word of the new
       // run is its phase 0 (1000), never the held position. A MEMS recovery
       // (SYS_RESET MEMS -> Streams::touch) in the SAME loop iteration as the
-      // START leaves a refresh pending when the next Streams::tick runs —
+      // START leaves a touch() pending when the next Streams::tick runs —
       // before Trajectory::tick's first drive — so this exercises the
       // `firstDrive` guard: without it that tick re-commits the held position.
       // The next tick pre-positions at phase 0 only while it is still ahead
@@ -1964,9 +2011,7 @@ int main() {
         tHandled = payloadAs<System::Timestamp>(ack).microseconds;
       }
       // From the reset's DAC init words on: the burst's START was handled
-      // right before them, in the same handle() pass. A word ahead of them
-      // is the HOLD's own (a 1 Hz refresh re-committing the held position
-      // between `mark` and the burst), not the new run's.
+      // right before them, in the same handle() pass.
       const size_t burstAt = sim.indexOf("dac cs=LR 280001", mark);
       std::vector<uint16_t> fresh;
       for (int i = 0; i < 200 && fresh.empty(); i++) {
@@ -2022,15 +2067,19 @@ int main() {
       drain(sim);
       CHECK(hasValue(dacValues(sim, 'L', mark), 30000),
             "Actuate in HOLD writes the DAC");
-      // ... and moves the hold position: the 1 Hz refresh re-commits it,
-      // never the trajectory's phase-0 hold.
+      // ... the mirror stays there (no snap-back to the phase-0 hold) ...
       mark = sim.lines.size();
-      sleepMs(1200);
+      sleepMs(1500);
       drain(sim);
-      v = dacValues(sim, 'L', mark);
-      CHECK(hasValue(v, 30000), "the refresh re-commits the Actuate position");
+      CHECK(dacWordCount(sim, mark) == 0,
+            "Actuate in HOLD: no DAC write for 1.5 s (no snap-back)");
+      // ... and it is the new hold position: a MEMS recovery re-commits it,
+      // never the trajectory's phase-0 hold.
+      v = dacValues(sim, 'L', recoverMems("Actuate in HOLD"));
+      CHECK(hasValue(v, 30000),
+            "MEMS recovery in HOLD re-commits the Actuate position");
       CHECK(inBand(v, 1000, 3400).empty(),
-            "Actuate in HOLD survives the 1 Hz refresh (no snap-back)");
+            "MEMS recovery in HOLD never snaps back to the phase-0 hold");
 
       // Control returns to the streams on the next stream write.
       mark = sim.lines.size();
@@ -2044,11 +2093,13 @@ int main() {
         back = hasValue(dacValues(sim, 'L', mark), 4321);
       }
       CHECK(back, "stream UPDATE drives the DAC again after STOP");
+      (void)mcuNow(wire); // that write's remaining words: out by this ACK
+      drain(sim);
 
       // START (future t_start) and STOP in ONE loop iteration: the run never
       // drives, and the HOLD keeps what the DAC holds — the stream's 4321 —
-      // across the 1 Hz refresh, not a stale drive position (the Actuate's
-      // 30000, or zeros after boot).
+      // not a stale drive position (the Actuate's 30000, or zeros after
+      // boot): nothing is written, and a MEMS recovery re-commits 4321.
       mark = sim.lines.size();
       {
         Cmd::TrajectoryStart fut = st;
@@ -2071,10 +2122,13 @@ int main() {
         expectAckOf(wire, Protocol::Property::CMD_TRAJECTORY, sStop,
                     "STOP in the START burst");
       }
-      sleepMs(1200);
+      sleepMs(1500);
       drain(sim);
-      v = dacValues(sim, 'L', mark);
-      CHECK(hasValue(v, 4321), "the refresh re-commits the held position");
+      CHECK(dacWordCount(sim, mark) == 0,
+            "START+STOP in one iteration: no DAC write for 1.5 s");
+      v = dacValues(sim, 'L', recoverMems("START+STOP hold"));
+      CHECK(hasValue(v, 4321),
+            "MEMS recovery re-commits the held position (the DAC's 4321)");
       CHECK(!hasValue(v, 30000) && !hasValue(v, 0) &&
                 inBand(v, 1000, 3400).empty(),
             "START+STOP in one iteration holds the DAC's actual position");
@@ -2095,13 +2149,14 @@ int main() {
 
       // A MEMS recovery (SYS_RESET MEMS) re-inits every channel to V_BIAS, so
       // a START (future t_start) + STOP in the SAME loop iteration right
-      // after it holds V_BIAS: claim() seeds Global::bias_voltage because
-      // Streams::noteReinit() forgot the last write. The 1 Hz refresh then
-      // re-commits the bias on all four channels of both mirrors — not the
-      // stream's pre-reset position (L ch0 4321, R = R0: the last DAC write)
-      // and not zeros. The reset's own bias word is a CH::ALL broadcast,
-      // which carriesValue() skips, so every per-channel word in the window
-      // is a refresh write.
+      // after it holds V_BIAS: the reset's own re-init train parks every
+      // channel at V_BIAS (a CH::ALL broadcast, which carriesValue() skips),
+      // claim() drops the reset's pending touch() and seeds
+      // Global::bias_voltage because Streams::noteReinit() forgot the last
+      // write, so no per-channel word follows. A second recovery's touch()
+      // then re-commits that hold position — the bias on all four channels of
+      // both mirrors, not the stream's pre-reset position (L ch0 4321, R =
+      // R0: the last DAC write) and not zeros.
       constexpr uint16_t BIAS = 30000; // stage 2's staged CFG_BIAS
       mark = sim.lines.size();
       {
@@ -2134,14 +2189,17 @@ int main() {
         expectAckOf(wire, Protocol::Property::CMD_TRAJECTORY, sStop,
                     "STOP in the reset burst");
       }
-      sleepMs(1200);
-      drain(sim);
       {
-        // From the reset's init words on (a 1 Hz refresh between `mark` and
-        // the burst still re-commits the stream's position).
-        bool wrote[2][4] = {}; // [L, R][channel] got a per-channel word
-        for (size_t i = sim.indexOf("dac cs=LR 280001", mark);
-             i < sim.lines.size(); i++) {
+        const size_t resetAt = sim.indexOf("dac cs=LR 280001", mark);
+        (void)sim.indexOf("dac cs=LR 1F7530", resetAt); // V_BIAS, all channels
+        sleepMs(1500);
+        drain(sim);
+        CHECK(dacValues(sim, 'L', resetAt).empty() &&
+                  dacValues(sim, 'R', resetAt).empty(),
+              "a START+STOP right after a MEMS reset: no per-channel write for "
+              "1.5 s (the DAC stays at the re-init's V_BIAS)");
+        const size_t again = recoverMems("reset hold");
+        for (size_t i = again; i < sim.lines.size(); i++) {
           DacWord w;
           if (!parseDac(sim.lines[i], w) || !carriesValue(w))
             continue;
@@ -2153,13 +2211,7 @@ int main() {
           CHECK(w.value == BIAS,
                 "a START+STOP right after a MEMS reset holds V_BIAS (not the "
                 "pre-reset position, not zeros)");
-          wrote[0][w.addr] |= w.left;
-          wrote[1][w.addr] |= w.right;
         }
-        for (const auto &side : wrote)
-          for (bool ch : side)
-            CHECK(ch, "the refresh re-commits V_BIAS on every channel of "
-                      "both mirrors");
       }
       // Hand the DAC back to stream 1 (same target) for the later stages.
       s = wire.next();
@@ -2426,8 +2478,7 @@ int main() {
         // hold at phase 0 (exempt from the "high" bound: a loop stall right
         // before the end can clamp it early). The bounds leave a sim stall
         // of up to ~50 ms around a wrap harmless. Consecutive identical
-        // words are dropped first: the 1 Hz housekeeping refresh re-commits
-        // an unchanged value, and a repeat inside the wrap segment would
+        // words are dropped first: a repeat inside the wrap segment would
         // split one wrap into two.
         auto all = inBand(dacValues(sim, 'L', runMark), BAND_LO, BAND_HI);
         all.erase(std::unique(all.begin(), all.end()), all.end());

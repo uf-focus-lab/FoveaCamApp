@@ -9,12 +9,9 @@
 // the fovea-fw-sim harness (test/build/fovea-fw-sim; build with
 // `cd test && make build`). Companion to 47-firmware-sim.ts, same DAC-word
 // capture + control plane. Proves:
-//   a. M1 periodic config re-assertion — while enabled with a live stream,
-//      exactly the 3 idempotent refresh words (DAC_POWER 0x20000F, INT_REF
-//      0x380001, LDAC 0x300000) appear ~1 s apart, on BOTH buses in lockstep
-//      (cs=LR), with NO RESET (0x28xxxx) and NO value/bias write (refresh must
-//      not move the mirror); the active stream's target is re-committed right
-//      after; and NO refresh words appear while the system is disabled.
+//   a. DAC quiescence — no DAC traffic at all while disabled, nor while
+//      enabled with an idle live stream (no periodic re-assertion on the V0.1
+//      board: docs/spec/serial-protocol.md#mems-refresh).
 //   b. M2 targeted DAC recovery — SET System::Reset type=MEMS while enabled
 //      replays the FULL MEMS enable() word train (incl. RESET) on the wire,
 //      ACKs, and re-commits the active stream's target; while DISABLED it REJs.
@@ -109,8 +106,6 @@ if (!existsSync(simBinary)) {
 const BIAS = 30000; // 0x7530 -> bias broadcast word 1F7530
 const T1L: AnalogChannels = [1000, 2000, 3000, 4000];
 const T1R: AnalogChannels = [4000, 3000, 2000, 1000];
-// The three idempotent M1 refresh words (config-only; NEVER move the mirror).
-const REFRESH = ["20000F", "380001", "300000"];
 // The full MEMS enable() train (RESET first, bias last), both mirrors selected.
 const ENABLE_TRAIN = ["280001", "380001", "20000F", "300000", "1F7530"];
 // ch[0]=1000 -> LEFT DAC channel A (WRITE_IREG|A = 0x00): the first word of a
@@ -153,13 +148,13 @@ try {
     console.log(`49-firmware-recovery: §c GET Version ${v.major}.${v.minor}.${v.patch} OK.`);
   }
 
-  // --- a1: NO refresh words while disabled ------------------------------------
+  // --- a1: NO DAC traffic while disabled -------------------------------------
   {
     const mark = sim.mark();
-    await sleep(1300); // > 1 s refresh period; disabled housekeeping must be a no-op
+    await sleep(1500);
     const words = sim.dac(mark);
     assert.equal(words.length, 0, "no DAC traffic at all while system disabled");
-    console.log("49-firmware-recovery: §a(disabled) no refresh while disabled OK.");
+    console.log("49-firmware-recovery: §a(disabled) no DAC traffic while disabled OK.");
   }
 
   // Enable + create a live stream (its target commits immediately).
@@ -178,44 +173,13 @@ try {
     await sim.waitLine((l) => l === `dac cs=L ${RECOMMIT_L}`, 0, 5000, "CREATE commit");
   }
 
-  // --- a2: exactly the 3 refresh words ~1 s later, then a re-commit -----------
+  // --- a2: NO DAC traffic while enabled with an idle stream -------------------
   {
     await sleep(150); // let the CREATE commit fully flush before marking
     const mark = sim.mark();
-    // First refresh lands ~1 s after the enable edge primed the cadence.
-    const ldac = await sim.waitLine((l) => l === "dac cs=LR 300000", mark, 3000, "refresh LDAC");
-    // The refresh is broadcast (same word on both buses: cs=LR); the
-    // follow-up re-commit frames differ per mirror (T1L != T1R on every
-    // channel, so they decode as cs=L / cs=R pairs), so filtering cs=LR
-    // isolates the refresh train.
-    const refresh = sim.dac(mark).filter((w) => w.cs === "LR").slice(0, 3);
-    assert.deepEqual(
-      refresh.map((w) => w.word),
-      REFRESH,
-      "refresh = DAC_POWER, INT_REF, LDAC in order",
-    );
-    assert(
-      refresh.every((w) => w.cs === "LR"),
-      "refresh words broadcast to BOTH mirrors (cs=LR)",
-    );
-    // Config-only: refresh must NOT reset (0x28xxxx) or write a value/bias.
-    assert(
-      !refresh.some((w) => w.word.startsWith("28")),
-      "refresh never RESETs the DAC (would zero outputs)",
-    );
-    assert(
-      !refresh.some((w) => w.word.startsWith("1F")),
-      "refresh never writes a value/bias (would move the mirror)",
-    );
-    // The active stream's target is re-committed right after the refresh.
-    const recommit = await sim.waitLine(
-      (l) => l === `dac cs=L ${RECOMMIT_L}`,
-      ldac.index + 1,
-      3000,
-      "post-refresh re-commit",
-    );
-    assert(recommit.index > ldac.index, "targets re-committed after the refresh");
-    console.log("49-firmware-recovery: §a(enabled) 1 Hz refresh + re-commit OK.");
+    await sleep(1500);
+    assert.equal(sim.dac(mark).length, 0, "no DAC traffic while enabled and idle");
+    console.log("49-firmware-recovery: §a(enabled) no DAC traffic while idle OK.");
   }
 
   // --- b: SET System::Reset type=MEMS while enabled ---------------------------
@@ -227,8 +191,8 @@ try {
       "MEMS recovery ACK",
     );
     assert.equal(ack.valueOf(), "MEMS", "recovery ACK echoes the MEMS reset type");
-    // The full enable() train must appear on the wire (RESET included). Locate
-    // it by its unique RESET word so a stray periodic refresh can't confuse it.
+    // The full enable() train must appear on the wire (RESET included),
+    // located by its unique RESET word.
     const words = sim.dac(mark).map((w) => w.word);
     const resetAt = words.indexOf("280001");
     assert(resetAt >= 0, "MEMS recovery replays the AD5664R RESET");

@@ -38,11 +38,6 @@ bool dirty = false; // active stream's target not yet written to the DAC
 // touch(): re-commit whatever currently drives the DAC on the next tick.
 bool refresh = false;
 
-// Housekeeping cadence for periodic config re-assertion.
-constexpr uint64_t REFRESH_PERIOD_US = 1'000'000; // ~1 Hz
-uint64_t lastRefreshUs = 0;
-bool refreshPrimed = false; // cadence clock started on the enable edge
-
 // ---- v2.2.0 schedule state --------------------------------------------------
 
 // POD (DMAMEM-safe): validity is tracked by the per-stream Ring head/count.
@@ -80,7 +75,7 @@ Owner dacOwner = Owner::STREAMS;
 MirrorPosition driveLeft{}, driveRight{};
 // The first drive() after claim() writes unconditionally. A flag of its own,
 // NOT `refresh`: Streams::tick() runs before Trajectory::tick() in loop(), and
-// a refresh under TRAJECTORY ownership re-writes driveLeft/driveRight — until
+// a pending touch() under TRAJECTORY ownership re-writes driveLeft/driveRight — until
 // the new run's first drive() that is the LAST run's position, a stale value
 // that would move the mirror for one tick before phase 0. tick() therefore
 // leaves the DAC alone while this is set (drive() honours a pending refresh).
@@ -288,34 +283,9 @@ void noteReinit() {
 void touch() {
   // Force the DAC's current owner to be re-committed on the next tick(), even
   // if nothing changed. Used after a MEMS re-init (Protocol.cpp MEMS
-  // recovery) or a periodic refresh so the DAC is re-loaded with live targets.
+  // recovery) so the DAC is re-loaded with live targets.
   if (activeId != INVALID_ID || dacOwner != Owner::STREAMS)
     refresh = true;
-}
-
-void housekeeping() {
-  // Periodic config re-assertion. Called every loop() but acts only while the
-  // system is enabled and >= 1 s
-  // since the last refresh. MEMS::refresh() re-sends config-only words (no
-  // RESET, no value write), so the mirror never moves — safe mid-capture; the
-  // subsequent touch() re-commits the current targets within one tick.
-  if (!Global::system_enabled) {
-    refreshPrimed = false;
-    return;
-  }
-  const uint64_t now = Global::time.now();
-  if (!refreshPrimed) {
-    // Enable just ran the full MEMS::enable() (these words included) — start the
-    // 1 Hz clock here so the first re-assertion lands ~1 s later.
-    refreshPrimed = true;
-    lastRefreshUs = now;
-    return;
-  }
-  if (now - lastRefreshUs < REFRESH_PERIOD_US)
-    return;
-  lastRefreshUs = now;
-  MEMS::refresh();
-  touch();
 }
 
 void tick() {
@@ -334,8 +304,8 @@ void tick() {
   if (dacOwner != Owner::STREAMS) {
     dirty = false;
     // Before the run's first drive() the driven position is the previous
-    // run's: a touch() landing after claim() (1 Hz housekeeping, a MEMS
-    // recovery in the START batch) stays pending for drive() instead.
+    // run's: a touch() landing after claim() (a MEMS recovery in the START
+    // batch) stays pending for drive() instead.
     if (refresh && !(dacOwner == Owner::TRAJECTORY && firstDrive)) {
       writeDac(driveLeft, driveRight);
       refresh = false;

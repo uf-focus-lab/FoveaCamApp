@@ -84,8 +84,10 @@
   slow slew), applied after `pinMode` so it sticks; compiled out under
   `FOVEA_HOST_SIM`.
 - Enable order (Mirrorcle guide p27): DAC init words, Vbias on all channels,
-  FCLK running, then MEMS_EN HIGH. Disable in reverse. The 1 Hz
-  `MEMS::refresh()` re-assertion stays and never moves the mirror.
+  FCLK running, then MEMS_EN HIGH. Disable in reverse. The periodic 1 Hz
+  DAC config re-assertion is retired: the new buses are bench-verified for
+  signal integrity, so only `SYS_RESET` MEMS recovery re-inits and re-commits
+  (`serial-protocol.md#mems-refresh`).
 - The host simulator decodes the real bit-banged waveform back into
   `dac cs=<L|R|LR> <hex>` lines, so it checks the driver bit for bit.
 
@@ -180,6 +182,7 @@ while the MCU owns the DAC.
 | Non-isolated camera lines, polarity constant, center camera | `fw-sim-check` stages 8 and 9; `core/test/50` rewritten and un-quarantined; bench-verified 2026-10-22: LineInverter=true |
 | Protocol 2.2.0 schedule + trajectory, firmware engines | `fw-sim-check` stages C1 to C4 (keyframe timing, interpolation, 10-cycle trajectory with marker pushes, hold/stop) |
 | Serial pipelining and rate limits | `fw-sim-check` stage D; `core/test/52` |
+| Periodic MEMS re-assertion retired (bench-verified SPI integrity) | `fw-sim-check` C4 asserts HOLD sees no DAC write for 1.5 s and recovery re-commits the hold position; `core/test/49` asserts an idle enabled stream sees no DAC traffic |
 | Core packet factories, `onPush`, boolean/integer camera feature setters | Written against the Aravis 0.8 / NAPI patterns; validated only on stub-linked builds |
 | Host camera-line programming, controller node routing, telemetry | App suite 141 files, 1540 tests; process-boundary gates; VitePress docs build |
 | Teensy core API names used by the new firmware | Checked against the PaulStoffregen/cores Teensy 4 headers: every macro exists, no trajectory op name collides |
