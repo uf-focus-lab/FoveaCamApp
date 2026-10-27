@@ -1,5 +1,6 @@
 build: configure
 	@cd build && cmake .. && make -j
+	@./build/conversions
 
 configure:
 	@mkdir -p build

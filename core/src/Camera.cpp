@@ -111,6 +111,7 @@ public:
             INSTANCE_ACCESSOR(CameraObject, exposure),                 //
             INSTANCE_GETTER(CameraObject, exposure_range),             //
             INSTANCE_ACCESSOR(CameraObject, exposure_auto),            //
+            INSTANCE_METHOD(CameraObject, getExposureMode),            //
             INSTANCE_METHOD(CameraObject, setExposureMode),            //
             INSTANCE_GETTER(CameraObject, gain_available),             //
             INSTANCE_GETTER(CameraObject, gain_auto_available),        //
@@ -415,6 +416,13 @@ private:
   GET_PROP(exposure_auto, String, (convert<std::string, ArvAuto>));
   SET_PROP(exposure_auto, val.As<String>().Utf8Value(),
            (convert<ArvAuto, std::string>));
+
+  FN(getExposureMode) {
+    try {
+      return String::New(env, convert<std::string>(core()->get_exposure_mode()));
+    }
+    JS_EXCEPT(env.Null())
+  }
 
   FN(setExposureMode) {
     try {

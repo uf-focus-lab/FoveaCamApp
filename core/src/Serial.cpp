@@ -29,7 +29,7 @@
 int SerialOpen(const Napi::CallbackInfo &info) noexcept {
   const auto env = info.Env();
   const auto path = convert<std::string>(info[0]);
-  const auto baud = optionalArgument<speed_t>(info[1], 115200);
+  const speed_t baud = optionalArgument<uint32_t>(info[1], 115200);
   VERBOSE("Opening serial port %s (baudrate=%lu)", path.c_str(), baud);
   // Open serial port
   int fd = ::open(path.c_str(), O_RDWR | O_NOCTTY | O_CLOEXEC | O_NONBLOCK);

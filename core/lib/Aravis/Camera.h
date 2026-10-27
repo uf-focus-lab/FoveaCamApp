@@ -8,6 +8,7 @@
 #include <vector>
 
 #include <arv.h>
+#include <convert.h>
 
 #include <utils/ref-count.h>
 
@@ -238,6 +239,10 @@ public:
   ARV_CAMERA_SET(ArvAuto, exposure_auto, exposure_time_auto);
 
   ARV_CAMERA_SET(ArvExposureMode, exposure_mode, exposure_mode);
+  // Aravis has no arv_camera_get_exposure_mode; read the SFNC node directly.
+  inline ArvExposureMode get_exposure_mode() const {
+    return convert<ArvExposureMode>(get_feature("ExposureMode"));
+  }
 
   /* Analog control */
 

@@ -56,3 +56,30 @@ template <> std::string convert(const ArvAuto &src) {
     throw Error("Invalid ArvAuto value: " + std::to_string(src));
   }
 }
+
+template <> ArvExposureMode convert(const std::string &src) {
+  if (src == "Off")
+    return ARV_EXPOSURE_MODE_OFF;
+  if (src == "Timed")
+    return ARV_EXPOSURE_MODE_TIMED;
+  if (src == "TriggerWidth")
+    return ARV_EXPOSURE_MODE_TRIGGER_WIDTH;
+  if (src == "TriggerControlled")
+    return ARV_EXPOSURE_MODE_TRIGGER_CONTROLLED;
+  throw Error("Invalid ArvExposureMode string: " + src);
+}
+
+template <> std::string convert(const ArvExposureMode &src) {
+  switch (src) {
+  case ARV_EXPOSURE_MODE_OFF:
+    return "Off";
+  case ARV_EXPOSURE_MODE_TIMED:
+    return "Timed";
+  case ARV_EXPOSURE_MODE_TRIGGER_WIDTH:
+    return "TriggerWidth";
+  case ARV_EXPOSURE_MODE_TRIGGER_CONTROLLED:
+    return "TriggerControlled";
+  default:
+    throw Error("Invalid ArvExposureMode value: " + std::to_string(src));
+  }
+}

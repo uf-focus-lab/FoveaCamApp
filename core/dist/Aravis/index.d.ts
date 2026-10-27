@@ -90,6 +90,11 @@ declare module "core/Aravis" {
     exposure: number;
     readonly exposure_range: Range;
     exposure_auto: AutoMode;
+    /** SFNC ExposureMode ("Off" | "Timed" | "TriggerWidth" | "TriggerControlled"); null when unreadable. */
+    getExposureMode(): string | null;
+    /** `arv_camera_set_exposure_mode`: true when the camera took the mode,
+     *  false when it refused it; THROWS on a string that is not an
+     *  ExposureMode entry (Off / Timed / TriggerWidth / TriggerControlled). */
     setExposureMode(mode: string): boolean;
 
     // Gain control

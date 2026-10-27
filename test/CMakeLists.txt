@@ -20,6 +20,8 @@ file(GLOB SRCS ${SRC_DIR}/*.cpp ${SRC_DIR}/**/*.cpp)
 # fw-sim/ is a MULTI-file target (fovea-fw-sim, declared below), not part of
 # the one-executable-per-file convention.
 list(FILTER SRCS EXCLUDE REGEX "/fw-sim/")
+# conversions.cpp links aravis (declared below).
+list(FILTER SRCS EXCLUDE REGEX "/conversions\\.cpp$")
 
 # set(CMAKE_CXX_FLAGS "-Wall -Wno-ignored-qualifiers")
 set(CMAKE_CXX_FLAGS_DEBUG "-g -DDEBUG")
@@ -71,3 +73,20 @@ if(NOT APPLE)
   # openpty lives in libutil on Linux; it is in libc on macOS (<util.h>).
   target_link_libraries(fovea-fw-sim util)
 endif()
+
+# ------------------------------------------------------------------------------
+# conversions — link-time guard for core/lib/Aravis/Conversions.cpp. A normally
+# linked executable (no dynamic undefined lookup, unlike the node addon), so a
+# convert<> specialization the test references but nobody defines fails the
+# LINK instead of segfaulting on first call at the rig.
+# ------------------------------------------------------------------------------
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(ARAVIS REQUIRED IMPORTED_TARGET aravis-0.8)
+set(CORE_DIR ${PROJECT_HOME}/../core)
+add_executable(conversions
+  ${PROJECT_HOME}/conversions.cpp
+  ${CORE_DIR}/lib/Aravis/Conversions.cpp
+  ${CORE_DIR}/lib/Aravis/Error.cpp
+)
+target_include_directories(conversions PRIVATE ${CORE_DIR}/lib)
+target_link_libraries(conversions PRIVATE PkgConfig::ARAVIS)
